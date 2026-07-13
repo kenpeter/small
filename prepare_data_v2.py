@@ -138,7 +138,7 @@ def main():
                 continue
 
             active = {}
-            workers = 3
+            workers = 4
             with ThreadPoolExecutor(max_workers=workers) as executor:
                 for _ in range(workers):
                     if file_idx < len(files):

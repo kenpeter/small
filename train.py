@@ -13,6 +13,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import IterableDataset, DataLoader
+from torch.utils.checkpoint import checkpoint
 from transformers import AutoTokenizer
 
 # ─── Config ───────────────────────────────────────────────────
@@ -31,10 +32,10 @@ class TrainConfig:
     dropout: float = 0.0
 
     # Training
-    batch_size: int = 8
+    batch_size: int = 2
     gradient_accumulation_steps: int = 4
     max_steps: int = 500_000
-    learning_rate: float = 5e-4
+    learning_rate: float = 2e-4
     min_lr: float = 5e-5
     warmup_steps: int = 2000
     weight_decay: float = 0.1
@@ -42,16 +43,17 @@ class TrainConfig:
     beta1: float = 0.9
     beta2: float = 0.95
     eps: float = 1e-8
-    compile: bool = True
+    compile: bool = False
 
     # Data
     data_dir: Path = Path("/home/kenpeter/work/data")
-    seq_len: int = 2048
+    seq_len: int = 4096
     val_frac: float = 0.01
 
     # Checkpointing
     checkpoint_dir: Path = Path("/home/kenpeter/work/checkpoints")
     save_every_n_steps: int = 1000
+    val_every_n_steps: int = 100
     log_every_n_steps: int = 10
 
     # Device
@@ -80,6 +82,9 @@ class RotaryEmbedding(nn.Module):
     def forward(self, x, seq_len: int):
         cos = self.cos[:seq_len, :]
         sin = self.sin[:seq_len, :]
+        # Interleave to match head_dim (e.g. 32 -> 64)
+        cos = cos.repeat_interleave(2, dim=-1)
+        sin = sin.repeat_interleave(2, dim=-1)
         x1, x2 = x[..., ::2], x[..., 1::2]
         rotated = torch.stack([-x2, x1], dim=-1).flatten(-2)
         return x * cos + rotated * sin
@@ -104,8 +109,6 @@ class CausalSelfAttention(nn.Module):
         self.o_proj = nn.Linear(cfg.n_heads * self.head_dim, cfg.dim, bias=False)
         self.rope = RotaryEmbedding(self.head_dim, cfg.max_seq_len, cfg.rope_theta)
 
-        self.register_buffer("bias", torch.tril(torch.ones(cfg.max_seq_len, cfg.max_seq_len)), persistent=False)
-
     def forward(self, x):
         B, T, C = x.size()
         q = self.q_proj(x).view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
@@ -118,11 +121,8 @@ class CausalSelfAttention(nn.Module):
         k = repeat_kv(k, self.n_rep)
         v = repeat_kv(v, self.n_rep)
 
-        # Flash Attention-friendly manual implementation
-        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(self.head_dim))
-        att = att.masked_fill(self.bias[:T, :T] == 0, float("-inf"))
-        att = F.softmax(att, dim=-1)
-        y = att @ v
+        # Memory-efficient Flash Attention
+        y = F.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=0.0, is_causal=True)
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         return self.o_proj(y)
 
@@ -172,7 +172,7 @@ class SmolLM2(nn.Module):
     def forward(self, idx, targets=None):
         x = self.tok_embeddings(idx)
         for layer in self.layers:
-            x = layer(x)
+            x = checkpoint(layer, x, use_reentrant=False)
         x = self.norm(x)
         logits = self.lm_head(x)
         loss = None
@@ -231,7 +231,7 @@ class BinShardDataset(IterableDataset):
 
 def get_dataloader(cfg: TrainConfig, is_val: bool = False):
     ds = BinShardDataset(cfg.data_dir, cfg.seq_len, cfg.val_frac, is_val)
-    return DataLoader(ds, batch_size=cfg.batch_size, shuffle=False, num_workers=2, pin_memory=True)
+    return DataLoader(ds, batch_size=cfg.batch_size, shuffle=False, num_workers=0, pin_memory=False)
 
 # ─── Checkpointing ──────────────────────────────────────────────────────
 class CheckpointManager:
@@ -266,23 +266,30 @@ class CheckpointManager:
             print(f"  ⭐ Saved best checkpoint (loss {loss:.4f})")
 
     def load(self, model, optimizer, scheduler):
-        if not self.latest_path.exists():
+        ckpt_path = self.latest_path if self.latest_path.exists() else self.best_path
+        if not ckpt_path.exists():
             print("  🔄 No checkpoint found, starting from scratch")
             return 0, float("inf")
 
-        state = torch.load(self.latest_path, map_location=self.cfg.device, weights_only=False)
+        print(f"  🔄 Resuming from {ckpt_path.name}")
+        state = torch.load(ckpt_path, map_location=self.cfg.device, weights_only=False)
         model.load_state_dict(state["model_state_dict"])
         optimizer.load_state_dict(state["optimizer_state_dict"])
-        if scheduler and state.get("scheduler_state_dict"):
+        if scheduler and "scheduler_state_dict" in state:
             scheduler.load_state_dict(state["scheduler_state_dict"])
-        torch.set_rng_state(state["rng_state"])
-        if torch.cuda.is_available() and state.get("cuda_rng_state"):
-            torch.cuda.set_rng_state_all(state["cuda_rng_state"])
-
-        step = state["step"]
+        if "rng_state" in state:
+            try:
+                torch.set_rng_state(state["rng_state"])
+            except Exception as e:
+                print(f"     ⚠ RNG restore skipped: {e}")
+        if "cuda_rng_state" in state and torch.cuda.is_available():
+            try:
+                torch.cuda.set_rng_state(state["cuda_rng_state"])
+            except Exception as e:
+                print(f"     ⚠ CUDA RNG restore skipped: {e}")
+        step = state.get("step", 0)
         best_loss = state.get("best_loss", float("inf"))
-        self.best_loss = best_loss
-        print(f"  🔄 Resumed from step {step}, best_loss={best_loss:.4f}")
+        print(f"     step {step}, best_loss {best_loss:.4f}")
         return step, best_loss
 
 # ─── LR Scheduler ────────────────────────────────────────────────────────
@@ -298,7 +305,29 @@ def get_lr(step: int, cfg: TrainConfig):
 
 # ─── Training ───────────────────────────────────────────────────────
 @torch.no_grad()
-def estimate_loss(model, val_loader, cfg: TrainConfig, max_batches: int = 20):
+def generate_sample(model, tokenizer, prompt: str, max_new: int = 20, device: str = "cuda"):
+    """Quick greedy generation for real-situation eval."""
+    model.eval()
+    ids = tokenizer.encode(prompt, add_special_tokens=False)
+    input_ids = torch.tensor([ids], dtype=torch.long, device=device)
+    for _ in range(max_new):
+        logits, _ = model(input_ids)
+        next_tok = logits[0, -1, :].argmax(dim=-1, keepdim=True)
+        input_ids = torch.cat([input_ids, next_tok.unsqueeze(0)], dim=1)
+    out = tokenizer.decode(input_ids[0].tolist())
+    model.train()
+    return out
+
+REAL_PROMPTS = [
+    "The capital of France is",
+    "1 + 1 =",
+    "The sky is",
+    "Water boils at",
+    "Once upon a time",
+]
+
+@torch.no_grad()
+def estimate_loss(model, val_loader, cfg: TrainConfig, max_batches: int = 50):
     model.eval()
     losses = []
     for i, (x, y) in enumerate(val_loader):
@@ -359,6 +388,8 @@ def train(cfg: TrainConfig):
     t0 = time.time()
     running_loss = 0.0
     step = start_step
+    val_interval = cfg.val_every_n_steps
+    stall_count = 0
 
     while step < cfg.max_steps:
         step += 1
@@ -387,6 +418,11 @@ def train(cfg: TrainConfig):
             else:
                 loss.backward()
 
+            # Cool-down between microsteps to reduce sustained GPU heat / fan noise
+            if micro_step < cfg.gradient_accumulation_steps - 1:
+                torch.cuda.synchronize()
+                time.sleep(0.4)
+
         # Clip + step
         if scaler:
             scaler.unscale_(optimizer)
@@ -410,12 +446,26 @@ def train(cfg: TrainConfig):
             print(f"step {step:6d} | loss {avg_loss:.4f} | lr {lr:.2e} | {dt:.1f}s | {tokens_per_sec:,.0f} tok/s")
             running_loss = 0.0
 
-        # Checkpointing
-        if step % cfg.save_every_n_steps == 0:
+        # Validation (adaptive: 30 min normally, 15 min if plateau)
+        if step % val_interval == 0:
             val_loss = estimate_loss(model, val_loader, cfg)
-            ckpt.save(model, optimizer, scheduler, step, val_loss, is_best=(val_loss < best_loss))
+            print(f"  📊 Val loss: {val_loss:.4f} | best: {best_loss:.4f} | eval_every={val_interval}")
+            # Real-situation generation sample
+            test_prompt = REAL_PROMPTS[step % len(REAL_PROMPTS)]
+            gen = generate_sample(model, tokenizer, test_prompt, max_new=15, device=cfg.device)
+            print(f"  💬 Gen: {gen[:80]}")
             if val_loss < best_loss:
                 best_loss = val_loss
+                stall_count = 0
+            else:
+                stall_count += 1
+                if stall_count >= 3 and val_interval > 50:
+                    val_interval = max(50, val_interval // 2)
+                    print(f"  ⚠ Plateau detected → eval every {val_interval} steps (~15 min)")
+
+        # Checkpointing
+        if step % cfg.save_every_n_steps == 0:
+            ckpt.save(model, optimizer, scheduler, step, val_loss, is_best=(val_loss == best_loss))
 
     # Final save
     val_loss = estimate_loss(model, val_loader, cfg)

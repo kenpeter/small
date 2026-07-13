@@ -10,6 +10,17 @@
 **Method**: Next-token prediction on massive raw text corpora.
 **Architecture**: Transformer++ (RMSNorm, SwiGLU, RoPE, GQA, KV Cache)
 
+| Spec | Value |
+|------|-------|
+| Parameters | ~162.8 M (embedding 28.3 M + 30 layers 106.2 M + LM head 28.3 M, untied) |
+| Hidden dimension | 576 |
+| Layers | 30 |
+| Attention heads | 9 (query) / 3 (key-value) — GQA |
+| FFN intermediate size | 1536 (SwiGLU) |
+| Max sequence length | 8192 |
+| RoPE base θ | 10 000 |
+| RMSNorm ε | 1e-5 |
+
 ### Data Sources (Curated Mixture)
 
 | Dataset | Source | Ratio | Size | What It Contains |
@@ -26,14 +37,17 @@
 | Parameter | Value |
 |-----------|-------|
 | Total tokens target | ~118 billion (220 GB uint16 shards) |
-| Sequence length | 8192 tokens |
+| Sequence length | 2048 tokens (not 8192; memory constraint) |
 | Tokenizer | `HuggingFaceTB/SmolLM2-135M` (BPE, uint16 output) |
-| Shard format | `.bin` files (2 GB each, 1B tokens) |
-| Batch size | 8 per step × 4 gradient accumulation = effective 32 |
-| Learning rate | 6e-4 with cosine warmup (1000 steps) + decay |
+| Shard format | `.bin` files (~2 GB each, 1 B tokens) |
+| Batch size | 2 per step × 4 gradient accumulation = effective 8 |
+| Learning rate | 5e-4 with cosine warmup (2000 steps) + decay |
 | Precision | `bfloat16` (mixed) |
 | Optimizer | AdamW (β₁=0.9, β₂=0.95, weight_decay=0.1) |
-| Compilation | `torch.compile` (if CUDA available) |
+| Gradient clipping | max_norm = 1.0 |
+| Compilation | Disabled (`torch.compile = False`) |
+| Attention | Flash Attention via `F.scaled_dot_product_attention` |
+| Causal mask | No `torch.tril` buffer (saves ~8 GB VRAM) |
 | Checkpointing | Every 1000 steps → `checkpoint_latest.pt` + `checkpoint_best.pt` |
 
 ### Pretraining Script
@@ -238,7 +252,7 @@ python3 dpo.py \
 | Phase | GPU VRAM | RAM | Disk | Time Estimate |
 |-------|----------|-----|------|---------------|
 | Data prep (download + tokenize) | None | 4 GB | 220 GB | ~15-25 hours (parallel wget) |
-| Pretraining 135M @ 118B tokens | 8 GB (RTX 3060) | 16 GB | 220 GB | ~40-60 hours on single GPU |
+| Pretraining 163M @ 52-118B tokens | 8 GB (RTX 4070 Ti 12 GB) | 16 GB | 220 GB | ~40-60 hours on single GPU |
 | SFT | 4 GB | 8 GB | +2 GB | ~2-4 hours |
 | DPO | 4 GB | 8 GB | +2 GB | ~1-2 hours |
 
@@ -266,5 +280,5 @@ python3 dpo.py \
 
 ---
 
-*Last updated: July 12, 2026*
-*Status: Phase 1 in progress (data download + tokenization running)*
+*Last updated: July 13, 2026*
+*Status: Phase 1 ready — 49 shards (~98 GB, ~52.6 B tokens) prepared; training configured for batch=2, seq=2048. Data download resuming.*

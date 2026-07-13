@@ -12,7 +12,7 @@ from transformers import AutoTokenizer
 
 # ─── Config ──────────────────────────────────────────────────────
 TOKENIZER_NAME = "HuggingFaceTB/SmolLM2-135M"
-MAX_SEQ_LEN    = 8192
+MAX_SEQ_LEN    = 32768
 SHARD_SIZE     = int(1_073_741_824)     # 1 GiB tokens → ~2 GB on disk (uint16)
 MAX_GB         = int(sys.argv[1]) if len(sys.argv) > 1 else 220
 MAX_TOKENS     = int(MAX_GB * 1_073_741_824 // 2)
@@ -74,7 +74,7 @@ def download_wget(url, out_path):
 
 # ─── Main ───────────────────────────────────────────────────────
 def main():
-    tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_NAME, trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_NAME, trust_remote_code=True, model_max_length=16384)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
@@ -137,7 +137,7 @@ def main():
                             for text in texts:
                                 if not text:
                                     continue
-                                ids = tokenizer.encode(text, add_special_tokens=False, truncation=False)
+                                ids = tokenizer.encode(text, add_special_tokens=False, truncation=True, max_length=MAX_SEQ_LEN)
                                 if not ids:
                                     continue
                                 ids_arr = np.array(ids, dtype=np.uint16)
