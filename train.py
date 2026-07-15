@@ -46,7 +46,7 @@ class TrainConfig:
     compile: bool = False
 
     # Data
-    data_dir: Path = Path("/home/kenpeter/work/data")
+    data_dir: Path = Path("/home/kenpeter/work/data/_shards_final")
     seq_len: int = 4096
     val_frac: float = 0.01
 
