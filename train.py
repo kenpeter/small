@@ -32,7 +32,7 @@ class TrainConfig:
     dropout: float = 0.0
 
     # Training
-    batch_size: int = 2
+    batch_size: int = 4  # Increased from 2 with gradient checkpointing
     gradient_accumulation_steps: int = 8  # Increased from 4 for better convergence
     max_steps: int = 539_000  # 5 epochs on 3.53B tokens (go hard)
     learning_rate: float = 2e-4
@@ -43,18 +43,19 @@ class TrainConfig:
     beta1: float = 0.9
     beta2: float = 0.95
     eps: float = 1e-8
-    compile: bool = False
-
-    # Data
-    data_dir: Path = Path("/home/kenpeter/work/data/_shards_final")
+    save_every_n_steps: int = 1000
+    log_every_n_steps: int = 10
+    val_every_n_steps: int = 100
+    device: str = "cuda" if torch.cuda.is_available() else "cpu"
+    use_gradient_checkpointing: bool = True  # Enable for bigger batches
     seq_len: int = 4096
     val_frac: float = 0.01
 
     # Checkpointing
     checkpoint_dir: Path = Path("/home/kenpeter/work/checkpoints")
-    save_every_n_steps: int = 1000
-    val_every_n_steps: int = 100
-    log_every_n_steps: int = 10
+
+    # Data
+    data_dir: Path = Path("/home/kenpeter/work/data/_shards_final")
 
     # Device
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
@@ -143,10 +144,15 @@ class TransformerBlock(nn.Module):
         self.attn = CausalSelfAttention(cfg)
         self.mlp_norm = RMSNorm(cfg.dim, cfg.rms_norm_eps)
         self.mlp = SwiGLUMLP(cfg)
+        self.use_checkpoint = getattr(cfg, "use_gradient_checkpointing", False)
 
     def forward(self, x):
-        x = x + self.attn(self.attn_norm(x))
-        x = x + self.mlp(self.mlp_norm(x))
+        if self.use_checkpoint and self.training:
+            x = x + torch.utils.checkpoint.checkpoint(self.attn, self.attn_norm(x), use_reentrant=False)
+            x = x + torch.utils.checkpoint.checkpoint(self.mlp, self.mlp_norm(x), use_reentrant=False)
+        else:
+            x = x + self.attn(self.attn_norm(x))
+            x = x + self.mlp(self.mlp_norm(x))
         return x
 
 class SmolLM2(nn.Module):
