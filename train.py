@@ -357,11 +357,6 @@ def train(cfg: TrainConfig):
     model = SmolLM2(cfg).to(cfg.device)
     print(f"Model params: {model.count_parameters():,}")
 
-    # Compile
-    if cfg.compile and hasattr(torch, "compile") and cfg.device == "cuda":
-        print("Compiling model with torch.compile...")
-        model = torch.compile(model)
-
     # Optimizer
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -375,6 +370,11 @@ def train(cfg: TrainConfig):
     # Checkpoint manager
     ckpt = CheckpointManager(cfg)
     start_step, best_loss = ckpt.load(model, optimizer, scheduler)
+
+    # Compile AFTER loading checkpoint (avoids _orig_mod key mismatch)
+    if cfg.compile and hasattr(torch, "compile") and cfg.device == "cuda":
+        print("Compiling model with torch.compile...")
+        model = torch.compile(model)
 
     # Data
     train_loader = get_dataloader(cfg, is_val=False)
