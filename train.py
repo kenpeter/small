@@ -32,8 +32,8 @@ class TrainConfig:
     dropout: float = 0.0
 
     # Training
-    batch_size: int = 2  # Kept at 2 to avoid OOM; use grad_accum for effective batch
-    gradient_accumulation_steps: int = 12  # Effective batch = 24
+    batch_size: int = 4
+    gradient_accumulation_steps: int = 12  # Effective batch = 48
     max_steps: int = 539_000  # 5 epochs on 3.53B tokens (go hard)
     learning_rate: float = 2e-4
     min_lr: float = 5e-5
@@ -49,7 +49,7 @@ class TrainConfig:
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     use_gradient_checkpointing: bool = True  # Enable for bigger batches
     compile: bool = False
-    seq_len: int = 4096
+    seq_len: int = 2048  # Reduced from 4096 to fit batch=4 in 12GB
     val_frac: float = 0.01
 
     # Checkpointing
