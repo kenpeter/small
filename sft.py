@@ -268,10 +268,15 @@ def train_sft(cfg: SFTConfig):
                 x, y = next(data_iter)
 
             x, y = x.to(cfg.device), y.to(cfg.device)
+            # Skip samples with no valid response tokens (all labels = -100)
+            if (y != -100).sum() == 0:
+                continue
             ctx = torch.autocast(device_type=cfg.device, dtype=torch.bfloat16 if use_amp else torch.float32)
             with ctx:
                 _, loss = model(x, y)
                 loss = loss / cfg.gradient_accumulation_steps
+            if torch.isnan(loss):
+                continue
             accumulated_loss += loss.item()
 
             if scaler:
