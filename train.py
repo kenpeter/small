@@ -48,6 +48,7 @@ class TrainConfig:
     val_every_n_steps: int = 100
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     use_gradient_checkpointing: bool = True  # Enable for bigger batches
+    compile: bool = False
     seq_len: int = 4096
     val_frac: float = 0.01
 
@@ -56,9 +57,6 @@ class TrainConfig:
 
     # Data
     data_dir: Path = Path("/home/kenpeter/work/data/_shards_final")
-
-    # Device
-    device: str = "cuda" if torch.cuda.is_available() else "cpu"
 
 # ─── Architecture ──────────────────────────────────────────────────────
 class RMSNorm(nn.Module):
