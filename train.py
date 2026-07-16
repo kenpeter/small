@@ -418,10 +418,9 @@ def train(cfg: TrainConfig):
             else:
                 loss.backward()
 
-            # Cool-down between microsteps to reduce sustained GPU heat / fan noise
+            # No sleep between microsteps - maximize GPU utilization
             if micro_step < cfg.gradient_accumulation_steps - 1:
-                torch.cuda.synchronize()
-                time.sleep(0.4)
+                pass
 
         # Clip + step
         if scaler:
