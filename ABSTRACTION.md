@@ -55,15 +55,15 @@ L20 rejects **70%** of candidate documents. Our pipeline rejects **~90%**. Our 3
 ## 3. Current Pipeline Status
 | Phase | Status | Data |
 |---|---|---|
-| Pretraining | **Running** (step ~16,200, loss ~3.28) | 13 shards, 3.53B tokens |
+| Pretraining | **Running** (step ~16,220, loss ~3.19, speed ~35.5k tok/s) | 13 shards, 3.53B tokens |
 | SFT | Paused at step 100, loss 1.23 | 6.78M samples |
 | DPO | **Not started** | 234K pairs (raw, not tokenized) |
 
 ## 4. Key Constraints
 - **GPU**: RTX 4070 Ti 12GB
 - **Batch size**: 4 is VRAM ceiling at seq_len=2048 with gradient checkpointing
-- **Speed**: ~20k tok/s (before compile/accum changes)
-- **No torch.compile** previously due to caution; now enabled for free 15–25% speedup
+- **Speed**: ~35.5k tok/s (after torch.compile + accum changes)
+- **torch.compile enabled**: +70% speedup observed; **must load checkpoint BEFORE compile** to avoid `_orig_mod` key mismatch
 
 ## 5. Lessons Learned
 1. **Loss plateau at 3.3–3.4** was caused by tiny effective batch (8→24→48), not data corruption. Bumping grad_accum immediately broke the plateau.
@@ -71,3 +71,4 @@ L20 rejects **70%** of candidate documents. Our pipeline rejects **~90%**. Our 3
 3. **Causal attention bias buffers** were wasting ~8GB; removing them saved enough VRAM to increase batch size.
 4. **max_steps must be recalculated** whenever batch/seq_len/accum changes. 539k steps at old config became ~15 epochs at new config.
 5. **L20's LR (4e-4)** is 2× ours. With our small batch, 2e-4 was overly conservative.
+6. **`torch.compile` checkpoint bug**: If you compile the model before loading a non-compiled checkpoint, `state_dict` keys get `_orig_mod.` prefix and loading fails. **Fix**: compile AFTER `ckpt.load()`.
