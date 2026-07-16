@@ -136,7 +136,7 @@ class SFTConfig:
     sft_shards_dir: Path = Path("/home/kenpeter/work/data/_sft_shards")
     output_dir: Path = Path("/home/kenpeter/work/checkpoints")
     seq_len: int = 2048
-    batch_size: int = 2
+    batch_size: int = 1  # Reduced from 2 to avoid OOM
     gradient_accumulation_steps: int = 4
     max_steps: int = 20_000
     learning_rate: float = 2e-5
