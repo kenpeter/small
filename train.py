@@ -34,7 +34,7 @@ class TrainConfig:
     # Training
     batch_size: int = 2
     gradient_accumulation_steps: int = 4
-    max_steps: int = 500_000
+    max_steps: int = 539_000  # 5 epochs on 3.53B tokens (go hard)
     learning_rate: float = 2e-4
     min_lr: float = 5e-5
     warmup_steps: int = 2000
