@@ -132,7 +132,7 @@ class SFTConfig:
     rms_norm_eps: float = 1e-5
     dropout: float = 0.0
 
-    base_checkpoint: Path = Path("/home/kenpeter/work/checkpoints/pretrained_phase1.pt")
+    base_checkpoint: Path = Path("/home/kenpeter/work/checkpoints/pretrained_final.pt")
     sft_shards_dir: Path = Path("/home/kenpeter/work/data/_sft_shards")
     output_dir: Path = Path("/home/kenpeter/work/checkpoints")
     seq_len: int = 2048
@@ -219,7 +219,13 @@ def train_sft(cfg: SFTConfig):
     # Load pretrained
     if cfg.base_checkpoint.exists():
         state = torch.load(cfg.base_checkpoint, map_location=cfg.device, weights_only=False)
-        model.load_state_dict(state["model_state_dict"])
+        model_state = state["model_state_dict"]
+        # Strip _orig_mod prefix from compiled model checkpoints
+        unwanted_prefix = "_orig_mod."
+        for k,v in list(model_state.items()):
+            if k.startswith(unwanted_prefix):
+                model_state[k[len(unwanted_prefix):]] = model_state.pop(k)
+        model.load_state_dict(model_state)
         print(f"  🔄 Loaded pretrained from step {state.get('step', 'unknown')}")
     else:
         print(f"  ⚠ No base checkpoint. Training from scratch.")
