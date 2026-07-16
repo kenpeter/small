@@ -132,7 +132,7 @@ class SFTConfig:
     rms_norm_eps: float = 1e-5
     dropout: float = 0.0
 
-    base_checkpoint: Path = Path("/home/kenpeter/work/checkpoints/checkpoint_best.pt")
+    base_checkpoint: Path = Path("/home/kenpeter/work/checkpoints/pretrained_best.pt")
     sft_shards_dir: Path = Path("/home/kenpeter/work/data/_sft_shards")
     output_dir: Path = Path("/home/kenpeter/work/checkpoints")
     seq_len: int = 2048
@@ -228,8 +228,27 @@ def train_sft(cfg: SFTConfig):
     model = SmolLM2(cfg).to(cfg.device)
     print(f"Model params: {sum(p.numel() for p in model.parameters()):,}")
 
-    # Load pretrained
-    if cfg.base_checkpoint.exists():
+    # Load pretrained or resume SFT
+    latest_sft = cfg.output_dir / "sft_latest.pt"
+    resume_step = 0
+    best_loss = float("inf")
+    if latest_sft.exists():
+        state = torch.load(latest_sft, map_location=cfg.device, weights_only=False)
+        model_state = state["model_state_dict"]
+        unwanted_prefix = "_orig_mod."
+        for k,v in list(model_state.items()):
+            if k.startswith(unwanted_prefix):
+                model_state[k[len(unwanted_prefix):]] = model_state.pop(k)
+        model.load_state_dict(model_state)
+        optimizer.load_state_dict(state["optimizer_state_dict"])
+        resume_step = state.get("step", 0)
+        best_loss = state.get("best_loss", float("inf"))
+        if "rng_state" in state:
+            torch.set_rng_state(state["rng_state"].cpu())
+        if "cuda_rng_state" in state and cfg.device == "cuda":
+            torch.cuda.set_rng_state_all([s.cpu() if s.is_cuda else s for s in state["cuda_rng_state"]])
+        print(f"  🔄 Resumed SFT from step {resume_step} (best_loss={best_loss:.4f})")
+    elif cfg.base_checkpoint.exists():
         state = torch.load(cfg.base_checkpoint, map_location=cfg.device, weights_only=False)
         model_state = state["model_state_dict"]
         # Strip _orig_mod prefix from compiled model checkpoints
@@ -240,7 +259,7 @@ def train_sft(cfg: SFTConfig):
         model.load_state_dict(model_state)
         print(f"  🔄 Loaded pretrained from step {state.get('step', 'unknown')}")
     else:
-        print(f"  ⚠ No base checkpoint. Training from scratch.")
+        print(f"  ⚠ No checkpoint found. Training from scratch.")
 
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -261,8 +280,7 @@ def train_sft(cfg: SFTConfig):
 
     t0 = time.time()
     running_loss = 0.0
-    step = 0
-    best_loss = float("inf")
+    step = resume_step
     cfg.output_dir.mkdir(parents=True, exist_ok=True)
 
     while step < cfg.max_steps:
@@ -324,9 +342,12 @@ def train_sft(cfg: SFTConfig):
             state = {
                 "step": step,
                 "loss": val_loss,
+                "best_loss": best_loss,
                 "model_state_dict": model.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
                 "config": cfg.__dict__,
+                "rng_state": torch.get_rng_state(),
+                "cuda_rng_state": torch.cuda.get_rng_state_all() if cfg.device == "cuda" else None,
             }
             tmp = cfg.output_dir / "sft_latest.tmp"
             torch.save(state, tmp)
@@ -340,9 +361,12 @@ def train_sft(cfg: SFTConfig):
     state = {
         "step": step,
         "loss": running_loss,
+        "best_loss": best_loss,
         "model_state_dict": model.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
         "config": cfg.__dict__,
+        "rng_state": torch.get_rng_state(),
+        "cuda_rng_state": torch.cuda.get_rng_state_all() if cfg.device == "cuda" else None,
     }
     torch.save(state, cfg.output_dir / "sft_final.pt")
     print(f"\n✅ SFT complete. sft_final.pt | best={best_loss:.4f}")

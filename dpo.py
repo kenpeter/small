@@ -267,8 +267,26 @@ def train_dpo(cfg: DPOConfig):
     # Reference model (frozen)
     reference = SmolLM2(cfg).to(cfg.device)
 
-    # Load SFT weights into both
-    if cfg.sft_checkpoint.exists():
+    # Load SFT weights into both, or resume DPO
+    latest_dpo = cfg.output_dir / "dpo_latest.pt"
+    resume_step = 0
+    best_loss = float("inf")
+    if latest_dpo.exists():
+        state = torch.load(latest_dpo, map_location=cfg.device, weights_only=False)
+        sd = state["model_state_dict"]
+        if any(k.startswith("_orig_mod.") for k in sd.keys()):
+            sd = {k.replace("_orig_mod.", ""): v for k, v in sd.items()}
+        policy.load_state_dict(sd)
+        reference.load_state_dict(sd)
+        optimizer.load_state_dict(state["optimizer_state_dict"])
+        resume_step = state.get("step", 0)
+        best_loss = state.get("best_loss", float("inf"))
+        if "rng_state" in state:
+            torch.set_rng_state(state["rng_state"].cpu())
+        if "cuda_rng_state" in state and cfg.device == "cuda":
+            torch.cuda.set_rng_state_all([s.cpu() if s.is_cuda else s for s in state["cuda_rng_state"]])
+        print(f"  🔄 Resumed DPO from step {resume_step} (best_loss={best_loss:.4f})")
+    elif cfg.sft_checkpoint.exists():
         state = torch.load(cfg.sft_checkpoint, map_location=cfg.device, weights_only=False)
         sd = state["model_state_dict"]
         # Strip torch.compile _orig_mod prefix if present
@@ -278,7 +296,7 @@ def train_dpo(cfg: DPOConfig):
         reference.load_state_dict(sd)
         print(f"  🔄 Loaded SFT checkpoint step {state.get('step', 'unknown')}")
     else:
-        print("  ⚠ No SFT checkpoint. Starting from scratch.")
+        print("  ⚠ No checkpoint found. Starting from scratch.")
 
     # Freeze reference
     for p in reference.parameters():
@@ -322,8 +340,7 @@ def train_dpo(cfg: DPOConfig):
 
     t0 = time.time()
     running_loss = 0.0
-    step = 0
-    best_loss = float("inf")
+    step = resume_step
     cfg.output_dir.mkdir(parents=True, exist_ok=True)
 
     while step < cfg.max_steps:
@@ -409,9 +426,12 @@ def train_dpo(cfg: DPOConfig):
             state = {
                 "step": step,
                 "loss": val_loss,
+                "best_loss": best_loss,
                 "model_state_dict": policy.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
                 "config": cfg.__dict__,
+                "rng_state": torch.get_rng_state(),
+                "cuda_rng_state": torch.cuda.get_rng_state_all() if cfg.device == "cuda" else None,
             }
             tmp = cfg.output_dir / "dpo_latest.tmp"
             torch.save(state, tmp)
@@ -425,9 +445,12 @@ def train_dpo(cfg: DPOConfig):
     state = {
         "step": step,
         "loss": running_loss,
+        "best_loss": best_loss,
         "model_state_dict": policy.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
         "config": cfg.__dict__,
+        "rng_state": torch.get_rng_state(),
+        "cuda_rng_state": torch.cuda.get_rng_state_all() if cfg.device == "cuda" else None,
     }
     torch.save(state, cfg.output_dir / "dpo_final.pt")
     print(f"\n✅ DPO complete. dpo_final.pt | best={best_loss:.4f}")
