@@ -2,22 +2,21 @@
 SFT (Supervised Fine-Tuning) for SmolLM2-135M.
 Loads pretrained checkpoint, fine-tunes on instruction-response pairs.
 Only assistant tokens contribute to loss (system/user masked with -100).
+Uses pre-tokenized .pt shards from _sft_shards/.
 """
-import os, sys, json, time, math, gc
+import os, sys, json, time, math, glob, gc
 from pathlib import Path
 from dataclasses import dataclass
-from typing import Optional, List, Dict
+from typing import Optional, List
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from transformers import AutoTokenizer
-from datasets import load_dataset, concatenate_datasets
+import numpy as np
 
-# ─── Reuse architecture from train.py ─────────────────────────────
-# (paste the same classes to avoid import coupling)
-
+# ─── Reuse architecture from train.py ───────────────────────────────────────────────────
 class RMSNorm(nn.Module):
     def __init__(self, dim: int, eps: float = 1e-5):
         super().__init__()
@@ -119,10 +118,9 @@ class SmolLM2(nn.Module):
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-100)
         return logits, loss
 
-# ─── Config ──────────────────────────────────────────────────────
+# ─── Config ───────────────────────────────────────────────────────────────
 @dataclass
 class SFTConfig:
-    # Model (same as pretraining)
     vocab_size: int = 49152
     dim: int = 576
     n_layers: int = 30
@@ -134,8 +132,8 @@ class SFTConfig:
     rms_norm_eps: float = 1e-5
     dropout: float = 0.0
 
-    # Training
-    base_checkpoint: Path = Path("/home/kenpeter/work/checkpoints/checkpoint_best.pt")
+    base_checkpoint: Path = Path("/home/kenpeter/work/checkpoints/pretrained_phase1.pt")
+    sft_shards_dir: Path = Path("/home/kenpeter/work/data/_sft_shards")
     output_dir: Path = Path("/home/kenpeter/work/checkpoints")
     seq_len: int = 2048
     batch_size: int = 2
@@ -153,198 +151,48 @@ class SFTConfig:
     log_every_n_steps: int = 10
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
 
-# ─── Chat formatting ─────────────────────────────────────────────
-CHAT_TEMPLATE = """<|im_start|>system
-You are a helpful assistant.<|im_end|>
-<|im_start|>user
-{instruction}<|im_end|>
-<|im_start|>assistant
-{response}<|im_end|>"""
-
-def format_openhermes(example: dict) -> dict:
-    """OpenHermes 2.5 format: conversations list."""
-    conversations = example.get("conversations", [])
-    text = ""
-    for turn in conversations:
-        role = turn.get("from", turn.get("role", ""))
-        content = turn.get("value", turn.get("content", ""))
-        if role in ("human", "user"):
-            text += f"<|im_start|>user\n{content}<|im_end|>\n"
-        elif role in ("gpt", "assistant"):
-            text += f"<|im_start|>assistant\n{content}<|im_end|>\n"
-        elif role == "system":
-            text += f"<|im_start|>system\n{content}<|im_end|>\n"
-    return {"text": text}
-
-def format_openorca(example: dict) -> dict:
-    """OpenOrca format: system_prompt, question, response."""
-    system = example.get("system_prompt", "You are a helpful assistant.")
-    question = example.get("question", example.get("instruction", ""))
-    response = example.get("response", example.get("answer", ""))
-    text = f"<|im_start|>system\n{system}<|im_end|>\n"
-    text += f"<|im_start|>user\n{question}<|im_end|>\n"
-    text += f"<|im_start|>assistant\n{response}<|im_end|>\n"
-    return {"text": text}
-
-def format_alpaca(example: dict) -> dict:
-    """Alpaca format: instruction, input, output."""
-    instruction = example.get("instruction", "")
-    inp = example.get("input", "")
-    output = example.get("output", "")
-    if inp:
-        instruction += f"\n{inp}"
-    text = f"<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n"
-    text += f"<|im_start|>user\n{instruction}<|im_end|>\n"
-    text += f"<|im_start|>assistant\n{output}<|im_end|>\n"
-    return {"text": text}
-
-def format_ultrachat(example: dict) -> dict:
-    """Ultrachat format: data list of turns."""
-    data = example.get("data", [])
-    text = "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n"
-    for i, turn in enumerate(data):
-        role = "user" if i % 2 == 0 else "assistant"
-        text += f"<|im_start|>{role}\n{turn}<|im_end|>\n"
-    return {"text": text}
-
-# ─── Tokenize with loss masking ──────────────────────────────────
-class SFTDataset(Dataset):
-    def __init__(self, texts: List[str], tokenizer, seq_len: int = 2048):
-        self.tokenizer = tokenizer
+# ─── Dataset: streaming pre-tokenized .pt shards ─────────────────────────────────────────
+class StreamingSFTDataset(torch.utils.data.IterableDataset):
+    def __init__(self, shards_dir: Path, seq_len: int = 2048):
+        self.shard_files = sorted(shards_dir.glob("shard_*.pt"))
+        if not self.shard_files:
+            raise RuntimeError(f"No .pt shards found in {shards_dir}")
+        print(f"Found {len(self.shard_files)} SFT shards")
         self.seq_len = seq_len
-        self.samples = []
-        for text in texts:
-            sample = self._tokenize_with_mask(text)
-            if sample:
-                self.samples.append(sample)
 
-    def _tokenize_with_mask(self, text: str):
-        """Tokenize and mask non-assistant tokens with -100."""
-        # Simple heuristic: split by role markers and mask accordingly
-        parts = text.split("<|im_start|>")
-        all_ids = []
-        all_labels = []
-        for part in parts:
-            if not part.strip():
-                continue
-            # Determine role
-            if part.startswith("assistant"):
-                # Train on this part
-                content = part[len("assistant"):].split("<|im_end|>")[0].strip()
-                if not content:
-                    continue
-                ids = self.tokenizer.encode(content, add_special_tokens=False)
-                all_ids.extend(ids)
-                all_labels.extend(ids)
-            elif part.startswith("user") or part.startswith("system"):
-                # Mask this part
-                content = part.split("\n", 1)[1].split("<|im_end|>")[0] if "\n" in part else ""
-                if not content:
-                    continue
-                ids = self.tokenizer.encode(content, add_special_tokens=False)
-                all_ids.extend(ids)
-                all_labels.extend([-100] * len(ids))
-            else:
-                # Raw text (shouldn't happen with proper formatting)
-                ids = self.tokenizer.encode(part, add_special_tokens=False)
-                all_ids.extend(ids)
-                all_labels.extend([-100] * len(ids))
+    def _pad_sample(self, s):
+        input_ids = torch.tensor(s["input_ids"], dtype=torch.long)
+        labels = torch.tensor(s["labels"], dtype=torch.long)
+        if len(input_ids) > self.seq_len:
+            input_ids = input_ids[:self.seq_len]
+            labels = labels[:self.seq_len]
+        elif len(input_ids) < self.seq_len:
+            pad = self.seq_len - len(input_ids)
+            input_ids = torch.cat([input_ids, torch.zeros(pad, dtype=torch.long)])
+            labels = torch.cat([labels, torch.full((pad,), -100, dtype=torch.long)])
+        return input_ids, labels
 
-        if len(all_ids) < 2:
-            return None
-
-        # Truncate or pad to seq_len
-        if len(all_ids) > self.seq_len:
-            all_ids = all_ids[:self.seq_len]
-            all_labels = all_labels[:self.seq_len]
+    def __iter__(self):
+        worker_info = torch.utils.data.get_worker_info()
+        if worker_info is None:
+            shard_files = self.shard_files.copy()
         else:
-            # Pad
-            pad_len = self.seq_len - len(all_ids)
-            all_ids.extend([self.tokenizer.pad_token_id] * pad_len)
-            all_labels.extend([-100] * pad_len)
+            # Shard across workers
+            per_worker = len(self.shard_files) // worker_info.num_workers
+            start = worker_info.id * per_worker
+            end = start + per_worker if worker_info.id < worker_info.num_workers - 1 else len(self.shard_files)
+            shard_files = self.shard_files[start:end]
+        import random
+        random.shuffle(shard_files)
+        for shard_path in shard_files:
+            shard = torch.load(shard_path, weights_only=False)
+            random.shuffle(shard)
+            for s in shard:
+                yield self._pad_sample(s)
+            del shard
+            gc.collect()
 
-        return {
-            "input_ids": torch.tensor(all_ids, dtype=torch.long),
-            "labels": torch.tensor(all_labels, dtype=torch.long),
-        }
-
-    def __len__(self):
-        return len(self.samples)
-
-    def __getitem__(self, idx):
-        return self.samples[idx]["input_ids"], self.samples[idx]["labels"]
-
-# ─── Load datasets ───────────────────────────────────────────────
-def load_sft_datasets(max_samples_per_ds: int = 50_000):
-    """Load and combine SFT datasets."""
-    all_texts = []
-
-    # OpenHermes 2.5
-    try:
-        print("Loading OpenHermes 2.5...")
-        ds = load_dataset("teknium/OpenHermes-2.5", split="train", streaming=True)
-        for i, ex in enumerate(ds):
-            if i >= max_samples_per_ds:
-                break
-            all_texts.append(format_openhermes(ex)["text"])
-        print(f"  ✓ OpenHermes: {len(all_texts)} samples so far")
-    except Exception as e:
-        print(f"  ⚠ OpenHermes failed: {e}")
-
-    # OpenOrca
-    try:
-        print("Loading OpenOrca...")
-        ds = load_dataset("Open-Orca/OpenOrca", split="train", streaming=True)
-        count = 0
-        for ex in ds:
-            if count >= max_samples_per_ds:
-                break
-            all_texts.append(format_openorca(ex)["text"])
-            count += 1
-        print(f"  ✓ OpenOrca: +{count} samples")
-    except Exception as e:
-        print(f"  ⚠ OpenOrca failed: {e}")
-
-    # Alpaca-GPT4
-    try:
-        print("Loading Alpaca-GPT4...")
-        ds = load_dataset("vicgalle/alpaca-gpt4", split="train")
-        count = min(len(ds), max_samples_per_ds)
-        for ex in ds.select(range(count)):
-            all_texts.append(format_alpaca(ex)["text"])
-        print(f"  ✓ Alpaca-GPT4: +{count} samples")
-    except Exception as e:
-        print(f"  ⚠ Alpaca-GPT4 failed: {e}")
-
-    # Code-Alpaca
-    try:
-        print("Loading CodeAlpaca...")
-        ds = load_dataset("sahil2801/CodeAlpaca-20k", split="train")
-        count = min(len(ds), 20_000)
-        for ex in ds.select(range(count)):
-            all_texts.append(format_alpaca(ex)["text"])
-        print(f"  ✓ CodeAlpaca: +{count} samples")
-    except Exception as e:
-        print(f"  ⚠ CodeAlpaca failed: {e}")
-
-    # Ultrachat
-    try:
-        print("Loading Ultrachat...")
-        ds = load_dataset("stingning/ultrachat", split="train", streaming=True)
-        count = 0
-        for ex in ds:
-            if count >= max_samples_per_ds:
-                break
-            all_texts.append(format_ultrachat(ex)["text"])
-            count += 1
-        print(f"  ✓ Ultrachat: +{count} samples")
-    except Exception as e:
-        print(f"  ⚠ Ultrachat failed: {e}")
-
-    print(f"\n📊 Total SFT samples: {len(all_texts)}")
-    return all_texts
-
-# ─── LR Scheduler ─────────────────────────────────────────────────
+# ─── LR Scheduler ─────────────────────────────────────────────────────────
 def get_lr(step: int, cfg: SFTConfig):
     if step < cfg.warmup_steps:
         return cfg.learning_rate * (step + 1) / cfg.warmup_steps
@@ -354,30 +202,28 @@ def get_lr(step: int, cfg: SFTConfig):
     coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
     return cfg.min_lr + coeff * (cfg.learning_rate - cfg.min_lr)
 
-# ─── Training ──────────────────────────────────────────────────────
+# ─── Training ──────────────────────────────────────────────────────────
 def train_sft(cfg: SFTConfig):
     print(f"Device: {cfg.device}")
     print(f"Base checkpoint: {cfg.base_checkpoint}")
+    print(f"SFT shards: {cfg.sft_shards_dir}")
 
     tokenizer = AutoTokenizer.from_pretrained("HuggingFaceTB/SmolLM2-135M", trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     print(f"Tokenizer vocab: {len(tokenizer)}")
 
-    # Model
     model = SmolLM2(cfg).to(cfg.device)
     print(f"Model params: {sum(p.numel() for p in model.parameters()):,}")
 
-    # Load pretrained weights
+    # Load pretrained
     if cfg.base_checkpoint.exists():
         state = torch.load(cfg.base_checkpoint, map_location=cfg.device, weights_only=False)
         model.load_state_dict(state["model_state_dict"])
         print(f"  🔄 Loaded pretrained from step {state.get('step', 'unknown')}")
     else:
-        print(f"  ⚠ No base checkpoint found at {cfg.base_checkpoint}")
-        print("  Training from scratch (not recommended for SFT)")
+        print(f"  ⚠ No base checkpoint. Training from scratch.")
 
-    # Optimizer
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=cfg.learning_rate,
@@ -387,26 +233,19 @@ def train_sft(cfg: SFTConfig):
     )
 
     # Data
-    texts = load_sft_datasets()
-    if not texts:
-        print("No SFT data loaded. Exiting.")
-        return
-
-    dataset = SFTDataset(texts, tokenizer, cfg.seq_len)
-    dataloader = DataLoader(dataset, batch_size=cfg.batch_size, shuffle=True, num_workers=0)
+    dataset = StreamingSFTDataset(cfg.sft_shards_dir, seq_len=cfg.seq_len)
+    dataloader = DataLoader(dataset, batch_size=cfg.batch_size, shuffle=False, num_workers=0)
     data_iter = iter(dataloader)
-    print(f"Batches per epoch: ~{len(dataset) // cfg.batch_size}")
+    print(f"Streaming {len(dataset.shard_files)} shards, batch_size={cfg.batch_size}")
 
     use_amp = cfg.device == "cuda" and torch.cuda.is_bf16_supported()
     scaler = torch.cuda.amp.GradScaler() if use_amp and hasattr(torch.cuda.amp, "GradScaler") else None
 
-    # Training loop
     t0 = time.time()
     running_loss = 0.0
     step = 0
-
-    cfg.output_dir.mkdir(parents=True, exist_ok=True)
     best_loss = float("inf")
+    cfg.output_dir.mkdir(parents=True, exist_ok=True)
 
     while step < cfg.max_steps:
         step += 1
@@ -455,7 +294,7 @@ def train_sft(cfg: SFTConfig):
             running_loss = 0.0
 
         if step % cfg.save_every_n_steps == 0:
-            val_loss = avg_loss  # Use running avg as proxy
+            val_loss = avg_loss
             is_best = val_loss < best_loss
             if is_best:
                 best_loss = val_loss
@@ -475,7 +314,6 @@ def train_sft(cfg: SFTConfig):
             else:
                 print(f"  💾 Saved latest SFT (loss {val_loss:.4f})")
 
-    # Final save
     state = {
         "step": step,
         "loss": running_loss,
@@ -484,7 +322,7 @@ def train_sft(cfg: SFTConfig):
         "config": cfg.__dict__,
     }
     torch.save(state, cfg.output_dir / "sft_final.pt")
-    print(f"\n✅ SFT complete. Saved sft_final.pt | best_loss={best_loss:.4f}")
+    print(f"\n✅ SFT complete. sft_final.pt | best={best_loss:.4f}")
 
 if __name__ == "__main__":
     cfg = SFTConfig()
