@@ -26,11 +26,24 @@ def format_chat(messages):
     return text
 
 def fmt_openhermes(ex):
-    msgs = ex.get("messages", [])
-    if not msgs: return None
-    if msgs[0].get("role") != "system":
-        msgs = [{"role": "system", "content": "You are a helpful assistant."}] + msgs
-    return msgs
+    """OpenHermes uses 'conversations' with 'from': human/gpt/system"""
+    conversations = ex.get("conversations", [])
+    if not conversations:
+        return None
+    msgs = []
+    # Check for system prompt at top level
+    system = ex.get("system_prompt", "")
+    if system:
+        msgs.append({"role": "system", "content": system})
+    else:
+        msgs.append({"role": "system", "content": "You are a helpful assistant."})
+    for turn in conversations:
+        role_map = {"human": "user", "gpt": "assistant", "system": "system"}
+        role = role_map.get(turn.get("from", ""), "user")
+        content = turn.get("value", "")
+        if content:
+            msgs.append({"role": role, "content": content})
+    return msgs if len(msgs) > 1 else None
 
 def fmt_openorca(ex):
     system = ex.get("system_prompt", "You are a helpful assistant.")
