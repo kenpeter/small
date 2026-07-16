@@ -302,16 +302,16 @@ class CheckpointManager:
                 rng_state = state["rng_state"]
                 if isinstance(rng_state, list):
                     rng_state = torch.tensor(rng_state, dtype=torch.uint8)
-                torch.set_rng_state(rng_state)
+                torch.set_rng_state(rng_state.cpu())
             except Exception as e:
                 print(f"     ⚠ RNG restore skipped: {e}")
         if "cuda_rng_state" in state and torch.cuda.is_available():
             try:
                 cuda_states = state["cuda_rng_state"]
                 if isinstance(cuda_states, list) and cuda_states and isinstance(cuda_states[0], torch.Tensor):
-                    torch.cuda.set_rng_state_all(cuda_states)
+                    torch.cuda.set_rng_state_all([s.cpu() for s in cuda_states])
                 elif isinstance(cuda_states, torch.Tensor):
-                    torch.cuda.set_rng_state(cuda_states)
+                    torch.cuda.set_rng_state(cuda_states.cpu())
                 else:
                     print(f"     ⚠ CUDA RNG restore skipped: unexpected type {type(cuda_states)}")
             except Exception as e:
