@@ -134,7 +134,7 @@ class DPOConfig:
     sft_checkpoint: Path = Path("/home/kenpeter/work/checkpoints/sft_best.pt")
     dpo_data_dir: Path = Path("/home/kenpeter/work/data/_dpo_staging")
     output_dir: Path = Path("/home/kenpeter/work/checkpoints")
-    seq_len: int = 2048
+    seq_len: int = 1024
     batch_size: int = 1  # Pairs are large; keep small
     gradient_accumulation_steps: int = 4
     max_steps: int = 5_000
