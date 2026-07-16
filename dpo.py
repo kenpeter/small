@@ -224,29 +224,30 @@ class DPODataset(Dataset):
             "prompt_len": len(s["prompt_ids"]),
         }
 
+# ─── DPO helpers ──────────────────────────────────────────────────
+def get_batch_logps(logits, tokens, mask):
+    """Gather per-token log-probs, sum over mask positions, return per-sample avg."""
+    logps = torch.log_softmax(logits, dim=-1)
+    # Gather log-prob of actual token at each position
+    B, T, V = logps.shape
+    gathered = logps.gather(dim=-1, index=tokens.unsqueeze(-1)).squeeze(-1)  # (B, T)
+    # Zero out padded / non-response positions
+    gathered = gathered * mask.float()
+    # Sum and divide by number of valid positions
+    sum_logps = gathered.sum(dim=1)
+    n_valid = mask.sum(dim=1).clamp(min=1)
+    return sum_logps / n_valid
+
 # ─── DPO Loss ─────────────────────────────────────────────────────
-def dpo_loss(policy_logits, reference_logits, chosen_mask, rejected_mask, beta=0.1):
+def dpo_loss(policy_chosen_logps, policy_rejected_logps,
+             ref_chosen_logps, ref_rejected_logps, beta=0.1):
     """
-    policy_logits: (B, T, V) from policy model
-    reference_logits: (B, T, V) from frozen reference model
-    chosen_mask: (B, T) bool mask for chosen response tokens
-    rejected_mask: (B, T) bool mask for rejected response tokens
+    Standard DPO loss: -logsigmoid(beta * ((policy_chosen - ref_chosen) -
+                                            (policy_rejected - ref_rejected)))
+    All logps are per-sample averages over response tokens.
     """
-    # Log-probs for chosen
-    policy_chosen_lp = torch.log_softmax(policy_logits, dim=-1)
-    ref_chosen_lp = torch.log_softmax(reference_logits, dim=-1)
-
-    # Gather log-probs of actual tokens
-    B, T, V = policy_logits.shape
-    chosen_lp = (policy_chosen_lp * chosen_mask.unsqueeze(-1)).sum(dim=(1,2)) / chosen_mask.sum(dim=1)
-    ref_chosen_lp = (ref_chosen_lp * chosen_mask.unsqueeze(-1)).sum(dim=(1,2)) / chosen_mask.sum(dim=1)
-
-    rejected_lp = (policy_chosen_lp * rejected_mask.unsqueeze(-1)).sum(dim=(1,2)) / rejected_mask.sum(dim=1)
-    ref_rejected_lp = (ref_chosen_lp * rejected_mask.unsqueeze(-1)).sum(dim=(1,2)) / rejected_mask.sum(dim=1)
-
-    # DPO loss: maximize log-ratio of chosen vs rejected
-    policy_ratio = chosen_lp - rejected_lp
-    ref_ratio = ref_chosen_lp - ref_rejected_lp
+    policy_ratio = policy_chosen_logps - policy_rejected_logps
+    ref_ratio = ref_chosen_logps - ref_rejected_logps
     loss = -F.logsigmoid(beta * (policy_ratio - ref_ratio)).mean()
     return loss
 
@@ -269,8 +270,12 @@ def train_dpo(cfg: DPOConfig):
     # Load SFT weights into both
     if cfg.sft_checkpoint.exists():
         state = torch.load(cfg.sft_checkpoint, map_location=cfg.device, weights_only=False)
-        policy.load_state_dict(state["model_state_dict"])
-        reference.load_state_dict(state["model_state_dict"])
+        sd = state["model_state_dict"]
+        # Strip torch.compile _orig_mod prefix if present
+        if any(k.startswith("_orig_mod.") for k in sd.keys()):
+            sd = {k.replace("_orig_mod.", ""): v for k, v in sd.items()}
+        policy.load_state_dict(sd)
+        reference.load_state_dict(sd)
         print(f"  🔄 Loaded SFT checkpoint step {state.get('step', 'unknown')}")
     else:
         print("  ⚠ No SFT checkpoint. Starting from scratch.")
@@ -303,7 +308,8 @@ def train_dpo(cfg: DPOConfig):
     print(f"Batches: ~{len(dataset) // cfg.batch_size}")
 
     use_amp = cfg.device == "cuda" and torch.cuda.is_bf16_supported()
-    scaler = torch.cuda.amp.GradScaler() if use_amp and hasattr(torch.cuda.amp, "GradScaler") else None
+    # bf16 does not need loss scaling; GradScaler can cause NaN
+    scaler = None if use_amp else None
 
     def get_lr(step):
         if step < cfg.warmup_steps:
@@ -358,10 +364,16 @@ def train_dpo(cfg: DPOConfig):
                     ref_chosen_logits, _ = reference(chosen)
                     ref_rejected_logits, _ = reference(rejected)
 
-                # DPO loss on both
-                loss_chosen = dpo_loss(policy_chosen_logits, ref_chosen_logits, chosen_mask, chosen_mask, cfg.beta)
-                loss_rejected = dpo_loss(policy_rejected_logits, ref_rejected_logits, rejected_mask, rejected_mask, cfg.beta)
-                loss = (loss_chosen + loss_rejected) / 2 / cfg.gradient_accumulation_steps
+                # Compute per-sample log-probs over response tokens
+                policy_chosen_logps = get_batch_logps(policy_chosen_logits, chosen, chosen_mask)
+                policy_rejected_logps = get_batch_logps(policy_rejected_logits, rejected, rejected_mask)
+                ref_chosen_logps = get_batch_logps(ref_chosen_logits, chosen, chosen_mask)
+                ref_rejected_logps = get_batch_logps(ref_rejected_logits, rejected, rejected_mask)
+
+                loss = dpo_loss(
+                    policy_chosen_logps, policy_rejected_logps,
+                    ref_chosen_logps, ref_rejected_logps, cfg.beta,
+                ) / cfg.gradient_accumulation_steps
 
             accumulated_loss += loss.item()
 
