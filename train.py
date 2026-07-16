@@ -12,6 +12,10 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+# TF32 for faster matmul on Ampere+ (negligible accuracy loss)
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
 from torch.utils.data import IterableDataset, DataLoader
 from torch.utils.checkpoint import checkpoint
 from transformers import AutoTokenizer
@@ -235,7 +239,7 @@ class BinShardDataset(IterableDataset):
 
 def get_dataloader(cfg: TrainConfig, is_val: bool = False):
     ds = BinShardDataset(cfg.data_dir, cfg.seq_len, cfg.val_frac, is_val)
-    return DataLoader(ds, batch_size=cfg.batch_size, shuffle=False, num_workers=0, pin_memory=False)
+    return DataLoader(ds, batch_size=cfg.batch_size, shuffle=False, num_workers=0, pin_memory=True)
 
 # ─── Checkpointing ──────────────────────────────────────────────────────
 class CheckpointManager:
@@ -277,8 +281,18 @@ class CheckpointManager:
 
         print(f"  🔄 Resuming from {ckpt_path.name}")
         state = torch.load(ckpt_path, map_location=self.cfg.device, weights_only=False)
-        model.load_state_dict(state["model_state_dict"])
-        optimizer.load_state_dict(state["optimizer_state_dict"])
+        # Strip _orig_mod prefix from compiled model checkpoints
+        model_state = state["model_state_dict"]
+        unwanted_prefix = "_orig_mod."
+        for k,v in list(model_state.items()):
+            if k.startswith(unwanted_prefix):
+                model_state[k[len(unwanted_prefix):]] = model_state.pop(k)
+        model.load_state_dict(model_state)
+        try:
+            optimizer.load_state_dict(state["optimizer_state_dict"])
+        except Exception as e:
+            print(f"     ⚠ Optimizer state load failed (switching optimizers?): {e}")
+            print(f"     ⚠ Starting optimizer from scratch. Model weights preserved.")
         if scheduler and "scheduler_state_dict" in state:
             scheduler.load_state_dict(state["scheduler_state_dict"])
         if "rng_state" in state:
@@ -364,6 +378,7 @@ def train(cfg: TrainConfig):
         betas=(cfg.beta1, cfg.beta2),
         eps=cfg.eps,
         weight_decay=cfg.weight_decay,
+        fused=True,
     )
     scheduler = None  # manual LR
 
@@ -384,9 +399,9 @@ def train(cfg: TrainConfig):
     print(f"Train shards: {len(train_loader.dataset.shards)}")
     print(f"Val shards:   {len(val_loader.dataset.shards)}")
 
-    # Scaler for mixed precision (only if CUDA and bf16 available)
+    # Scaler for mixed precision (only if float16; bf16 doesn't need scaling)
     use_amp = cfg.device == "cuda" and torch.cuda.is_bf16_supported()
-    scaler = torch.cuda.amp.GradScaler() if use_amp and hasattr(torch.cuda.amp, "GradScaler") else None
+    scaler = torch.cuda.amp.GradScaler() if use_amp and hasattr(torch.cuda.amp, "GradScaler") and getattr(cfg, 'dtype', 'bfloat16') == 'float16' else None
 
     # Training loop
     t0 = time.time()
@@ -410,7 +425,7 @@ def train(cfg: TrainConfig):
                 train_iter = iter(train_loader)
                 x, y = next(train_iter)
 
-            x, y = x.to(cfg.device), y.to(cfg.device)
+            x, y = x.to(cfg.device, non_blocking=True), y.to(cfg.device, non_blocking=True)
             ctx = torch.autocast(device_type=cfg.device, dtype=torch.bfloat16 if use_amp else torch.float32)
             with ctx:
                 _, loss = model(x, y)
