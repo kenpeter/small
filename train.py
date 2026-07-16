@@ -180,7 +180,7 @@ class SmolLM2(nn.Module):
     def forward(self, idx, targets=None):
         x = self.tok_embeddings(idx)
         for layer in self.layers:
-            x = checkpoint(layer, x, use_reentrant=False)
+            x = layer(x)
         x = self.norm(x)
         logits = self.lm_head(x)
         loss = None
@@ -201,12 +201,14 @@ class BinShardDataset(IterableDataset):
         self.val_frac = val_frac
         self.is_val = is_val
 
-        # Split shards: last N% for validation
-        n_val = max(1, int(len(self.shards) * val_frac))
+        # Deterministic stratified split: shuffle by stable hash, then take tail for val
+        import hashlib
+        sorted_shards = sorted(self.shards, key=lambda p: hashlib.md5(str(p).encode()).hexdigest())
+        n_val = max(1, int(len(sorted_shards) * val_frac))
         if is_val:
-            self.shards = self.shards[-n_val:]
+            self.shards = sorted_shards[-n_val:]
         else:
-            self.shards = self.shards[:-n_val] if n_val > 0 else self.shards
+            self.shards = sorted_shards[:-n_val] if n_val > 0 else sorted_shards
 
         self.token_dtype = np.uint16
         self.tokens_per_shard = self.shards[0].stat().st_size // np.dtype(self.token_dtype).itemsize
@@ -297,12 +299,21 @@ class CheckpointManager:
             scheduler.load_state_dict(state["scheduler_state_dict"])
         if "rng_state" in state:
             try:
-                torch.set_rng_state(state["rng_state"])
+                rng_state = state["rng_state"]
+                if isinstance(rng_state, list):
+                    rng_state = torch.tensor(rng_state, dtype=torch.uint8)
+                torch.set_rng_state(rng_state)
             except Exception as e:
                 print(f"     ⚠ RNG restore skipped: {e}")
         if "cuda_rng_state" in state and torch.cuda.is_available():
             try:
-                torch.cuda.set_rng_state(state["cuda_rng_state"])
+                cuda_states = state["cuda_rng_state"]
+                if isinstance(cuda_states, list) and cuda_states and isinstance(cuda_states[0], torch.Tensor):
+                    torch.cuda.set_rng_state_all(cuda_states)
+                elif isinstance(cuda_states, torch.Tensor):
+                    torch.cuda.set_rng_state(cuda_states)
+                else:
+                    print(f"     ⚠ CUDA RNG restore skipped: unexpected type {type(cuda_states)}")
             except Exception as e:
                 print(f"     ⚠ CUDA RNG restore skipped: {e}")
         step = state.get("step", 0)
