@@ -31,7 +31,6 @@ def download_one(name: str, info: dict):
             info["repo"],
             split=info["split"],
             streaming=info["streaming"],
-            trust_remote_code=True,
         )
         # Save as JSONL shards
         shard_size = 10000
