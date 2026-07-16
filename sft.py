@@ -163,14 +163,26 @@ class StreamingSFTDataset(torch.utils.data.IterableDataset):
     def _pad_sample(self, s):
         input_ids = torch.tensor(s["input_ids"], dtype=torch.long)
         labels = torch.tensor(s["labels"], dtype=torch.long)
+
+        # FIX: shift labels so model predicts NEXT token, not CURRENT token.
+        # Stored labels have labels[j] = input_ids[j] for assistant positions j.
+        # We need: position i predicts token at position i+1, so labels[i] = input_ids[i+1]
+        # only if position i+1 is part of the assistant response.
+        shifted_labels = torch.full_like(labels, -100)
+        assistant_positions = (labels != -100).nonzero(as_tuple=True)[0]
+        for j in assistant_positions:
+            j = j.item()
+            if j > 0:
+                shifted_labels[j - 1] = input_ids[j]
+
         if len(input_ids) > self.seq_len:
             input_ids = input_ids[:self.seq_len]
-            labels = labels[:self.seq_len]
+            shifted_labels = shifted_labels[:self.seq_len]
         elif len(input_ids) < self.seq_len:
             pad = self.seq_len - len(input_ids)
             input_ids = torch.cat([input_ids, torch.zeros(pad, dtype=torch.long)])
-            labels = torch.cat([labels, torch.full((pad,), -100, dtype=torch.long)])
-        return input_ids, labels
+            shifted_labels = torch.cat([shifted_labels, torch.full((pad,), -100, dtype=torch.long)])
+        return input_ids, shifted_labels
 
     def __iter__(self):
         worker_info = torch.utils.data.get_worker_info()
