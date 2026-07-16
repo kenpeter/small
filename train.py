@@ -32,8 +32,8 @@ class TrainConfig:
     dropout: float = 0.0
 
     # Training
-    batch_size: int = 4  # Increased from 2 with gradient checkpointing
-    gradient_accumulation_steps: int = 8  # Increased from 4 for better convergence
+    batch_size: int = 2  # Kept at 2 to avoid OOM; use grad_accum for effective batch
+    gradient_accumulation_steps: int = 12  # Effective batch = 24
     max_steps: int = 539_000  # 5 epochs on 3.53B tokens (go hard)
     learning_rate: float = 2e-4
     min_lr: float = 5e-5
