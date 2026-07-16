@@ -132,7 +132,7 @@ class SFTConfig:
     rms_norm_eps: float = 1e-5
     dropout: float = 0.0
 
-    base_checkpoint: Path = Path("/home/kenpeter/work/checkpoints/pretrained_final.pt")
+    base_checkpoint: Path = Path("/home/kenpeter/work/checkpoints/checkpoint_best.pt")
     sft_shards_dir: Path = Path("/home/kenpeter/work/data/_sft_shards")
     output_dir: Path = Path("/home/kenpeter/work/checkpoints")
     seq_len: int = 2048
@@ -245,7 +245,7 @@ def train_sft(cfg: SFTConfig):
     print(f"Streaming {len(dataset.shard_files)} shards, batch_size={cfg.batch_size}")
 
     use_amp = cfg.device == "cuda" and torch.cuda.is_bf16_supported()
-    scaler = torch.cuda.amp.GradScaler() if use_amp and hasattr(torch.cuda.amp, "GradScaler") else None
+    scaler = torch.cuda.amp.GradScaler() if use_amp and hasattr(torch.cuda.amp, "GradScaler") and getattr(cfg, 'dtype', 'bfloat16') == 'float16' else None
 
     t0 = time.time()
     running_loss = 0.0
