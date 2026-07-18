@@ -135,11 +135,11 @@ class DPOConfig:
     dpo_data_dir: Path = Path("/home/kenpeter/work/data/_dpo_staging")
     output_dir: Path = Path("/home/kenpeter/work/checkpoints")
     seq_len: int = 1024
-    batch_size: int = 2  # Increased to improve throughput
+    batch_size: int = 1  # Pairs are large; keep small
     gradient_accumulation_steps: int = 4
-    max_steps: int = 20000
-    learning_rate: float = 1e-6  # Slightly higher for faster convergence
-    beta: float = 0.2  # Increased KL penalty
+    max_steps: int = 15000
+    learning_rate: float = 5e-7  # Very low — DPO is sensitive
+    beta: float = 0.1  # KL divergence penalty weight
     min_lr: float = 1e-7
     warmup_steps: int = 100
     weight_decay: float = 0.1

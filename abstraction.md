@@ -270,15 +270,60 @@ python3 dpo.py \
 
 ---
 
-## References
 
-- [SmolLM2 Technical Report](https://huggingface.co/blog/smollm2) — Architecture & data mixture
-- [FineWeb-Edu Paper](https://huggingface.co/datasets/HuggingFaceFW/fineweb-edu) — Educational web filtering
-- [Direct Preference Optimization (Rafailov et al., 2023)](https://arxiv.org/abs/2305.18290) — DPO theory
-- [OpenHermes 2.5](https://huggingface.co/datasets/teknium/OpenHermes-2.5) — SFT dataset
-- [UltraFeedback](https://huggingface.co/datasets/openbmb/UltraFeedback) — DPO preference data
+## Recent Experiments (July 2026)
 
----
+### SFT Run
+- Target steps: 40000 (doubled original goal)
+- Final checkpoint: step 40000, loss ~3.03, best loss ~1.52
+- Observations: loss fluctuated, generation quality still noisy; SFT provided a base for alignment.
 
-*Last updated: July 13, 2026*
-*Status: Phase 1 ready — 49 shards (~98 GB, ~52.6 B tokens) prepared; training configured for batch=2, seq=2048. Data download resuming.*
+### DPO Run (first extension)
+- Started from step 5000 checkpoint, increased max_steps to 15000.
+- Final loss ~0.4554, best loss ~0.4467 at step 10000.
+- Generation still repetitive; DPO improved preference loss but not output quality.
+
+### Hyperparameter Adjustments
+- Batch size increased from 1 to 2 (effective batch 8 with grad_acc=4).
+- Learning rate increased from 5e-7 to 1e-6.
+- Beta (KL weight) increased from 0.1 to 0.2.
+- Max steps increased to 20000 (continued from 15000).
+
+### Ongoing DPO Run (second extension)
+- Started from step 15000 checkpoint, targeting 20000 total.
+- Current step ~15000+, loss ~0.45 at step 15000.
+- Expected to finish soon.
+
+### Next Steps
+- Generate new preference pairs from current DPO model and run a second DPO iteration.
+- Consider PPO/GRPO if reward model available.
+- Explore LoRA adapters for specific tasks.
+
+
+## Recent Experiments (July 2026)
+
+### SFT Run
+- Target steps: 40000 (doubled original goal)
+- Final checkpoint: step 40000, loss ~3.03, best loss ~1.52
+- Observations: loss fluctuated, generation quality still noisy; SFT provided a base for alignment.
+
+### DPO Run (first extension)
+- Started from step 5000 checkpoint, increased max_steps to 15000.
+- Final loss ~0.4554, best loss ~0.4467 at step 10000.
+- Generation still repetitive; DPO improved preference loss but not output quality.
+
+### Hyperparameter Adjustments
+- Batch size increased from 1 to 2 (effective batch 8 with grad_acc=4).
+- Learning rate increased from 5e-7 to 1e-6.
+- Beta (KL weight) increased from 0.1 to 0.2.
+- Max steps increased to 20000 (continued from 15000).
+
+### Ongoing DPO Run (second extension)
+- Started from step 15000 checkpoint, targeting 20000 total.
+- Current step ~15000+, loss ~0.45 at step 15000.
+- Expected to finish soon.
+
+### Next Steps
+- Generate new preference pairs from current DPO model and run a second DPO iteration.
+- Consider PPO/GRPO if reward model available.
+- Explore LoRA adapters for specific tasks.

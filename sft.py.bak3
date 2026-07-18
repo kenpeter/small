@@ -136,7 +136,7 @@ class SFTConfig:
     sft_shards_dir: Path = Path("/home/kenpeter/work/data/_sft_shards")
     output_dir: Path = Path("/home/kenpeter/work/checkpoints")
     seq_len: int = 1024
-    batch_size: int = 3  # Increased from 2 to improve throughput, still within memory limits
+    batch_size: int = 1  # Reduced from 2 to avoid OOM
     gradient_accumulation_steps: int = 4
     max_steps: int = 40_000
     learning_rate: float = 2e-5
@@ -147,7 +147,7 @@ class SFTConfig:
     beta1: float = 0.9
     beta2: float = 0.95
     eps: float = 1e-8
-    save_every_n_steps: int = 50
+    save_every_n_steps: int = 1000
     log_every_n_steps: int = 10
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
 
