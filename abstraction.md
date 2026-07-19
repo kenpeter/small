@@ -1,4 +1,4 @@
-# SmolLM2-135M Replication — Full Pipeline Abstraction
+# SmolLM2-0.5B Training — Full Pipeline Abstraction
 
 > This document maps the complete lifecycle of a small language model: from raw internet text to a helpful, instruction-following assistant.
 
@@ -12,50 +12,50 @@
 
 | Spec | Value |
 |------|-------|
-| Parameters | ~162.8 M (embedding 28.3 M + 30 layers 106.2 M + LM head 28.3 M, untied) |
-| Hidden dimension | 576 |
-| Layers | 30 |
-| Attention heads | 9 (query) / 3 (key-value) — GQA |
-| FFN intermediate size | 1536 (SwiGLU) |
+| Parameters | ~503 M (embedding 50.3 M + 32 layers 402.4 M + LM head 50.3 M, untied) |
+| Hidden dimension | 1024 |
+| Layers | 32 |
+| Attention heads | 8 (query) / 4 (key-value) — GQA |
+| FFN intermediate size | 3072 (SwiGLU) |
 | Max sequence length | 8192 |
 | RoPE base θ | 10 000 |
 | RMSNorm ε | 1e-5 |
 
 ### Data Sources (Curated Mixture)
 
-| Dataset | Source | Ratio | Size | What It Contains |
-|---------|--------|-------|------|------------------|
-| **FineWeb-Edu** | `HuggingFaceFW/fineweb-edu` | 50% | ~110 GB tokenized | High-quality educational web pages (Common Crawl filtered for educational value) |
-| **DCLM** | `mlfoundations/dclm-baseline-1.0` | 20% | ~44 GB tokenized | Diverse cleaned language modeling data (books, articles, encyclopedias) |
-| **Stack-Edu** | `bigcode/the-stack-dedup` | 10% | ~22 GB tokenized | Educational code repositories (Python, JavaScript, C++, etc.) |
-| **FineMath** | `HuggingFaceTB/finemath` | 10% | ~22 GB tokenized | Mathematical text, proofs, derivations, LaTeX-formatted math |
-| **Infimm-WebMath** | `OpenCoder-LLM/InfIMMCorpus` | 5% | ~11 GB tokenized | Web-scraped math content with intermediate reasoning steps |
-| **Cosmopedia** | `HuggingFaceTB/cosmopedia` | 5% | ~11 GB tokenized | Synthetic textbooks, encyclopedia articles, educational content |
+| Dataset | Source | Ratio | Raw Size | What It Contains |
+|---------|--------|-------|----------|------------------|
+| **FineWeb-Edu** | `HuggingFaceFW/fineweb-edu` | 45% | 64 GB parquet | High-quality educational web pages (Common Crawl filtered for educational value) |
+| **FineMath-3Plus** | `HuggingFaceTB/finemath-3plus` | 20% | 58 GB parquet | Advanced mathematical text, proofs, derivations |
+| **Cosmopedia** | `HuggingFaceTB/cosmopedia` | 12% | ~80 GB parquet | Synthetic textbooks, encyclopedia articles |
+| **OpenWebMath** | `open-web-math/open-web-math` | 10% | 2.5 GB parquet | High-quality math content from the web |
+| **FineMath** | `HuggingFaceTB/finemath` | 8% | 2.2 GB parquet | Mathematical text, proofs, derivations |
 
 ### Pretraining Configuration
 
 | Parameter | Value |
 |-----------|-------|
-| Total tokens target | ~118 billion (220 GB uint16 shards) |
-| Sequence length | 2048 tokens (not 8192; memory constraint) |
+| Total tokens target | ~15 billion |
+| Sequence length | 2048 tokens |
 | Tokenizer | `HuggingFaceTB/SmolLM2-135M` (BPE, uint16 output) |
-| Shard format | `.bin` files (~2 GB each, 1 B tokens) |
-| Batch size | 2 per step × 4 gradient accumulation = effective 8 |
-| Learning rate | 5e-4 with cosine warmup (2000 steps) + decay |
-| Precision | `bfloat16` (mixed) |
-| Optimizer | AdamW (β₁=0.9, β₂=0.95, weight_decay=0.1) |
+| Shard format | `.bin` files (~256 M tokens each) |
+| Batch size | 2 per step × 24 gradient accumulation = effective 48 (98,304 tok/step) |
+| Learning rate | 4e-4 with cosine warmup (2000 steps) + decay to 1e-4 |
+| Precision | `bfloat16` |
+| Optimizer | 8-bit AdamW (bitsandbytes) — reduces optimizer memory from 8→2 bytes/param |
+| Weight decay | 0.1 |
 | Gradient clipping | max_norm = 1.0 |
 | Compilation | Disabled (`torch.compile = False`) |
+| Gradient checkpointing | Enabled (essential for 0.5B on 12 GB) |
 | Attention | Flash Attention via `F.scaled_dot_product_attention` |
-| Causal mask | No `torch.tril` buffer (saves ~8 GB VRAM) |
-| Checkpointing | Every 1000 steps → `checkpoint_latest.pt` + `checkpoint_best.pt` |
+| Checkpointing | Every 2000 steps → `checkpoint_latest.pt` + `checkpoint_best.pt` |
 
 ### Pretraining Script
 
 ```bash
 cd /home/kenpeter/work/small
 source venv/bin/activate
-python3 train.py  # Automatically loads shards from /home/kenpeter/work/data/
+python3 train.py  # 0.5B config default, loads .bin shards from data dir
 ```
 
 **Resume capability**: `checkpoint_latest.pt` contains model weights, optimizer state, scheduler state, RNG seeds, and step count. Restarting the script restores exact training state.
@@ -206,14 +206,14 @@ python3 dpo.py \
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
 │                          DATA PREPARATION                                │
-│  Raw datasets → Tokenize → Shard into .bin → Stream during training      │
-│  (FineWeb, DCLM, Stack, FineMath, Infimm, Cosmopedia)                    │
+│  Raw datasets → Filter + Dedup → Tokenize → Shard into .bin → Train      │
+│  (FineWeb-Edu, FineMath-3Plus, Cosmopedia, OpenWebMath, FineMath)        │
 └─────────────────────────────────────────────────────────────────────────┘
                                     ↓
 ┌─────────────────────────────────────────────────────────────────────────┐
 │  PHASE 1: PRETRAINING (Self-Supervised)                                  │
-│  Input: Next-token prediction on ~118B tokens                            │
-│  Output: Base model — knows language, code, math, facts                   │
+│  Input: Next-token prediction on ~15B high-quality tokens                │
+│  Output: 0.5B base model — knows language, code, math, facts             │
 │  Script: train.py → checkpoint_best.pt                                     │
 └─────────────────────────────────────────────────────────────────────────┘
                                     ↓
@@ -240,10 +240,13 @@ python3 dpo.py \
 |----------|-----|
 | **Keep real curated data** (not synthetic CoT) | Synthetic latent CoT is a post-training technique. Pretraining on real web data + math is the established recipe for base models. |
 | **Transformer++ architecture** | SOTA for <1B parameters in 2024-2026 (SmolLM2, Qwen3, Llama 3.2, Gemma 3). Mamba-2/SSD and MoE are alternatives but this is the published baseline. |
-| **DPO over RLHF** | DPO is simpler, more stable, and achieves comparable alignment quality. For a 135M model, skipping PPO complexity is pragmatic. |
+| **0.5B over 1B** | 1B doesn't fit on 12GB with reasonable batch size (51 days at batch=1). 0.5B fits at batch=2 (8.1 GB, 38 days) — the sweet spot for this hardware. |
+| **8-bit Adam** | Reduces optimizer memory from 12 bytes/param to 4 bytes/param. Essential for fitting 0.5B with optimizer + gradients + activations on 12 GB. |
+| **Gradient checkpointing** | Only store one layer's activations at a time. Without it, 0.5B OOMs at batch=2. |
+| **DPO over RLHF** | DPO is simpler, more stable, and achieves comparable alignment quality. For a 0.5B model, skipping PPO complexity is pragmatic. |
 | **Truncate long texts to 50K chars** | 500K-character outliers cause tokenizer slowdowns. Most information is in the first ~10K tokens anyway. |
 | **Only 2 checkpoints** | Disk space conservation. `latest.pt` for resume, `best.pt` for downstream use. |
-| **Gradient accumulation = 4** | Simulates larger batch size on limited GPU memory. |
+| **Gradient accumulation = 24** | Simulates larger effective batch (98K tok/step) for stable training at small batch size. |
 
 ---
 
@@ -251,10 +254,11 @@ python3 dpo.py \
 
 | Phase | GPU VRAM | RAM | Disk | Time Estimate |
 |-------|----------|-----|------|---------------|
-| Data prep (download + tokenize) | None | 4 GB | 220 GB | ~15-25 hours (parallel wget) |
-| Pretraining 163M @ 52-118B tokens | 8 GB (RTX 4070 Ti 12 GB) | 16 GB | 220 GB | ~40-60 hours on single GPU |
-| SFT | 4 GB | 8 GB | +2 GB | ~2-4 hours |
-| DPO | 4 GB | 8 GB | +2 GB | ~1-2 hours |
+| Data prep (download + filter) | None | 4 GB | 150 GB raw → ~40 GB filtered | ~4 hours (parallel filter) |
+| Tokenize → .bin shards | None | 8 GB | ~30 GB tokenized | ~30 min |
+| Pretraining 0.5B @ 15B tokens | 8.1 GB (RTX 4070 Ti 12 GB) | 16 GB | ~30 GB shards | ~38 days (batch=2, 4500 tok/s) |
+| SFT | 8 GB | 8 GB | +2 GB | ~4 hours |
+| DPO | 8 GB | 8 GB | +2 GB | ~2 hours |
 
 ---
 
@@ -271,59 +275,27 @@ python3 dpo.py \
 ---
 
 
-## Recent Experiments (July 2026)
+## Recent History (July 2026)
 
-### SFT Run
-- Target steps: 40000 (doubled original goal)
-- Final checkpoint: step 40000, loss ~3.03, best loss ~1.52
-- Observations: loss fluctuated, generation quality still noisy; SFT provided a base for alignment.
+### 163M → 0.5B Pivot
+- Original plan: 163M model on ~20B tokens → loss ~3.0
+- 163M trained to ~3.26 loss on sample data
+- Decided to pivot to 0.5B for better quality vs training time tradeoff
+- Data pipeline rewritten for quality filtering (quality_filter_v3.py)
 
-### DPO Run (first extension)
-- Started from step 5000 checkpoint, increased max_steps to 15000.
-- Final loss ~0.4554, best loss ~0.4467 at step 10000.
-- Generation still repetitive; DPO improved preference loss but not output quality.
+### Data Pipeline v3
+- `quality_filter_v3.py`: heuristic filtering + URL dedup + exact text dedup (MD5) + prefix dedup
+- 6-worker parallel processing via ProcessPoolExecutor → OOM with in-memory lists
+- Fixed: streaming to temp files → 500 MB/worker
+- 4-dataset parallel launch (3 workers each) for faster throughput
 
-### Hyperparameter Adjustments
-- Batch size increased from 1 to 2 (effective batch 8 with grad_acc=4).
-- Learning rate increased from 5e-7 to 1e-6.
-- Beta (KL weight) increased from 0.1 to 0.2.
-- Max steps increased to 20000 (continued from 15000).
-
-### Ongoing DPO Run (second extension)
-- Started from step 15000 checkpoint, targeting 20000 total.
-- Current step ~15000+, loss ~0.45 at step 15000.
-- Expected to finish soon.
+### Model & Config Decisions
+- 0.5B config: dim=1024, L=32, h=8, kv=4, ffn=3072
+- 8-bit Adam (bitsandbytes) instead of standard AdamW to fit optimizer on 12 GB VRAM
+- Gradient checkpointing essential (0.5B OOMs at batch=2 without it)
+- `view()` → `reshape()` fixes needed for non-contiguous tensors with gradient checkpointing
+- Batch=2, accum=24, seq=2048 → 4,500 tok/s → ~38 days for 15B tokens
 
 ### Next Steps
-- Generate new preference pairs from current DPO model and run a second DPO iteration.
-- Consider PPO/GRPO if reward model available.
-- Explore LoRA adapters for specific tasks.
-
-
-## Recent Experiments (July 2026)
-
-### SFT Run
-- Target steps: 40000 (doubled original goal)
-- Final checkpoint: step 40000, loss ~3.03, best loss ~1.52
-- Observations: loss fluctuated, generation quality still noisy; SFT provided a base for alignment.
-
-### DPO Run (first extension)
-- Started from step 5000 checkpoint, increased max_steps to 15000.
-- Final loss ~0.4554, best loss ~0.4467 at step 10000.
-- Generation still repetitive; DPO improved preference loss but not output quality.
-
-### Hyperparameter Adjustments
-- Batch size increased from 1 to 2 (effective batch 8 with grad_acc=4).
-- Learning rate increased from 5e-7 to 1e-6.
-- Beta (KL weight) increased from 0.1 to 0.2.
-- Max steps increased to 20000 (continued from 15000).
-
-### Ongoing DPO Run (second extension)
-- Started from step 15000 checkpoint, targeting 20000 total.
-- Current step ~15000+, loss ~0.45 at step 15000.
-- Expected to finish soon.
-
-### Next Steps
-- Generate new preference pairs from current DPO model and run a second DPO iteration.
-- Consider PPO/GRPO if reward model available.
-- Explore LoRA adapters for specific tasks.
+- Wait for data filtering → tokenize → start 0.5B pretraining
+- After pretraining: SFT on instruction data, then DPO for alignment

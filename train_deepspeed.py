@@ -1,11 +1,10 @@
 """
-SmolLM2-135M pretraining script.
-Transformer++: RMSNorm, SwiGLU, RoPE, GQA.
-Saves only latest.pt and best.pt. Resumable.
+SmolLM2-0.85B pretraining with DeepSpeed ZeRO-3 + CPU offload.
+Fits 12GB VRAM with batch=4+ at seq=2048.
 """
-import os, sys, json, time, math, glob, gc
+import os, sys, json, time, math, glob, gc, hashlib
 from pathlib import Path
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
 import numpy as np
@@ -13,31 +12,32 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-# TF32 for faster matmul on Ampere+ (negligible accuracy loss)
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
+
 from torch.utils.data import IterableDataset, DataLoader
 from torch.utils.checkpoint import checkpoint
 from transformers import AutoTokenizer
 
+import deepspeed
+from deepspeed.ops.adam import DeepSpeedCPUAdam
+
 # ─── Config ───────────────────────────────────────────────────
 @dataclass
 class TrainConfig:
-    # Model (0.5B: dim=1024, L=32, h=8, kv=4, ffn=3072)
     vocab_size: int = 49152
-    dim: int = 1024
-    n_layers: int = 32
-    n_heads: int = 8
+    dim: int = 1536
+    n_layers: int = 28
+    n_heads: int = 12
     n_kv_heads: int = 4
-    intermediate_size: int = 3072
+    intermediate_size: int = 4096
     max_seq_len: int = 8192
     rope_theta: float = 10000.0
     rms_norm_eps: float = 1e-5
     dropout: float = 0.0
 
-    # Training
-    batch_size: int = 2
-    gradient_accumulation_steps: int = 24
+    batch_size: int = 4
+    gradient_accumulation_steps: int = 6
     max_steps: int = 100_000
     learning_rate: float = 4e-4
     min_lr: float = 1e-4
@@ -56,13 +56,11 @@ class TrainConfig:
     seq_len: int = 2048
     val_frac: float = 0.01
 
-    # Checkpointing
     checkpoint_dir: Path = Path("/home/kenpeter/work/checkpoints")
-
-    # Data
     data_dir: Path = Path("/home/kenpeter/work/data/_shards_final")
 
-# ─── Architecture ──────────────────────────────────────────────────────
+
+# ─── Architecture (same as train.py) ──────────────────────────
 class RMSNorm(nn.Module):
     def __init__(self, dim: int, eps: float = 1e-5):
         super().__init__()
@@ -71,6 +69,7 @@ class RMSNorm(nn.Module):
 
     def forward(self, x):
         return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps) * self.weight
+
 
 class RotaryEmbedding(nn.Module):
     def __init__(self, dim: int, max_seq_len: int = 8192, theta: float = 10000.0):
@@ -83,20 +82,19 @@ class RotaryEmbedding(nn.Module):
         self.register_buffer("sin", torch.sin(freqs), persistent=False)
 
     def forward(self, x, seq_len: int):
-        cos = self.cos[:seq_len, :]
-        sin = self.sin[:seq_len, :]
-        # Interleave to match head_dim (e.g. 32 -> 64)
-        cos = cos.repeat_interleave(2, dim=-1)
-        sin = sin.repeat_interleave(2, dim=-1)
+        cos = self.cos[:seq_len, :].repeat_interleave(2, dim=-1)
+        sin = self.sin[:seq_len, :].repeat_interleave(2, dim=-1)
         x1, x2 = x[..., ::2], x[..., 1::2]
         rotated = torch.stack([-x2, x1], dim=-1).flatten(-2)
         return x * cos + rotated * sin
+
 
 def repeat_kv(x, n_rep: int):
     b, n_kv, h, d = x.shape
     if n_rep == 1:
         return x
     return x.unsqueeze(2).expand(b, n_kv, n_rep, h, d).reshape(b, n_kv * n_rep, h, d)
+
 
 class CausalSelfAttention(nn.Module):
     def __init__(self, cfg: TrainConfig):
@@ -114,12 +112,9 @@ class CausalSelfAttention(nn.Module):
 
     def forward(self, x):
         B, T, C = x.size()
-        q = self.q_proj(x)
-        k = self.k_proj(x)
-        v = self.v_proj(x)
-        q = q.reshape(B, T, self.n_heads, self.head_dim).transpose(1, 2)
-        k = k.reshape(B, T, self.n_kv_heads, self.head_dim).transpose(1, 2)
-        v = v.reshape(B, T, self.n_kv_heads, self.head_dim).transpose(1, 2)
+        q = self.q_proj(x).reshape(B, T, self.n_heads, self.head_dim).transpose(1, 2)
+        k = self.k_proj(x).reshape(B, T, self.n_kv_heads, self.head_dim).transpose(1, 2)
+        v = self.v_proj(x).reshape(B, T, self.n_kv_heads, self.head_dim).transpose(1, 2)
 
         q = self.rope(q, T)
         k = self.rope(k, T)
@@ -127,10 +122,10 @@ class CausalSelfAttention(nn.Module):
         k = repeat_kv(k, self.n_rep)
         v = repeat_kv(v, self.n_rep)
 
-        # Memory-efficient Flash Attention
         y = F.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=0.0, is_causal=True)
-        y = y.transpose(1, 2).reshape(B, T, C)
+        y = y.transpose(1, 2).contiguous().view(B, T, C)
         return self.o_proj(y)
+
 
 class SwiGLUMLP(nn.Module):
     def __init__(self, cfg: TrainConfig):
@@ -141,6 +136,7 @@ class SwiGLUMLP(nn.Module):
 
     def forward(self, x):
         return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
+
 
 class TransformerBlock(nn.Module):
     def __init__(self, cfg: TrainConfig):
@@ -160,6 +156,7 @@ class TransformerBlock(nn.Module):
             x = x + self.mlp(self.mlp_norm(x))
         return x
 
+
 class SmolLM2(nn.Module):
     def __init__(self, cfg: TrainConfig):
         super().__init__()
@@ -168,8 +165,6 @@ class SmolLM2(nn.Module):
         self.layers = nn.ModuleList([TransformerBlock(cfg) for _ in range(cfg.n_layers)])
         self.norm = RMSNorm(cfg.dim, cfg.rms_norm_eps)
         self.lm_head = nn.Linear(cfg.dim, cfg.vocab_size, bias=False)
-
-        # Weight tying if desired (SmolLM2 does not tie)
         self.apply(self._init_weights)
 
     def _init_weights(self, module):
@@ -188,24 +183,24 @@ class SmolLM2(nn.Module):
         logits = self.lm_head(x)
         loss = None
         if targets is not None:
-            loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), targets.reshape(-1), ignore_index=-100)
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-100)
         return logits, loss
 
     def count_parameters(self):
         return sum(p.numel() for p in self.parameters())
 
-# ─── Data ─────────────────────────────────────────────────────────
+
+# ─── Data ─────────────────────────────────────────────────────
 class BinShardDataset(IterableDataset):
     def __init__(self, data_dir: Path, seq_len: int, val_frac: float = 0.0, is_val: bool = False):
         self.seq_len = seq_len
         self.shards = sorted(data_dir.glob("shard_*.bin"))
         if not self.shards:
             raise RuntimeError(f"No .bin shards found in {data_dir}")
+
         self.val_frac = val_frac
         self.is_val = is_val
 
-        # Deterministic stratified split: shuffle by stable hash, then take tail for val
-        import hashlib
         sorted_shards = sorted(self.shards, key=lambda p: hashlib.md5(str(p).encode()).hexdigest())
         n_val = max(1, int(len(sorted_shards) * val_frac))
         if is_val:
@@ -221,7 +216,6 @@ class BinShardDataset(IterableDataset):
         if worker_info is None:
             shards = self.shards
         else:
-            # Shard per worker
             per_worker = len(self.shards) // worker_info.num_workers
             start = worker_info.id * per_worker
             end = start + per_worker if worker_info.id < worker_info.num_workers - 1 else len(self.shards)
@@ -230,7 +224,6 @@ class BinShardDataset(IterableDataset):
         for shard_path in shards:
             tokens = np.memmap(str(shard_path), dtype=self.token_dtype, mode="r")
             n = len(tokens) - self.seq_len
-            # Random-ish offset per shard to avoid all workers starting at 0
             offset = (hash(str(shard_path)) % max(1, n)) if n > 0 else 0
             for i in range(offset, n, self.seq_len):
                 chunk = tokens[i : i + self.seq_len + 1]
@@ -242,103 +235,74 @@ class BinShardDataset(IterableDataset):
             del tokens
             gc.collect()
 
+
 def get_dataloader(cfg: TrainConfig, is_val: bool = False):
     ds = BinShardDataset(cfg.data_dir, cfg.seq_len, cfg.val_frac, is_val)
     return DataLoader(ds, batch_size=cfg.batch_size, shuffle=False, num_workers=0, pin_memory=True)
 
-# ─── Checkpointing ──────────────────────────────────────────────────────
-class CheckpointManager:
-    def __init__(self, cfg: TrainConfig):
-        self.cfg = cfg
-        self.checkpoint_dir = cfg.checkpoint_dir
-        self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
-        self.latest_path = self.checkpoint_dir / "checkpoint_latest.pt"
-        self.best_path = self.checkpoint_dir / "checkpoint_best.pt"
-        self.best_loss = float("inf")
 
-    def save(self, model, optimizer, scheduler, step: int, loss: float, is_best: bool = False):
-        state = {
-            "step": step,
-            "loss": loss,
-            "best_loss": self.best_loss,
-            "model_state_dict": model.state_dict(),
-            "optimizer_state_dict": optimizer.state_dict(),
-            "scheduler_state_dict": scheduler.state_dict() if scheduler else None,
-            "rng_state": torch.get_rng_state(),
-            "cuda_rng_state": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else [],
-            "config": self.cfg.__dict__,
-        }
-        tmp_path = self.latest_path.with_suffix(".tmp")
-        torch.save(state, tmp_path)
-        os.replace(tmp_path, self.latest_path)
-        print(f"  💾 Saved latest checkpoint (step {step}, loss {loss:.4f})")
+# ─── DeepSpeed Config ─────────────────────────────────────────
+def make_ds_config(cfg: TrainConfig):
+    """Build DeepSpeed ZeRO-3 + CPU offload config."""
+    return {
+        "train_batch_size": cfg.batch_size * cfg.gradient_accumulation_steps,
+        "gradient_accumulation_steps": cfg.gradient_accumulation_steps,
+        "fp16": {
+            "enabled": True,
+            "loss_scale": 0,
+            "loss_scale_window": 1000,
+            "initial_scale_power": 16,
+            "hysteresis": 2,
+            "min_loss_scale": 1,
+        },
+        "bf16": {
+            "enabled": False,
+        },
+        "zero_optimization": {
+            "stage": 3,
+            "offload_optimizer": {
+                "device": "cpu",
+                "pin_memory": True,
+            },
+            "offload_param": {
+                "device": "cpu",
+                "pin_memory": True,
+            },
+            "overlap_comm": True,
+            "contiguous_gradients": True,
+            "reduce_bucket_size": 5e7,
+            "stage3_prefetch_bucket_size": 5e7,
+            "stage3_param_persistence_threshold": 1e5,
+            "sub_group_size": 1e9,
+            "reduce_scatter": True,
+        },
+        "optimizer": {
+            "type": "AdamW",
+            "params": {
+                "lr": cfg.learning_rate,
+                "betas": [cfg.beta1, cfg.beta2],
+                "eps": cfg.eps,
+                "weight_decay": cfg.weight_decay,
+            },
+        },
+        "scheduler": {
+            "type": "WarmupCosineLR",
+            "params": {
+                "warmup_min_lr": 0,
+                "warmup_max_lr": cfg.learning_rate,
+                "warmup_num_steps": cfg.warmup_steps,
+                "total_num_steps": cfg.max_steps,
+            },
+        },
+        "gradient_clipping": cfg.max_grad_norm,
+        "steps_per_print": cfg.log_every_n_steps,
+        "wall_clock_breakdown": False,
+    }
 
-        if is_best or loss < self.best_loss:
-            self.best_loss = loss
-            os.replace(self.latest_path, self.best_path)
-            print(f"  ⭐ Saved best checkpoint (loss {loss:.4f})")
 
-    def load(self, model, optimizer, scheduler):
-        ckpt_path = self.latest_path if self.latest_path.exists() else self.best_path
-        if not ckpt_path.exists():
-            print("  🔄 No checkpoint found, starting from scratch")
-            return 0, float("inf")
-
-        print(f"  🔄 Resuming from {ckpt_path.name}")
-        state = torch.load(ckpt_path, map_location=self.cfg.device, weights_only=False)
-        # Strip _orig_mod prefix from compiled model checkpoints
-        model_state = state["model_state_dict"]
-        unwanted_prefix = "_orig_mod."
-        for k,v in list(model_state.items()):
-            if k.startswith(unwanted_prefix):
-                model_state[k[len(unwanted_prefix):]] = model_state.pop(k)
-        model.load_state_dict(model_state)
-        try:
-            optimizer.load_state_dict(state["optimizer_state_dict"])
-        except Exception as e:
-            print(f"     ⚠ Optimizer state load failed (switching optimizers?): {e}")
-            print(f"     ⚠ Starting optimizer from scratch. Model weights preserved.")
-        if scheduler and "scheduler_state_dict" in state:
-            scheduler.load_state_dict(state["scheduler_state_dict"])
-        if "rng_state" in state:
-            try:
-                rng_state = state["rng_state"]
-                if isinstance(rng_state, list):
-                    rng_state = torch.tensor(rng_state, dtype=torch.uint8)
-                torch.set_rng_state(rng_state.cpu())
-            except Exception as e:
-                print(f"     ⚠ RNG restore skipped: {e}")
-        if "cuda_rng_state" in state and torch.cuda.is_available():
-            try:
-                cuda_states = state["cuda_rng_state"]
-                if isinstance(cuda_states, list) and cuda_states and isinstance(cuda_states[0], torch.Tensor):
-                    torch.cuda.set_rng_state_all([s.cpu() for s in cuda_states])
-                elif isinstance(cuda_states, torch.Tensor):
-                    torch.cuda.set_rng_state(cuda_states.cpu())
-                else:
-                    print(f"     ⚠ CUDA RNG restore skipped: unexpected type {type(cuda_states)}")
-            except Exception as e:
-                print(f"     ⚠ CUDA RNG restore skipped: {e}")
-        step = state.get("step", 0)
-        best_loss = state.get("best_loss", float("inf"))
-        print(f"     step {step}, best_loss {best_loss:.4f}")
-        return step, best_loss
-
-# ─── LR Scheduler ────────────────────────────────────────────────────────
-def get_lr(step: int, cfg: TrainConfig):
-    if step < cfg.warmup_steps:
-        return cfg.learning_rate * (step + 1) / cfg.warmup_steps
-    if step >= cfg.max_steps:
-        return cfg.min_lr
-    # Cosine decay
-    decay_ratio = (step - cfg.warmup_steps) / (cfg.max_steps - cfg.warmup_steps)
-    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
-    return cfg.min_lr + coeff * (cfg.learning_rate - cfg.min_lr)
-
-# ─── Training ───────────────────────────────────────────────────────
+# ─── Eval ─────────────────────────────────────────────────────
 @torch.no_grad()
 def generate_sample(model, tokenizer, prompt: str, max_new: int = 20, device: str = "cuda"):
-    """Quick greedy generation for real-situation eval."""
     model.eval()
     ids = tokenizer.encode(prompt, add_special_tokens=False)
     input_ids = torch.tensor([ids], dtype=torch.long, device=device)
@@ -350,6 +314,7 @@ def generate_sample(model, tokenizer, prompt: str, max_new: int = 20, device: st
     model.train()
     return out
 
+
 REAL_PROMPTS = [
     "The capital of France is",
     "1 + 1 =",
@@ -358,52 +323,48 @@ REAL_PROMPTS = [
     "Once upon a time",
 ]
 
+
 @torch.no_grad()
-def estimate_loss(model, val_loader, cfg: TrainConfig, max_batches: int = 50):
+def estimate_loss(model, val_loader, max_batches: int = 50):
     model.eval()
     losses = []
     for i, (x, y) in enumerate(val_loader):
         if i >= max_batches:
             break
-        x, y = x.to(cfg.device), y.to(cfg.device)
-        with torch.autocast(device_type=cfg.device, dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32):
-            _, loss = model(x, y)
+        x, y = x.cuda(), y.cuda()
+        _, loss = model(x, y)
         losses.append(loss.item())
     model.train()
     return sum(losses) / len(losses) if losses else float("inf")
 
+
+# ─── Training ─────────────────────────────────────────────────
 def train(cfg: TrainConfig):
     print(f"Device: {cfg.device}")
     print(f"Data dir: {cfg.data_dir}")
     print(f"Checkpoint dir: {cfg.checkpoint_dir}")
 
-    # Verify tokenizer exists
     tokenizer = AutoTokenizer.from_pretrained("HuggingFaceTB/SmolLM2-135M", trust_remote_code=True)
     print(f"Tokenizer vocab size: {len(tokenizer)}")
 
-    # Model
-    model = SmolLM2(cfg).to(cfg.device)
-    print(f"Model params: {model.count_parameters():,}")
+    # Create model on CPU (DeepSpeed will offload to GPU as needed)
+    model = SmolLM2(cfg)
+    n_params = model.count_parameters()
+    print(f"Model params: {n_params:,} ({n_params/1e9:.3f}B)")
 
-    # Optimizer (8-bit Adam to fit 0.5B in 12GB)
-    import bitsandbytes as bnb
-    optimizer = bnb.optim.AdamW8bit(
-        model.parameters(),
-        lr=cfg.learning_rate,
-        betas=(cfg.beta1, cfg.beta2),
-        eps=cfg.eps,
-        weight_decay=cfg.weight_decay,
-    )
-    scheduler = None  # manual LR
+    # DeepSpeed config
+    ds_config = make_ds_config(cfg)
+    print(f"DeepSpeed ZeRO-3 + CPU offload")
+    print(f"  batch_size={cfg.batch_size}, grad_accum={cfg.gradient_accumulation_steps}")
+    print(f"  effective batch={cfg.batch_size * cfg.gradient_accumulation_steps * cfg.seq_len:,} tok/step")
 
-    # Checkpoint manager
-    ckpt = CheckpointManager(cfg)
-    start_step, best_loss = ckpt.load(model, optimizer, scheduler)
-
-    # Compile AFTER loading checkpoint (avoids _orig_mod key mismatch)
-    if cfg.compile and hasattr(torch, "compile") and cfg.device == "cuda":
-        print("Compiling model with torch.compile...")
-        model = torch.compile(model)
+    # Initialize DeepSpeed engine
+    engine = deepspeed.initialize(
+        model=model,
+        model_parameters=model.parameters(),
+        config_params=ds_config,
+    )[0]
+    print(f"  Initialized engine")
 
     # Data
     train_loader = get_dataloader(cfg, is_val=False)
@@ -413,22 +374,16 @@ def train(cfg: TrainConfig):
     print(f"Train shards: {len(train_loader.dataset.shards)}")
     print(f"Val shards:   {len(val_loader.dataset.shards)}")
 
-    # Scaler for mixed precision (only if float16; bf16 doesn't need scaling)
-    use_amp = cfg.device == "cuda" and torch.cuda.is_bf16_supported()
-    scaler = torch.cuda.amp.GradScaler() if use_amp and hasattr(torch.cuda.amp, "GradScaler") and getattr(cfg, 'dtype', 'bfloat16') == 'float16' else None
-
     # Training loop
     t0 = time.time()
     running_loss = 0.0
-    step = start_step
+    step = 0
     val_interval = cfg.val_every_n_steps
+    best_loss = float("inf")
     stall_count = 0
 
     while step < cfg.max_steps:
         step += 1
-        lr = get_lr(step, cfg)
-        for param_group in optimizer.param_groups:
-            param_group["lr"] = lr
 
         # Gradient accumulation micro-batches
         accumulated_loss = 0.0
@@ -439,33 +394,15 @@ def train(cfg: TrainConfig):
                 train_iter = iter(train_loader)
                 x, y = next(train_iter)
 
-            x, y = x.to(cfg.device, non_blocking=True), y.to(cfg.device, non_blocking=True)
-            ctx = torch.autocast(device_type=cfg.device, dtype=torch.bfloat16 if use_amp else torch.float32)
-            with ctx:
-                _, loss = model(x, y)
-                loss = loss / cfg.gradient_accumulation_steps
+            x, y = x.cuda(non_blocking=True), y.cuda(non_blocking=True)
+
+            output = engine(x, y)
+            loss = output[1] if isinstance(output, tuple) else output
+            engine.backward(loss)
+
             accumulated_loss += loss.item()
 
-            if scaler:
-                scaler.scale(loss).backward()
-            else:
-                loss.backward()
-
-            # No sleep between microsteps - maximize GPU utilization
-            if micro_step < cfg.gradient_accumulation_steps - 1:
-                pass
-
-        # Clip + step
-        if scaler:
-            scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.max_grad_norm)
-
-        if scaler:
-            scaler.step(optimizer)
-            scaler.update()
-        else:
-            optimizer.step()
-        optimizer.zero_grad(set_to_none=True)
+        engine.step()
 
         running_loss += accumulated_loss
 
@@ -475,16 +412,22 @@ def train(cfg: TrainConfig):
             t0 = time.time()
             tokens_per_sec = (cfg.batch_size * cfg.seq_len * cfg.gradient_accumulation_steps * cfg.log_every_n_steps) / dt
             avg_loss = running_loss / cfg.log_every_n_steps
-            print(f"step {step:6d} | loss {avg_loss:.4f} | lr {lr:.2e} | {dt:.1f}s | {tokens_per_sec:,.0f} tok/s")
+            print(f"step {step:6d} | loss {avg_loss:.4f} | {dt:.1f}s | {tokens_per_sec:,.0f} tok/s")
             running_loss = 0.0
 
-        # Validation (adaptive: 30 min normally, 15 min if plateau)
+            # Memory info
+            if torch.cuda.is_available():
+                alloc = torch.cuda.memory_allocated() / 1024**3
+                reserved = torch.cuda.memory_reserved() / 1024**3
+                print(f"  │ GPU: {alloc:.2f}GB alloc / {reserved:.2f}GB reserved")
+
+        # Validation
         if step % val_interval == 0:
-            val_loss = estimate_loss(model, val_loader, cfg)
-            print(f"  📊 Val loss: {val_loss:.4f} | best: {best_loss:.4f} | eval_every={val_interval}")
-            # Real-situation generation sample
+            internal_model = engine.module if hasattr(engine, 'module') else engine
+            val_loss = estimate_loss(internal_model, val_loader)
+            print(f"  📊 Val loss: {val_loss:.4f} | best: {best_loss:.4f}")
             test_prompt = REAL_PROMPTS[step % len(REAL_PROMPTS)]
-            gen = generate_sample(model, tokenizer, test_prompt, max_new=15, device=cfg.device)
+            gen = generate_sample(internal_model, tokenizer, test_prompt, max_new=15, device=cfg.device)
             print(f"  💬 Gen: {gen[:80]}")
             if val_loss < best_loss:
                 best_loss = val_loss
@@ -493,16 +436,19 @@ def train(cfg: TrainConfig):
                 stall_count += 1
                 if stall_count >= 3 and val_interval > 50:
                     val_interval = max(50, val_interval // 2)
-                    print(f"  ⚠ Plateau detected → eval every {val_interval} steps (~15 min)")
+                    print(f"  ⚠ Plateau → eval every {val_interval} steps")
 
-        # Checkpointing
+        # Checkpoint
         if step % cfg.save_every_n_steps == 0:
-            ckpt.save(model, optimizer, scheduler, step, val_loss, is_best=(val_loss == best_loss))
+            ckpt_dir = str(cfg.checkpoint_dir)
+            engine.save_checkpoint(ckpt_dir, tag=f"step_{step}")
+            print(f"  💾 Saved checkpoint (step {step})")
 
     # Final save
-    val_loss = estimate_loss(model, val_loader, cfg)
-    ckpt.save(model, optimizer, scheduler, step, val_loss, is_best=(val_loss < best_loss))
-    print(f"\n✅ Training complete. Final val loss: {val_loss:.4f}")
+    ckpt_dir = str(cfg.checkpoint_dir)
+    engine.save_checkpoint(ckpt_dir, tag=f"step_{step}")
+    print(f"\n✅ Training complete.")
+
 
 if __name__ == "__main__":
     cfg = TrainConfig()
