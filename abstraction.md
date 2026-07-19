@@ -47,21 +47,40 @@
 | `mlp_norm` | 1536 | 1,536 |
 | **Layer total** | | **27,528,192** |
 
-### Data Sources (Curated Mixture)
+## Data Inventory (Current)
 
-| Dataset | Source | Ratio | Raw Size | What It Contains |
-|---------|--------|-------|----------|------------------|
-| **FineWeb-Edu** | `HuggingFaceFW/fineweb-edu` | 45% | 64 GB parquet | High-quality educational web pages (Common Crawl filtered for educational value) |
-| **FineMath-3Plus** | `HuggingFaceTB/finemath-3plus` | 20% | 58 GB parquet | Advanced mathematical text, proofs, derivations |
-| **Cosmopedia** | `HuggingFaceTB/cosmopedia` | 12% | ~80 GB parquet | Synthetic textbooks, encyclopedia articles |
-| **OpenWebMath** | `open-web-math/open-web-math` | 10% | 2.5 GB parquet | High-quality math content from the web |
-| **FineMath** | `HuggingFaceTB/finemath` | 8% | 2.2 GB parquet | Mathematical text, proofs, derivations |
+**Disk total**: 506 GB — **151 GB used**, 330 GB free
+
+| What | Location | Size | Format | Status |
+|------|----------|------|--------|--------|
+| **Pretrain .bin shards** | `_shards_final/` | **7.4 GB** | 16× `.bin` (uint16, 3.97B tokens) | ✅ Uploaded to HF (`kenpeter123/small-pretrain-data`) |
+| **SFT .pt shards** | `_sft_final_shards/` | **24 GB** | 71× `.pt` (43 OpenOrca, 15 UltraChat, 11 OpenHermes, 1 Alpaca, 1 CodeAlpaca) | 🕐 Uploading to HF |
+| **Checkpoints** | `checkpoints/` | **12 GB** | 2× `.pt` (megatrain_latest + megatrain_best) | Active training |
+| **Raw parquet (downloading)** | `_staging_multi/` | ~**15-100 GB** | `.parquet` (FineWeb-Edu 200 files, FineMath-3Plus, Cosmopedia, OpenWebMath) | 🕐 Downloading (low-impact, 3 workers) |
+| **LeetCode datasets** | various | **~1 GB** | `.parquet` | Small code data |
+| **CoT raw** | `_cot_raw/` | **67 MB** | text | Small reasoning data |
+
+### Original Data Sources (Before Filtering)
+
+| Dataset | Source | Raw Size | What It Contains |
+|---------|--------|----------|------------------|
+| **FineWeb-Edu** | `HuggingFaceFW/fineweb-edu` | ~180 GB (2410 parquet files) | High-quality educational web pages (Common Crawl) |
+| **FineMath-3Plus** | `HuggingFaceTB/finemath` | ~58 GB (128 parquet files) | Advanced mathematical text |
+| **Cosmopedia** | `HuggingFaceTB/cosmopedia` | ~80 GB (13 parquet files) | Synthetic textbooks |
+| **OpenWebMath** | `open-web-math/open-web-math` | ~2.5 GB (114 parquet files) | High-quality math content |
+| **FineMath** | `HuggingFaceTB/finemath` | ~2.2 GB | Mathematical text |
+
+### Pipeline History
+
+- **First pass (deleted)**: Raw parquets downloaded → aggressive heuristics (~90% rejection) → 3.97B tokens → **raw parquets deleted**
+- **Current download (in progress)**: Re-downloading with `download_data_relaxed.py`. Low-impact (3 workers, nice 19). Will keep raws permanently.
+- **Plan**: Dedup-only processing (skip heuristics) → tokenize to `.bin` → combine with existing 3.97B shards → continue training.
 
 ### Pretraining Configuration
 
 | Parameter | Value |
 |-----------|-------|
-| Total tokens | ~3.97 billion (best-of-best filtered) |
+| Total tokens so far | ~3.97 billion (top-10% filtered) |
 | Sequence length | 2048 tokens |
 | Tokenizer | `HuggingFaceTB/SmolLM2-135M` (BPE, uint16 output) |
 | Shard format | `.bin` files (~256 M tokens each, 17 shards) |
@@ -82,10 +101,10 @@
 ```bash
 cd /home/kenpeter/work/small
 source venv/bin/activate
-python3 train.py  # 1B config default, loads .bin shards from _shards_final
+python3 pretrain_megatrain.py --batch-size 8 --grad-accum 6 --lr 4e-4 --num-steps 242188 --num-grad-slabs 6
 ```
 
-**Resume capability**: `megatrain_latest.pt` contains model weights, optimizer state, scheduler state, RNG seeds, and step count. Restarting the script restores exact training state.
+**Resume capability**: `megatrain_latest.pt` contains model weights, optimizer state, scheduler state, RNG seeds, and step count. Restarting the script restores exact training state. Active training: step ~6000, loss ~4.23, ~2.8k tok/s.
 
 ---
 
@@ -157,7 +176,7 @@ Not yet started. DPO data was cleaned up — will need fresh preparation when re
 
 | Phase | GPU VRAM | RAM | Disk | Time Estimate |
 |-------|----------|-----|------|---------------|
-| Pretraining 1B @ 3.97B tokens | ~5 GB (RTX 4070 Ti 12 GB) | 16 GB | 7.9 GB shards | ~30 days (batch=1, ~1500 tok/s) |
+| Pretraining 1B @ 3.97B tokens | 3.2 GB (RTX 4070 Ti 12 GB, power limit 150W) | 93 GB | 7.4 GB shards | ~3 days (batch=8, accum=6, ~2.8k tok/s) |
 | SFT | 8 GB | 8 GB | +24 GB | ~4 hours |
 | DPO | 8 GB | 8 GB | +2 GB | ~2 hours |
 
@@ -188,9 +207,13 @@ Not yet started. DPO data was cleaned up — will need fresh preparation when re
 
 ### Disk Space Management
 - 506 GB total. Data prep creates ~280G intermediate files — always clean up staging/filtered dirs after each run.
-- Checkpoint rules: keep only latest + best per phase (~4 GB total)
+- **CRITICAL**: Never delete raw parquet downloads in `_staging_multi/` — they're the source of truth. Without them, we can't re-tokenize with different filters.
+- Checkpoint rules: keep only latest + best per phase (~12 GB total for 1B model)
 
 ### Current Config
 - 1B model: dim=1536, L=32, h=12, kv=4, ffn=4608
-- batch=1, accum=48, seq=2048
-- 8-bit Adam + gradient checkpointing + optional CPU offload
+- batch=8, grad_accum=6, slabs=6, seq=2048 (MegaTrain)
+- PyTorch AdamW (CPU) — DeepSpeedCPUAdam caused NaN at step 36
+- GPU power limit: 150W (temperatures ~70-74°C)
+- Training: ~2.8k tok/s, GPU memory 3.16 GB/12.3 GB
+- Loss trajectory: 11.0 (step 0) → 4.23 (step 6000)
