@@ -7,12 +7,13 @@ if [ ! -f "$LOG" ]; then
     exit 0
 fi
 
-# Latest step line
-LATEST=$(grep "^step " "$LOG" | tail -1)
-# Latest validation line
-VAL=$(grep "Val loss" "$LOG" | tail -1)
+# Latest step line (MegaTrain format: Step X/Y | Loss ...)
+LATEST=$(grep '| Loss' "$LOG" | tail -1)
 # GPU memory
 GPU=$(nvidia-smi --query-gpu=memory.used,memory.total --format=csv,noheader,nounits 2>/dev/null | head -1)
+# Duration
+PID=$(pgrep -f 'pretrain_megatrain' 2>/dev/null | head -1)
+START=$(grep 'Starting pretraining' "$LOG" | tail -1 | head -c 21 2>/dev/null)
 
 {
     echo "=== Training Status ==="
@@ -24,14 +25,11 @@ GPU=$(nvidia-smi --query-gpu=memory.used,memory.total --format=csv,noheader,noun
         echo "No step logged yet"
     fi
     echo ""
-    if [ -n "$VAL" ]; then
-        echo "$VAL"
-    fi
+    echo "GPU memory: ${GPU:-N/A} MB" 
+    echo "PID: ${PID:-stopped}"
+    echo "Started: $START"
     echo ""
-    echo "GPU Memory: ${GPU:-N/A} MB used"
-    echo "PID: $(pgrep -f 'python3 train.py' 2>/dev/null | head -1 || echo 'not running')"
-    echo ""
-    echo "=== Last 20 lines ==="
+    echo "=== Last 20 log lines ==="
     tail -20 "$LOG"
 } > "$STATUS"
 

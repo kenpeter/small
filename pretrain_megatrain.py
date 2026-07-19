@@ -9,7 +9,7 @@ import torch
 from torch.utils.data import DataLoader, Dataset
 import numpy as np
 
-from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
+from transformers import AutoModelForCausalLM, AutoTokenizer, LlamaConfig
 from infinity import CPUMasterModel
 from infinity.config import CPUMasterConfig
 
@@ -20,6 +20,7 @@ SEQ_LEN = 2048
 
 class BinShardDataset(Dataset):
     """Memory-maps .bin shards and yields sequences of SEQ_LEN tokens."""
+    _causal_mask_4d = None  # cached 4D bool causal mask
     def __init__(self, shards_dir, seq_len: int = 2048):
         shards_dir = Path(shards_dir)
         shard_paths = sorted(shards_dir.glob("shard_*.bin"))
@@ -62,42 +63,64 @@ class BinShardDataset(Dataset):
 def collate_pretrain(batch):
     """Collate pretraining batch: labels = input_ids (all tokens train)."""
     input_ids = torch.stack(batch)  # (batch, seq_len)
-    attention_mask = torch.ones_like(input_ids)
+    B, T = input_ids.shape
+    # 4D causal mask for SDPA: True = attend (lower triangle). Cached globally.
+    if BinShardDataset._causal_mask_4d is None or BinShardDataset._causal_mask_4d.shape[-1] != T:
+        BinShardDataset._causal_mask_4d = torch.tril(torch.ones((1, 1, T, T), dtype=torch.bool))
     labels = input_ids.clone()
-    return {"input_ids": input_ids, "attention_mask": attention_mask, "labels": labels}
+    return {"input_ids": input_ids, "attention_mask": BinShardDataset._causal_mask_4d.expand(B, -1, -1, -1).contiguous(), "labels": labels}
 
 def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", type=str, default="HuggingFaceTB/SmolLM2-1.7B")
     parser.add_argument("--batch-size", type=int, default=4)
-    parser.add_argument("--num-steps", type=int, default=1000)
+    parser.add_argument("--num-steps", type=int, default=484560)
     parser.add_argument("--lr", type=float, default=4e-4)
     parser.add_argument("--max-seq-len", type=int, default=SEQ_LEN)
     parser.add_argument("--checkpoint-interval", type=int, default=4)
+    parser.add_argument("--grad-accum", type=int, default=12)
     parser.add_argument("--num-grad-slabs", type=int, default=12)
     parser.add_argument("--device", type=int, default=0)
-    parser.add_argument("--log-interval", type=int, default=10)
+    parser.add_argument("--log-interval", type=int, default=120)
+    parser.add_argument("--save-interval", type=int, default=12000)
     parser.add_argument("--output-dir", type=str, default="/home/kenpeter/work/checkpoints")
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
 
     logger.info("=" * 60)
-    logger.info(f"Model: {args.model}")
+    logger.info(f"Model: Custom 1032M (dim=1536, L=32, h=12, kv=4, ffn=4608)")
     logger.info(f"Data: {SHARDS_DIR}")
     logger.info(f"Params: batch={args.batch_size}, seq_len={args.max_seq_len}, steps={args.num_steps}")
 
     # Load tokenizer (for reference, not used in training since data is pre-tokenized)
     tokenizer = AutoTokenizer.from_pretrained("HuggingFaceTB/SmolLM2-135M", trust_remote_code=True)
 
-    # Load model
-    logger.info("Loading model...")
-    hf_model = AutoModelForCausalLM.from_pretrained(
-        args.model,
-        torch_dtype=torch.bfloat16,
-        device_map="cpu",
+    # Load model from scratch (random init, using our custom architecture)
+    logger.info("Creating model from custom config (random init)...")
+    hf_config = LlamaConfig(
+        vocab_size=49152,
+        hidden_size=1536,
+        intermediate_size=4608,
+        num_hidden_layers=32,
+        num_attention_heads=12,
+        num_key_value_heads=4,
+        max_position_embeddings=8192,
+        rope_theta=10000.0,
+        rms_norm_eps=1e-5,
+        hidden_act="silu",
+        tie_word_embeddings=False,
+        attention_bias=False,
+        mlp_bias=False,
+        initializer_range=0.02,
+        torch_dtype="bfloat16",
+        head_dim=128,
+        architectures=["LlamaForCausalLM"],
+    )
+    hf_model = AutoModelForCausalLM.from_config(
+        hf_config,
+        dtype=torch.bfloat16,
         trust_remote_code=True,
         attn_implementation="sdpa",
     )
@@ -106,12 +129,13 @@ def main():
 
     # MegaTrain config
     config = CPUMasterConfig(
-        model_name=args.model,
+        model_name="custom-1B",
         dataset_path="/tmp/dummy",  # dummy — we use our own dataset
         max_seq_len=args.max_seq_len,
         batch_size=args.batch_size,
         num_steps=args.num_steps,
         learning_rate=args.lr,
+        gradient_accumulation_steps=args.grad_accum,
         checkpoint_interval=args.checkpoint_interval,
         num_grad_slabs=args.num_grad_slabs,
         device=args.device,
@@ -125,27 +149,15 @@ def main():
     model = CPUMasterModel(hf_model, config)
     del hf_model
 
-    # Setup optimizer
-    logger.info("Setting up DeepSpeed CPUAdam...")
-    try:
-        from deepspeed.ops.adam import DeepSpeedCPUAdam
-        optimizer = DeepSpeedCPUAdam(
-            model.get_parameters(),
-            lr=config.learning_rate,
-            betas=(config.beta1, config.beta2),
-            eps=config.eps,
-            weight_decay=config.weight_decay,
-            adamw_mode=True
-        )
-    except ImportError:
-        logger.warning("DeepSpeed CPUAdam not available, using PyTorch AdamW")
-        optimizer = torch.optim.AdamW(
-            model.get_parameters(),
-            lr=config.learning_rate,
-            betas=(config.beta1, config.beta2),
-            eps=config.eps,
-            weight_decay=config.weight_decay,
-        )
+    # Setup optimizer (PyTorch CPU AdamW — DeepSpeedCPUAdam causes NaN with gradient accum)
+    logger.info("Setting up PyTorch CPU AdamW...")
+    optimizer = torch.optim.AdamW(
+        model.get_parameters(),
+        lr=config.learning_rate,
+        betas=(config.beta1, config.beta2),
+        eps=config.eps,
+        weight_decay=config.weight_decay,
+    )
 
     # Dataset
     logger.info("Loading dataset...")
@@ -200,7 +212,7 @@ def main():
             )
 
         # Save checkpoints
-        if (step + 1) % 500 == 0 or step == config.num_steps - 1:
+        if (step + 1) % args.save_interval == 0 or step == config.num_steps - 1:
             is_best = loss_val < best_loss
             if is_best:
                 best_loss = loss_val

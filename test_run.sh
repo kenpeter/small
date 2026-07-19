@@ -3,12 +3,12 @@ cd /home/kenpeter/work/small
 source venv/bin/activate
 export PYTHONUNBUFFERED=1
 exec python3 -u pretrain_megatrain.py \
-  --batch-size 8 \
-  --grad-accum 6 \
+  --batch-size 4 \
+  --grad-accum 12 \
   --lr 4e-4 \
-  --log-interval 240 \
-  --save-interval 2400 \
-  --num-steps 242188 \
+  --log-interval 1 \
+  --save-interval 100 \
+  --num-steps 3 \
   --checkpoint-interval 4 \
-  --num-grad-slabs 6 \
-  > training.log 2>&1
+  --num-grad-slabs 12 \
+  > /home/kenpeter/work/small/training.log 2>&1
