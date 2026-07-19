@@ -23,21 +23,21 @@ from transformers import AutoTokenizer
 # ─── Config ───────────────────────────────────────────────────
 @dataclass
 class TrainConfig:
-    # Model (0.5B: dim=1024, L=32, h=8, kv=4, ffn=3072)
+    # Model (~1B: dim=1536, L=32, h=12, kv=4, ffn=3840)
     vocab_size: int = 49152
-    dim: int = 1024
+    dim: int = 1536
     n_layers: int = 32
-    n_heads: int = 8
+    n_heads: int = 12
     n_kv_heads: int = 4
-    intermediate_size: int = 3072
+    intermediate_size: int = 4608
     max_seq_len: int = 8192
     rope_theta: float = 10000.0
     rms_norm_eps: float = 1e-5
     dropout: float = 0.0
 
     # Training
-    batch_size: int = 2
-    gradient_accumulation_steps: int = 24
+    batch_size: int = 1
+    gradient_accumulation_steps: int = 48
     max_steps: int = 100_000
     learning_rate: float = 4e-4
     min_lr: float = 1e-4
@@ -52,6 +52,7 @@ class TrainConfig:
     val_every_n_steps: int = 500
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     use_gradient_checkpointing: bool = True
+    cpu_offload: bool = False
     compile: bool = False
     seq_len: int = 2048
     val_frac: float = 0.01
@@ -382,8 +383,11 @@ def train(cfg: TrainConfig):
     print(f"Tokenizer vocab size: {len(tokenizer)}")
 
     # Model
-    model = SmolLM2(cfg).to(cfg.device)
+    model = SmolLM2(cfg)
+    if not cfg.cpu_offload:
+        model = model.to(cfg.device)
     print(f"Model params: {model.count_parameters():,}")
+    print(f"CPU offload: {cfg.cpu_offload}")
 
     # Optimizer (8-bit Adam to fit 0.5B in 12GB)
     import bitsandbytes as bnb
@@ -429,6 +433,10 @@ def train(cfg: TrainConfig):
         lr = get_lr(step, cfg)
         for param_group in optimizer.param_groups:
             param_group["lr"] = lr
+
+        # Move model to GPU at start of step if offloaded
+        if cfg.cpu_offload:
+            model.to(cfg.device)
 
         # Gradient accumulation micro-batches
         accumulated_loss = 0.0

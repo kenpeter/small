@@ -137,12 +137,12 @@ def generate(prompt, max_new=128, temperature=0.7, top_p=0.9):
             cumsum = torch.cumsum(sorted_probs, dim=-1)
             sorted_probs[cumsum > top_p] = 0
             sorted_probs = sorted_probs / sorted_probs.sum(dim=-1, keepdim=True)
-            # Clamp to avoid NaN from numerical issues
             sorted_probs = sorted_probs.clamp(min=0)
             if sorted_probs.sum() <= 0 or torch.isnan(sorted_probs).any():
                 next_tok = logits.argmax(dim=-1, keepdim=True)
             else:
-                next_tok = sorted_idx[torch.multinomial(sorted_probs, num_samples=1).item()].unsqueeze(0)
+                idx = torch.multinomial(sorted_probs[0], num_samples=1).item()
+                next_tok = sorted_idx[:, idx:idx+1]
         else:
             next_tok = logits.argmax(dim=-1, keepdim=True)
         ids = torch.cat([ids, next_tok], dim=1)
