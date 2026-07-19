@@ -8,18 +8,44 @@
 
 **Goal**: Teach the model the structure of language, facts, code syntax, and reasoning patterns.
 **Method**: Next-token prediction on massive raw text corpora.
-**Architecture**: Transformer++ (RMSNorm, SwiGLU, RoPE, GQA, KV Cache)
+**Architecture**: Transformer++ (RMSNorm, SwiGLU, RoPE, GQA)
+
+### Architecture
 
 | Spec | Value |
 |------|-------|
-| Parameters | ~1032 M (embedding + 32 layers + LM head) |
-| Hidden dimension | 1536 |
-| Layers | 32 |
-| Attention heads | 12 (query) / 4 (key-value) — GQA |
-| FFN intermediate size | 4608 (SwiGLU) |
+| Total parameters | 1,031,898,624 (~1032 M) |
+| Embedding params | 75,497,472 (49152 × 1536) |
+| Per-layer params | 27,528,192 |
+| LM head params | 75,497,472 (1536 × 49152, untied) |
+| Hidden dimension (dim) | 1536 |
+| Layers (n_layers) | 32 |
+| Attention heads (n_heads) | 12 |
+| Key-value heads (n_kv_heads) | 4 (GQA ratio 3:1) |
+| Head dimension (head_dim) | 128 |
+| FFN intermediate size | 4608 (SwiGLU: gate+up+down) |
 | Max sequence length | 8192 |
-| RoPE base θ | 10 000 |
+| RoPE base θ | 10,000 |
 | RMSNorm ε | 1e-5 |
+| Dropout | 0.0 |
+| Weight tying | No (embedding ≠ lm_head) |
+| Activation | SiLU (via SwiGLU) |
+| Position encoding | Rotary (RoPE) |
+
+### Per-Layer Breakdown
+
+| Component | Shape | Params |
+|-----------|-------|--------|
+| `q_proj` | 1536 × 1536 | 2,359,296 |
+| `k_proj` | 1536 × 512 | 786,432 |
+| `v_proj` | 1536 × 512 | 786,432 |
+| `o_proj` | 1536 × 1536 | 2,359,296 |
+| `gate_proj` | 1536 × 4608 | 7,077,888 |
+| `up_proj` | 1536 × 4608 | 7,077,888 |
+| `down_proj` | 4608 × 1536 | 7,077,888 |
+| `attn_norm` | 1536 | 1,536 |
+| `mlp_norm` | 1536 | 1,536 |
+| **Layer total** | | **27,528,192** |
 
 ### Data Sources (Curated Mixture)
 

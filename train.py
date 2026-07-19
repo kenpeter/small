@@ -13,6 +13,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 # TF32 for faster matmul on Ampere+ (negligible accuracy loss)
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
@@ -253,8 +255,8 @@ class CheckpointManager:
         self.cfg = cfg
         self.checkpoint_dir = cfg.checkpoint_dir
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
-        self.latest_path = self.checkpoint_dir / "checkpoint_latest.pt"
-        self.best_path = self.checkpoint_dir / "checkpoint_best.pt"
+        self.latest_path = self.checkpoint_dir / "megatrain_latest.pt"
+        self.best_path = self.checkpoint_dir / "megatrain_best.pt"
         self.best_loss = float("inf")
 
     def save(self, model, optimizer, scheduler, step: int, loss: float, is_best: bool = False):
@@ -384,12 +386,13 @@ def train(cfg: TrainConfig):
 
     # Model
     model = SmolLM2(cfg)
+    model = model.to(torch.bfloat16)
     if not cfg.cpu_offload:
         model = model.to(cfg.device)
     print(f"Model params: {model.count_parameters():,}")
     print(f"CPU offload: {cfg.cpu_offload}")
 
-    # Optimizer (8-bit Adam to fit 0.5B in 12GB)
+    # Optimizer (8-bit Adam — create AFTER model is on target device so states live there)
     import bitsandbytes as bnb
     optimizer = bnb.optim.AdamW8bit(
         model.parameters(),
@@ -474,6 +477,11 @@ def train(cfg: TrainConfig):
         else:
             optimizer.step()
         optimizer.zero_grad(set_to_none=True)
+
+        # Offload model to CPU to free GPU memory between steps
+        if cfg.cpu_offload:
+            model.to("cpu")
+            torch.cuda.empty_cache()
 
         running_loss += accumulated_loss
 
