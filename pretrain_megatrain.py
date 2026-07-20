@@ -165,13 +165,13 @@ def main():
         attention_bias=False,
         mlp_bias=False,
         initializer_range=0.02,
-        torch_dtype="bfloat16",
+        torch_dtype="float32",
         head_dim=128,
         architectures=["LlamaForCausalLM"],
     )
     hf_model = AutoModelForCausalLM.from_config(
         hf_config,
-        dtype=torch.bfloat16,
+        dtype=torch.float32,
         trust_remote_code=True,
         attn_implementation="sdpa",
     )
@@ -215,7 +215,7 @@ def main():
         checkpoint_interval=args.checkpoint_interval,
         num_grad_slabs=args.num_grad_slabs,
         device=args.device,
-        dtype=torch.bfloat16,
+        dtype=torch.float32,
         log_interval=1,
         attn_implementation="sdpa",
         trust_remote_code=True,
