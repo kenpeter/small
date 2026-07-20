@@ -2,7 +2,7 @@
 Pretraining with MegaTrain — CPU offloaded training of SmolLM2-1.7B.
 Loads .bin shards directly (already tokenized with SmolLM2 tokenizer).
 """
-import os, time, logging, argparse, math
+import os, time, logging, argparse, math, shutil
 from pathlib import Path
 
 import torch
@@ -70,6 +70,57 @@ def collate_pretrain(batch):
     labels = input_ids.clone()
     return {"input_ids": input_ids, "attention_mask": BinShardDataset._causal_mask_4d.expand(B, -1, -1, -1).contiguous(), "labels": labels}
 
+
+def validate_cpu_params(model, logger):
+    """Quick NaN/Inf check on CPU master params. Call after every optimizer step."""
+    bad = 0
+    for p in model.get_parameters():
+        if p is not None and not torch.isfinite(p).all():
+            bad += 1
+    if bad:
+        logger.error(f"CRITICAL: {bad} CPU master parameters are non-finite after sync. Training would corrupt checkpoints.")
+        raise RuntimeError(f"NaN/Inf detected in {bad} CPU master params after optimizer step. Aborting to preserve clean state.")
+
+
+def save_checkpoint_robust(state, output_dir, is_best, logger):
+    """Atomic save with NaN/Inf validation and backup rotation.
+    Skips write if any tensor is non-finite, preserving the last clean checkpoint."""
+    # 1. Validate all tensors
+    model_sd = state.get("model_state_dict", {})
+    bad_keys = []
+    for k, v in model_sd.items():
+        if not torch.isfinite(v).all():
+            n_bad = (~torch.isfinite(v)).sum().item()
+            n_total = v.numel()
+            bad_keys.append(f"{k}: {n_bad}/{n_total} non-finite")
+    if bad_keys:
+        logger.warning(f"Checkpoint SAVE ABORTED — non-finite tensors detected ({len(bad_keys)}):")
+        for msg in bad_keys[:5]:
+            logger.warning(f"  {msg}")
+        if len(bad_keys) > 5:
+            logger.warning(f"  ... and {len(bad_keys) - 5} more")
+        return False
+
+    # 2. Atomic write to temp then rename
+    latest_path = os.path.join(output_dir, "megatrain_latest.pt")
+    tmp_path = latest_path + ".tmp"
+    torch.save(state, tmp_path)
+    os.replace(tmp_path, latest_path)
+    logger.info(f"  Saved checkpoint to {latest_path}")
+
+    # 3. Best checkpoint with rotation (keep previous best as .bak)
+    if is_best:
+        best_path = os.path.join(output_dir, "megatrain_best.pt")
+        bak_path = best_path + ".bak"
+        if os.path.exists(best_path):
+            shutil.copy2(best_path, bak_path)
+        torch.save(state, tmp_path)
+        os.replace(tmp_path, best_path)
+        logger.info(f"  Best loss {state['best_loss']:.4f} — saved to {best_path}")
+
+    return True
+
+
 def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
@@ -127,6 +178,31 @@ def main():
     n_params = sum(p.numel() for p in hf_model.parameters())
     logger.info(f"Model loaded: {n_params:,} parameters ({n_params/1e9:.2f}B)")
 
+    # --- Resume from checkpoint if available ---
+    latest_path = os.path.join(args.output_dir, "megatrain_latest.pt")
+    start_step = 0
+    best_loss = float("inf")
+    if os.path.exists(latest_path):
+        logger.info(f"Resuming from {latest_path} ...")
+        state = torch.load(latest_path, map_location="cpu", weights_only=False)
+        # Load model weights
+        model_state = state.get("model_state_dict", {})
+        # Strip _orig_mod prefix if any
+        unwanted_prefix = "_orig_mod."
+        for k, v in list(model_state.items()):
+            if k.startswith(unwanted_prefix):
+                model_state[k[len(unwanted_prefix):]] = model_state.pop(k)
+        missing, unexpected = hf_model.load_state_dict(model_state, strict=False)
+        if missing:
+            logger.info(f"Missing keys: {missing[:5]}")
+        if unexpected:
+            logger.info(f"Unexpected keys: {unexpected[:5]}")
+        logger.info(f"Loaded model weights from step {state.get('step', 0)}")
+        start_step = state.get("step", 0)
+        best_loss = state.get("best_loss", float("inf"))
+    else:
+        logger.info("No checkpoint found, starting from scratch.")
+
     # MegaTrain config
     config = CPUMasterConfig(
         model_name="custom-1B",
@@ -159,6 +235,21 @@ def main():
         weight_decay=config.weight_decay,
     )
 
+    # Resume optimizer state if checkpoint exists
+    latest_path = os.path.join(args.output_dir, "megatrain_latest.pt")
+    if os.path.exists(latest_path):
+        state = torch.load(latest_path, map_location="cpu", weights_only=False)
+        if "optimizer_state_dict" in state:
+            try:
+                optimizer.load_state_dict(state["optimizer_state_dict"])
+                logger.info("Resumed optimizer state from checkpoint")
+            except Exception as e:
+                logger.warning(f"Could not resume optimizer state: {e}")
+        else:
+            logger.info("No optimizer state in checkpoint, starting fresh")
+    else:
+        logger.info("No checkpoint found, starting from scratch")
+
     # Dataset
     logger.info("Loading dataset...")
     dataset = BinShardDataset(SHARDS_DIR, seq_len=args.max_seq_len)
@@ -167,8 +258,8 @@ def main():
         batch_size=args.batch_size,
         collate_fn=collate_pretrain,
         shuffle=True,
-        num_workers=2,
-        pin_memory=True,
+        num_workers=0,
+        pin_memory=False,
     )
     data_iter = iter(dataloader)
 
@@ -177,8 +268,8 @@ def main():
     logger.info("Starting pretraining...")
     logger.info("=" * 60)
 
-    best_loss = float("inf")
-    for step in range(config.num_steps):
+    best_loss = float("inf") if start_step == 0 else best_loss
+    for step in range(start_step, config.num_steps):
         try:
             batch = next(data_iter)
         except StopIteration:
@@ -195,6 +286,7 @@ def main():
             torch.nn.utils.clip_grad_norm_(model.get_parameters(), config.max_grad_norm)
             optimizer.step()
             model._sync_params_to_gpu()
+            validate_cpu_params(model, logger)
             model.zero_grad()
             optimizer.zero_grad()
 
@@ -240,14 +332,7 @@ def main():
                 "optimizer_state_dict": optimizer.state_dict(),
             }
 
-            latest_path = os.path.join(args.output_dir, "megatrain_latest.pt")
-            torch.save(state, latest_path)
-            logger.info(f"  Saved checkpoint to {latest_path}")
-
-            if is_best:
-                best_path = os.path.join(args.output_dir, "megatrain_best.pt")
-                torch.save(state, best_path)
-                logger.info(f"  Best loss {best_loss:.4f} — saved to {best_path}")
+            save_checkpoint_robust(state, args.output_dir, is_best, logger)
 
     model.cleanup()
     logger.info("Pretraining complete!")

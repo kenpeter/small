@@ -1,0 +1,30 @@
+=== Training Status ===
+Updated: Tue Jul 21 08:00:01 AM AEST 2026
+
+2026-07-20 13:43:56,764 [INFO] Step 18240/242188 | Loss 3.4519 | 6.04s/step | 2712 tok/s | GPU 3.16GB
+
+GPU memory: 340, 12282 MB
+PID: stopped
+Started: 2026-07-19 12:13:50,7
+
+=== Last 20 log lines ===
+2026-07-20 08:29:59,805 [INFO]   Saved checkpoint to /home/kenpeter/work/checkpoints/megatrain_latest.pt
+2026-07-20 08:30:04,545 [INFO]   Best loss 3.6922 — saved to /home/kenpeter/work/checkpoints/megatrain_best.pt
+2026-07-20 08:49:26,590 [INFO] Step 14640/242188 | Loss 3.6317 | 5.90s/step | 2776 tok/s | GPU 3.16GB
+2026-07-20 09:08:36,948 [INFO] Step 14880/242188 | Loss 3.6961 | 5.88s/step | 2787 tok/s | GPU 3.16GB
+2026-07-20 09:27:47,312 [INFO] Step 15120/242188 | Loss 3.7147 | 5.89s/step | 2784 tok/s | GPU 3.16GB
+2026-07-20 09:46:58,079 [INFO] Step 15360/242188 | Loss 3.6053 | 5.89s/step | 2780 tok/s | GPU 3.16GB
+2026-07-20 10:06:27,646 [INFO] Step 15600/242188 | Loss 3.5476 | 6.07s/step | 2699 tok/s | GPU 3.16GB
+2026-07-20 10:26:12,105 [INFO] Step 15840/242188 | Loss 3.6776 | 6.02s/step | 2722 tok/s | GPU 3.16GB
+2026-07-20 10:45:57,081 [INFO] Step 16080/242188 | Loss 3.6033 | 6.04s/step | 2715 tok/s | GPU 3.16GB
+2026-07-20 11:05:41,375 [INFO] Step 16320/242188 | Loss 3.5818 | 6.04s/step | 2713 tok/s | GPU 3.16GB
+2026-07-20 11:25:26,115 [INFO] Step 16560/242188 | Loss 3.5105 | 6.07s/step | 2700 tok/s | GPU 3.16GB
+2026-07-20 11:45:10,991 [INFO] Step 16800/242188 | Loss 3.4509 | 6.06s/step | 2705 tok/s | GPU 3.16GB
+2026-07-20 11:45:15,302 [INFO]   Saved checkpoint to /home/kenpeter/work/checkpoints/megatrain_latest.pt
+2026-07-20 11:45:19,820 [INFO]   Best loss 3.4509 — saved to /home/kenpeter/work/checkpoints/megatrain_best.pt
+2026-07-20 12:05:04,379 [INFO] Step 17040/242188 | Loss 3.6033 | 6.02s/step | 2722 tok/s | GPU 3.16GB
+2026-07-20 12:24:53,507 [INFO] Step 17280/242188 | Loss 3.6590 | 6.05s/step | 2710 tok/s | GPU 3.16GB
+2026-07-20 12:44:38,812 [INFO] Step 17520/242188 | Loss 3.5711 | 6.04s/step | 2712 tok/s | GPU 3.16GB
+2026-07-20 13:04:24,580 [INFO] Step 17760/242188 | Loss 3.6815 | 6.07s/step | 2700 tok/s | GPU 3.16GB
+2026-07-20 13:24:10,568 [INFO] Step 18000/242188 | Loss 3.5740 | 6.02s/step | 2720 tok/s | GPU 3.16GB
+2026-07-20 13:43:56,764 [INFO] Step 18240/242188 | Loss 3.4519 | 6.04s/step | 2712 tok/s | GPU 3.16GB
