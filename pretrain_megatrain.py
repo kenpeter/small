@@ -323,13 +323,16 @@ def main():
     params = model.get_parameters()
     vocab_embed_numel = 49152 * 1536
     muon_params = [p for p in params if p.ndim >= 2 and p.numel() != vocab_embed_numel]
-    adam_params = [p for p in params if p.ndim < 2 or p.numel() == vocab_embed_numel]
-    muon_lr = max(args.lr * 25, 0.005)   # Muon needs ~25× AdamW lr; floor for safety
-    adam_lr = args.lr
-    logger.info(f"Optimizer: SingleDeviceMuonWithAuxAdam | Muon lr={muon_lr:.4f} ({len(muon_params)} params) | AdamW lr={adam_lr:.1e} ({len(adam_params)} params)")
+    embed_head_params = [p for p in params if p.ndim >= 2 and p.numel() == vocab_embed_numel]
+    scalar_params = [p for p in params if p.ndim < 2]
+    muon_lr = max(args.lr * 25, 0.005)
+    logger.info(f"Optimizer: SingleDeviceMuonWithAuxAdam | Muon lr={muon_lr:.4f} ({len(muon_params)} params) | "
+                f"Embed/Head lr={muon_lr:.4f} ({len(embed_head_params)} params) | "
+                f"Scalar lr={args.lr:.1e} ({len(scalar_params)} params)")
     muon_group = dict(params=muon_params, lr=muon_lr, momentum=0.95, weight_decay=config.weight_decay, use_muon=True)
-    adam_group = dict(params=adam_params, lr=adam_lr, betas=(config.beta1, config.beta2), eps=config.eps, weight_decay=config.weight_decay, use_muon=False)
-    optimizer = SingleDeviceMuonWithAuxAdam([muon_group, adam_group])
+    embed_head_group = dict(params=embed_head_params, lr=muon_lr, betas=(0.8, 0.95), eps=1e-10, weight_decay=config.weight_decay, use_muon=False)
+    scalar_group = dict(params=scalar_params, lr=args.lr, betas=(0.9, 0.95), eps=1e-10, weight_decay=config.weight_decay, use_muon=False)
+    optimizer = SingleDeviceMuonWithAuxAdam([muon_group, embed_head_group, scalar_group])
 
     # Resume optimizer state if checkpoint exists
     latest_path = os.path.join(args.output_dir, "megatrain_latest.pt")
@@ -379,8 +382,30 @@ def main():
         )
 
         if (step + 1) % config.gradient_accumulation_steps == 0:
-            torch.nn.utils.clip_grad_norm_(model.get_parameters(), config.max_grad_norm)
+            # Muon momentum warmup: 0.85 -> 0.95 over first 300 steps (KellerJordan modded-nanogpt recipe)
+            for group in optimizer.param_groups:
+                if group.get("use_muon", False):
+                    frac = min((step + 1) / 300.0, 1.0)
+                    group["momentum"] = (1 - frac) * 0.85 + frac * 0.95
+
+            # Only clip AdamW params; Muon's Newton-Schulz already normalizes updates
+            for group in optimizer.param_groups:
+                if not group.get("use_muon", False):
+                    torch.nn.utils.clip_grad_norm_(group["params"], config.max_grad_norm)
+
             optimizer.step()
+
+            # QK-Clip: limit spectral norm of attention-like projections every 10 steps (Kimi K2 MuonClip)
+            if (step + 1) % (config.gradient_accumulation_steps * 10) == 0:
+                for group in optimizer.param_groups:
+                    if group.get("use_muon", False):
+                        for p in group["params"]:
+                            if p.ndim >= 2 and p.shape[0] <= p.shape[1]:  # q/k/v/o_proj and down_proj
+                                with torch.no_grad():
+                                    spec_norm = torch.linalg.matrix_norm(p.data, ord=2)
+                                    if spec_norm > 2.0:
+                                        p.data.mul_(2.0 / spec_norm)
+
             model._sync_params_to_gpu()
             validate_cpu_params(model, logger)
             model.zero_grad()
