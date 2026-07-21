@@ -8,6 +8,7 @@ from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Read token from environment (avoids hardcoding secrets in source)
+# Set before running: export HF_TOKEN=hf_xxxxx
 HF_TOKEN = os.environ.get("HF_TOKEN", "")
 # If no token provided, run unauthenticated (public datasets only, slower)
 STAGING = Path("/home/kenpeter/work/data/_staging_multi")
@@ -61,9 +62,9 @@ def download_dataset(name, repo, pattern, max_files):
     total = len(files)
     done, ok, skip = 0, 0, 0
     t0 = time.time()
-    print(f"[{name}] {total} files to download (4 workers, staggered)", flush=True)
+    print(f"[{name}] {total} files to download (3 workers, staggered)", flush=True)
 
-    with ThreadPoolExecutor(max_workers=4) as pool:
+    with ThreadPoolExecutor(max_workers=3) as pool:
         futures = {}
         idx = 0
 

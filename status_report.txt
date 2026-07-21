@@ -1,8 +1,8 @@
-=== Status Report: Tue Jul 21 08:30:01 AM AEST 2026 ===
+=== Status Report: Wed Jul 22 09:00:01 AM AEST 2026 ===
 
 ── Training ──
   2026-07-20 13:43:56,764 [INFO] Step 18240/242188 | Loss 3.4519 | 6.04s/step | 2712 tok/s | GPU 3.16GB
-  PID: stopped | GPU: 28, 7.95, 340, 12282
+  PID: 401095 | GPU: 66, 166.88, 5128, 12282
 
 ── Data Download ──
   Not started
@@ -10,7 +10,7 @@
 ── HF Uploads ──
 
 ── Staging ──
-40K	/home/kenpeter/work/data/_staging_multi/fineweb-edu/
+1.8G	/home/kenpeter/work/data/_staging_multi/fineweb-edu/
 
 ── Disk ──
-  Used: 146G / 506G (31% full)
+  Used: 177G / 506G (37% full)
