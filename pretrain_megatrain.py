@@ -487,7 +487,7 @@ def main():
 
     # Dataset
     logger.info("Loading dataset...")
-    dataset = BinShardDataset(SHARD_DIRS, seq_len=args.max_seq_len, ratios=RATIOS, dedup=True)
+    dataset = BinShardDataset(SHARD_DIRS, seq_len=args.max_seq_len, ratios=RATIOS, dedup=False)
     dataloader = DataLoader(
         dataset,
         batch_size=args.batch_size,
