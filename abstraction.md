@@ -1,329 +1,123 @@
-# SmolLM2-135M Replication — Full Pipeline Abstraction
+# Data Abstraction — Training Assets on Machine
 
-> This document maps the complete lifecycle of a small language model: from raw internet text to a helpful, instruction-following assistant.
-
----
-
-## Phase 1: Pretraining (Self-Supervised Learning)
-
-**Goal**: Teach the model the structure of language, facts, code syntax, and reasoning patterns.
-**Method**: Next-token prediction on massive raw text corpora.
-**Architecture**: Transformer++ (RMSNorm, SwiGLU, RoPE, GQA, KV Cache)
-
-| Spec | Value |
-|------|-------|
-| Parameters | ~162.8 M (embedding 28.3 M + 30 layers 106.2 M + LM head 28.3 M, untied) |
-| Hidden dimension | 576 |
-| Layers | 30 |
-| Attention heads | 9 (query) / 3 (key-value) — GQA |
-| FFN intermediate size | 1536 (SwiGLU) |
-| Max sequence length | 8192 |
-| RoPE base θ | 10 000 |
-| RMSNorm ε | 1e-5 |
-
-### Data Sources (Curated Mixture)
-
-| Dataset | Source | Ratio | Size | What It Contains |
-|---------|--------|-------|------|------------------|
-| **FineWeb-Edu** | `HuggingFaceFW/fineweb-edu` | 50% | ~110 GB tokenized | High-quality educational web pages (Common Crawl filtered for educational value) |
-| **DCLM** | `mlfoundations/dclm-baseline-1.0` | 20% | ~44 GB tokenized | Diverse cleaned language modeling data (books, articles, encyclopedias) |
-| **Stack-Edu** | `bigcode/the-stack-dedup` | 10% | ~22 GB tokenized | Educational code repositories (Python, JavaScript, C++, etc.) |
-| **FineMath** | `HuggingFaceTB/finemath` | 10% | ~22 GB tokenized | Mathematical text, proofs, derivations, LaTeX-formatted math |
-| **Infimm-WebMath** | `OpenCoder-LLM/InfIMMCorpus` | 5% | ~11 GB tokenized | Web-scraped math content with intermediate reasoning steps |
-| **Cosmopedia** | `HuggingFaceTB/cosmopedia` | 5% | ~11 GB tokenized | Synthetic textbooks, encyclopedia articles, educational content |
-
-### Pretraining Configuration
-
-| Parameter | Value |
-|-----------|-------|
-| Total tokens target | ~118 billion (220 GB uint16 shards) |
-| Sequence length | 2048 tokens (not 8192; memory constraint) |
-| Tokenizer | `HuggingFaceTB/SmolLM2-135M` (BPE, uint16 output) |
-| Shard format | `.bin` files (~2 GB each, 1 B tokens) |
-| Batch size | 2 per step × 4 gradient accumulation = effective 8 |
-| Learning rate | 5e-4 with cosine warmup (2000 steps) + decay |
-| Precision | `bfloat16` (mixed) |
-| Optimizer | AdamW (β₁=0.9, β₂=0.95, weight_decay=0.1) |
-| Gradient clipping | max_norm = 1.0 |
-| Compilation | Disabled (`torch.compile = False`) |
-| Attention | Flash Attention via `F.scaled_dot_product_attention` |
-| Causal mask | No `torch.tril` buffer (saves ~8 GB VRAM) |
-| Checkpointing | Every 1000 steps → `checkpoint_latest.pt` + `checkpoint_best.pt` |
-
-### Pretraining Script
-
-```bash
-cd /home/kenpeter/work/small
-source venv/bin/activate
-python3 train.py  # Automatically loads shards from /home/kenpeter/work/data/
-```
-
-**Resume capability**: `checkpoint_latest.pt` contains model weights, optimizer state, scheduler state, RNG seeds, and step count. Restarting the script restores exact training state.
+Generated: 2026-07-22  
+Purpose: Single source of truth for what data exists, where it lives, and how it feeds into the pipeline.
 
 ---
 
-## Phase 2: Supervised Fine-Tuning (SFT)
+## 1. Pretraining Tokens (Ready to Feed)
 
-**Goal**: Convert the pretrained "text completer" into an instruction-following assistant that understands prompts and generates helpful responses.
-**Method**: Train on `(instruction, response)` pairs using next-token prediction (only the response tokens are trained; instruction tokens are masked with `loss_weight=0`).
+| Directory | Files | Size | Tokens | Domain | Status |
+|---|---|---|---|---|---|
+| `_shards_final/` | 17 `.bin` | 7.94 GB | ~3.97B uint16 | 100% FineWeb-Edu (web text) | ✅ Active |
 
-### SFT Data Sources
+**Notes:**
+- Shard size target: 512 MB (except `shard_000000.bin` at 260 MB, `shard_000016.bin` at 0 B empty)
+- Tokenizer: SmolLM2-135M vocab (49152)
+- Currently **100% web** — math / synthetic shards do not exist yet
 
-| Dataset | Source | Size | Strength |
-|---------|--------|------|----------|
-| **OpenHermes 2.5** | `teknium/OpenHermes-2.5` | ~1M conversations | Extremely high quality, diverse tasks (coding, reasoning, creative writing, roleplay) |
-| **OpenOrca** | `Open-Orca/OpenOrca` | ~4.2M entries | GPT-4 distilled reasoning — massive scale, high reasoning quality |
-| **Ultrachat** | `stingning/ultrachat` | ~1.5M multi-turn | Multi-turn conversational dialogue training |
-| **Alpaca-GPT4** | `vicgalle/alpaca-gpt4` | ~52K entries | Clean instruction-following format (seed for many derivations) |
-| **Code-Alpaca** | `sahil2801/CodeAlpaca-20k` | ~20K coding tasks | Code-specific instruction tuning |
+---
 
-### SFT Data Format
+## 2. Raw Downloads (Staging → Needs Tokenization)
 
-Each sample must be formatted as:
+| Dataset | Files | Size | Total Expected | Domain | Status |
+|---|---|---|---|---|---|
+| `fineweb-edu/` | 42 `.parquet` | 1.91 GB | ~10 GB | Web / educational | ✅ Complete |
+| `finemath-3plus/` | 24 `.parquet` | 4.71 GB | ~28 GB | Math (grade 3+) | ⬇️ In Progress (24/128) |
+| `cosmopedia/` | — | — | ~8–10 GB | Synthetic / encyclopedic | ❌ Not started |
+| `open-web-math/` | — | — | ~7–8 GB | Math / research | ❌ Not started |
 
-```json
-{
-  "messages": [
-    {"role": "system", "content": "You are a helpful assistant."},
-    {"role": "user", "content": "Explain quantum computing in simple terms."},
-    {"role": "assistant", "content": "Quantum computing uses quantum bits, or qubits..."}
-  ]
-}
+**Notes:**
+- Download worker: `download_3workers_direct.py` (3 workers, 1.5 s stagger)
+- Missing datasets block true 60/25/15 stratified mix
+
+---
+
+## 3. SFT / Instruction Data (Post-Pretraining)
+
+| Directory | Files | Size | Sources | Status |
+|---|---|---|---|---|
+| `_sft_final_shards/` | 71 `.pt` | 25.76 GB | Alpaca-GPT4, Code-Alpaca, OpenHermes, etc. | ✅ Ready for SFT stage |
+
+**Notes:**
+- Pre-tokenized `.pt` shards (not `.bin`)
+- Consumed after base model pretraining finishes
+
+---
+
+## 4. Math / Code Raw Datasets (LeetCode Cluster)
+
+| Dataset | Size | Format | Quality | Notes |
+|---|---|---|---|---|
+| `LeetCode_YT_CC_CoT_Summary/` | 0.67 GB | mixed | Medium | YouTube + CoT summaries |
+| `newfacade_LeetCodeDataset/` | 0.10 GB | `.jsonl` | Medium | Train + test split |
+| `high_quality_leetcode/` | 0.05 GB | `.jsonl` | Medium | Filtered subset |
+| `greengerong_LeetCode/` | 0.02 GB | `.jsonl` | Low-Med | Java/Python solutions |
+| `DenCT_LeetCode/` | 0.01 GB | `.parquet` | Low | Tiny |
+| `LimYeri_LeetCode/` | 0.01 GB | `.parquet` | Low | Tiny |
+| `NanDo_LeetCodeContests/` | ~0 GB | `.parquet` | Low | Tiny |
+| `juyoungml_LeetCodeRosetta/` | ~0 GB | `.parquet` | Low | Rosetta-style |
+| `mesolitica_LeetCodeQwQ/` | 0.02 GB | `.parquet` | Low | QwQ-style reasoning |
+| `vovw_LeetCode/` | ~0 GB | `.parquet` | Low | Tiny |
+
+**Verdict:** ~0.88 GB total. Small, heterogeneous, mostly LeetCode solutions. **Not currently used in pretraining.** Could be filtered + tokenized into a "code" domain bucket if desired, but `finemath-3plus` + `open-web-math` are the priority for math.
+
+---
+
+## 5. Other / Auxiliary
+
+| Dataset | Size | Format | Purpose | Status |
+|---|---|---|---|---|
+| `_cot_raw/numina_50k.jsonl` | 0.07 GB | `.jsonl` | Chain-of-Thought reasoning | Hold for SFT or synthetic mix |
+| `bluemoon_roleplay/` | 0.27 GB | `.json` + `.arrow` | Roleplay / conversational | Hold for SFT |
+
+---
+
+## 6. Pipeline Mapping
+
 ```
-
-**Loss masking**: Only tokens in `assistant` responses contribute to loss. `system` and `user` tokens are masked (`loss_weight=0`).
-
-### SFT Configuration
-
-| Parameter | Value |
-|-----------|-------|
-| Base model | Output from Phase 1 (`checkpoint_best.pt`) |
-| Learning rate | 2e-5 (much lower than pretraining) |
-| Epochs | 1-3 (overfitting is a real risk in SFT) |
-| Batch size | 16-32 |
-| Sequence length | 2048 (SFT samples are shorter than pretraining chunks) |
-| LoRA rank | Optional: 64 (if full fine-tuning is too heavy) |
-| Precision | `bfloat16` |
-
-### SFT Script (to be created)
-
-```bash
-python3 sft.py \
-  --base_checkpoint checkpoint_best.pt \
-  --dataset OpenHermes-2.5 \
-  --lr 2e-5 \
-  --epochs 2 \
-  --batch_size 16
+┌─────────────────────────────────────────────────────────────┐
+│  RAW STAGING (_staging_multi/)                               │
+│    fineweb-edu      ──┐                                     │
+│    finemath-3plus   ──┼──► tokenize.py ──► _shards_*/     │
+│    cosmopedia       ──┘      (SmolLM2 vocab)   .bin       │
+│    open-web-math                                           │
+└─────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────┐
+│  PRETRAIN (pretrain_megatrain.py)                            │
+│    _shards_final/   ──► StratifiedBinShardDataset           │
+│    _shards_math/    ──► (60/25/15 web/math/synth)          │
+│    _shards_synth/   ──► dedup=True (disabled at startup)    │
+└─────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────┐
+│  SFT / RLHF                                                  │
+│    _sft_final_shards/  ──► supervised fine-tuning           │
+│    _cot_raw/           ──► reasoning boost                   │
+│    bluemoon_roleplay/  ──► conversational style              │
+└─────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## Phase 3: Alignment (RLHF / DPO)
+## 7. Current Blockers
 
-**Goal**: Make the model helpful, harmless, and honest. Reduce toxic outputs, hallucinations, and unsafe responses. Go beyond "imitating good responses" to "understanding preferences."
-
-### Method A: RLHF (Reinforcement Learning from Human Feedback)
-
-**Three steps:**
-
-1. **Collect preference data**: For each prompt, generate 2 responses. Humans (or a strong model) rank which is better.
-2. **Train a Reward Model**: A small classifier that predicts "how good is this response?" (outputs scalar reward).
-3. **PPO Optimization**: Use the reward model as a critic. The language model (policy) is updated with PPO (Proximal Policy Optimization) to maximize expected reward while staying close to the SFT model (KL divergence penalty).
-
-**RLHF Datasets:**
-
-| Dataset | Source | Size | Description |
-|---------|--------|------|-------------|
-| **Anthropic HH-RLHF** | `Anthropic/hh-rlhf` | ~170K | Human preference data on helpfulness vs harmlessness |
-| **SHP (Stanford Human Preferences)** | `stanfordnlp/SHP` | ~380K | Reddit-based preference data across domains |
-| **OpenAssistant Conversations** | `OpenAssistant/oasst1` | ~161K | Human-annotated quality rankings |
-| **Ultrafeedback** | `openbmb/UltraFeedback` | ~64K | GPT-4 judged preference pairs with fine-grained scores |
-
-**RLHF Flow:**
-
-```
-SFT Model → Generate response pairs → Reward Model scores → PPO updates policy
-     ↑___________________________________________________________↓
-```
-
-### Method B: DPO (Direct Preference Optimization) ⭐ Recommended for small models
-
-**DPO is the modern replacement for RLHF** — it achieves the same goal without:
-- A separate reward model
-- Complex PPO training loops
-- Unstable hyperparameter tuning
-
-**How DPO works:**
-- Instead of learning a reward function and then optimizing with PPO, DPO directly optimizes the policy to satisfy the preference data.
-- **Mathematical insight**: The optimal reward model has a closed-form relationship with the optimal policy. DPO exploits this to skip the reward model entirely.
-- Loss function: maximize log-ratio of winning response probability vs losing response probability, relative to the reference (SFT) model.
-
-**DPO Datasets** (same as RLHF, but formatted differently):
-
-| Dataset | Format |
-|---------|--------|
-| **HuggingFace H4/ultrafeedback_binarized** | `{prompt, chosen, rejected}` |
-| **Intel/orca_dpo_pairs** | `{question, chatgpt_answer, llama2-13b_answer}` |
-| **OpenBMB/UltraFeedback** | `{instruction, response_a, response_b, score_a, score_b}` |
-
-**DPO Data Format:**
-
-```json
-{
-  "prompt": "Write a Python function to reverse a string.",
-  "chosen": "def reverse_string(s):\n    return s[::-1]",
-  "rejected": "def reverse_string(s):\n    for i in range(len(s)):\n        print(s[i])"
-}
-```
-
-### DPO Configuration
-
-| Parameter | Value |
-|-----------|-------|
-| Base model | SFT output (`sft_best.pt`) |
-| Reference model | Frozen SFT model (provides KL anchor) |
-| Learning rate | 5e-7 (very low — DPO is sensitive) |
-| β (beta) | 0.1-0.5 (controls deviation from reference) |
-| Batch size | 4-8 (pairs are processed together) |
-| Epochs | 1-2 |
-| LoRA | Optional rank 64 for 135M model (full DPO is feasible at this scale) |
-
-### DPO Script (to be created)
-
-```bash
-python3 dpo.py \
-  --sft_checkpoint sft_best.pt \
-  --dataset ultrafeedback_binarized \
-  --beta 0.1 \
-  --lr 5e-7 \
-  --epochs 1
-```
+| Blocker | Impact | Fix |
+|---|---|---|
+| `finemath-3plus` download incomplete | Cannot build math shards | Wait for 128/128 files |
+| `cosmopedia` missing | Cannot build synthetic shards | Queue download after finemath |
+| `open-web-math` missing | Math diversity gap | Queue download after cosmopedia |
+| `_shards_math/` does not exist | Stratified loader falls back to web | Tokenize finemath → _shards_math/ |
+| `_shards_synth/` does not exist | Stratified loader falls back to web | Tokenize cosmopedia → _shards_synth/ |
 
 ---
 
-## Full Pipeline Summary
+## 8. Summary
 
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                          DATA PREPARATION                                │
-│  Raw datasets → Tokenize → Shard into .bin → Stream during training      │
-│  (FineWeb, DCLM, Stack, FineMath, Infimm, Cosmopedia)                    │
-└─────────────────────────────────────────────────────────────────────────┘
-                                    ↓
-┌─────────────────────────────────────────────────────────────────────────┐
-│  PHASE 1: PRETRAINING (Self-Supervised)                                  │
-│  Input: Next-token prediction on ~118B tokens                            │
-│  Output: Base model — knows language, code, math, facts                   │
-│  Script: train.py → checkpoint_best.pt                                     │
-└─────────────────────────────────────────────────────────────────────────┘
-                                    ↓
-┌─────────────────────────────────────────────────────────────────────────┐
-│  PHASE 2: SFT (Supervised Fine-Tuning)                                   │
-│  Input: (instruction, response) pairs from OpenHermes, OpenOrca, etc.  │
-│  Output: Chat model — follows instructions, answers questions            │
-│  Script: sft.py → sft_best.pt                                            │
-└─────────────────────────────────────────────────────────────────────────┘
-                                    ↓
-┌─────────────────────────────────────────────────────────────────────────┐
-│  PHASE 3: ALIGNMENT (DPO recommended)                                    │
-│  Input: Preference pairs (chosen vs rejected)                            │
-│  Output: Aligned model — helpful, harmless, honest                       │
-│  Script: dpo.py → final_model.pt                                         │
-└─────────────────────────────────────────────────────────────────────────┘
-```
-
----
-
-## Key Decisions & Rationale
-
-| Decision | Why |
-|----------|-----|
-| **Keep real curated data** (not synthetic CoT) | Synthetic latent CoT is a post-training technique. Pretraining on real web data + math is the established recipe for base models. |
-| **Transformer++ architecture** | SOTA for <1B parameters in 2024-2026 (SmolLM2, Qwen3, Llama 3.2, Gemma 3). Mamba-2/SSD and MoE are alternatives but this is the published baseline. |
-| **DPO over RLHF** | DPO is simpler, more stable, and achieves comparable alignment quality. For a 135M model, skipping PPO complexity is pragmatic. |
-| **Truncate long texts to 50K chars** | 500K-character outliers cause tokenizer slowdowns. Most information is in the first ~10K tokens anyway. |
-| **Only 2 checkpoints** | Disk space conservation. `latest.pt` for resume, `best.pt` for downstream use. |
-| **Gradient accumulation = 4** | Simulates larger batch size on limited GPU memory. |
-
----
-
-## Hardware Requirements
-
-| Phase | GPU VRAM | RAM | Disk | Time Estimate |
-|-------|----------|-----|------|---------------|
-| Data prep (download + tokenize) | None | 4 GB | 220 GB | ~15-25 hours (parallel wget) |
-| Pretraining 163M @ 52-118B tokens | 8 GB (RTX 4070 Ti 12 GB) | 16 GB | 220 GB | ~40-60 hours on single GPU |
-| SFT | 4 GB | 8 GB | +2 GB | ~2-4 hours |
-| DPO | 4 GB | 8 GB | +2 GB | ~1-2 hours |
-
----
-
-## Files in This Directory
-
-| File | Purpose |
-|------|---------|
-| `train.py` | Phase 1: Pretraining script (resumable, Transformer++) |
-| `prepare_data_v2.py` | Data preparation: parallel download + batched tokenization |
-| `abstraction.md` | This document — full pipeline roadmap |
-| `sft.py` | *(Phase 2 — to be created)* |
-| `dpo.py` | *(Phase 3 — to be created)* |
-
----
-
-
-## Recent Experiments (July 2026)
-
-### SFT Run
-- Target steps: 40000 (doubled original goal)
-- Final checkpoint: step 40000, loss ~3.03, best loss ~1.52
-- Observations: loss fluctuated, generation quality still noisy; SFT provided a base for alignment.
-
-### DPO Run (first extension)
-- Started from step 5000 checkpoint, increased max_steps to 15000.
-- Final loss ~0.4554, best loss ~0.4467 at step 10000.
-- Generation still repetitive; DPO improved preference loss but not output quality.
-
-### Hyperparameter Adjustments
-- Batch size increased from 1 to 2 (effective batch 8 with grad_acc=4).
-- Learning rate increased from 5e-7 to 1e-6.
-- Beta (KL weight) increased from 0.1 to 0.2.
-- Max steps increased to 20000 (continued from 15000).
-
-### Ongoing DPO Run (second extension)
-- Started from step 15000 checkpoint, targeting 20000 total.
-- Current step ~15000+, loss ~0.45 at step 15000.
-- Expected to finish soon.
-
-### Next Steps
-- Generate new preference pairs from current DPO model and run a second DPO iteration.
-- Consider PPO/GRPO if reward model available.
-- Explore LoRA adapters for specific tasks.
-
-
-## Recent Experiments (July 2026)
-
-### SFT Run
-- Target steps: 40000 (doubled original goal)
-- Final checkpoint: step 40000, loss ~3.03, best loss ~1.52
-- Observations: loss fluctuated, generation quality still noisy; SFT provided a base for alignment.
-
-### DPO Run (first extension)
-- Started from step 5000 checkpoint, increased max_steps to 15000.
-- Final loss ~0.4554, best loss ~0.4467 at step 10000.
-- Generation still repetitive; DPO improved preference loss but not output quality.
-
-### Hyperparameter Adjustments
-- Batch size increased from 1 to 2 (effective batch 8 with grad_acc=4).
-- Learning rate increased from 5e-7 to 1e-6.
-- Beta (KL weight) increased from 0.1 to 0.2.
-- Max steps increased to 20000 (continued from 15000).
-
-### Ongoing DPO Run (second extension)
-- Started from step 15000 checkpoint, targeting 20000 total.
-- Current step ~15000+, loss ~0.45 at step 15000.
-- Expected to finish soon.
-
-### Next Steps
-- Generate new preference pairs from current DPO model and run a second DPO iteration.
-- Consider PPO/GRPO if reward model available.
-- Explore LoRA adapters for specific tasks.
+- **Tokens ready now:** ~3.97B (web only)
+- **Tokens needed for 60/25/15 mix:** ~6.6B web + ~2.75B math + ~1.65B synthetic = **~11B total**
+- **SFT assets ready:** 25.76 GB
+- **Next action:** Complete downloads → tokenize math + synth → update `SHARD_DIRS` → restart training with true stratified mix.
