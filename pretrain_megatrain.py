@@ -1,5 +1,6 @@
 """
-Pretraining with MegaTrain — CPU offloaded training of SmolLM2-1.7B.
+Pretraining with MegaTrain + Kimi K2 MuonClip
+CPU offloaded training of 1.03B model with orthogonal updates.
 Loads .bin shards directly (already tokenized with SmolLM2 tokenizer).
 """
 import os, time, logging, argparse, math, shutil
@@ -16,33 +17,27 @@ from infinity.config import CPUMasterConfig
 logger = logging.getLogger(__name__)
 
 # ============================================================================
-# Muon Optimizer (Single-Device Variant) — better sample efficiency than AdamW
-# https://github.com/KellerJordan/Muon
+# Kimi K2 MuonClip Optimizer — Full Implementation
+# Based on arXiv 2502.16982 + github.com/AkulDatta/muonclip
 # ============================================================================
-def zeropower_via_newtonschulz5(G, steps: int = 5):
-    """Newton-Schulz iteration for matrix orthogonalization. Stable in bfloat16."""
+
+def newton_schulz(G: torch.Tensor, steps: int = 5, eps: float = 1e-7) -> torch.Tensor:
+    """Newton-Schulz iteration for matrix orthogonalization."""
     assert G.ndim >= 2
-    a, b, c = (3.4445, -4.7750, 2.0315)
-    X = G.bfloat16() if G.device.type == "cuda" else G.float()
+    a, b, c = 3.4445, -4.7750, 2.0315
+    X = G.float()
+    # Normalize by Frobenius norm
+    X = X / (X.norm(dim=(-2, -1), keepdim=True) + eps)
     if G.size(-2) > G.size(-1):
         X = X.mT
-    X = X / (X.norm(dim=(-2, -1), keepdim=True) + 1e-7)
     for _ in range(steps):
         A = X @ X.mT
         B = b * A + c * A @ A
         X = a * X + B @ X
     if G.size(-2) > G.size(-1):
         X = X.mT
-    return X
+    return X.to(G.dtype)
 
-def muon_update(grad, momentum, beta=0.95, ns_steps=5, nesterov=True):
-    momentum.lerp_(grad, 1 - beta)
-    update = grad.lerp_(momentum, beta) if nesterov else momentum
-    if update.ndim == 4:
-        update = update.view(len(update), -1)
-    update = zeropower_via_newtonschulz5(update, steps=ns_steps)
-    update *= max(1, update.size(-2) / update.size(-1)) ** 0.5
-    return update
 
 def adam_update(grad, buf1, buf2, step, betas, eps):
     buf1.lerp_(grad, 1 - betas[0])
@@ -51,42 +46,82 @@ def adam_update(grad, buf1, buf2, step, betas, eps):
     buf2c = buf2 / (1 - betas[1] ** step)
     return buf1c / (buf2c.sqrt() + eps)
 
-class SingleDeviceMuonWithAuxAdam(torch.optim.Optimizer):
-    """Non-distributed Muon + AdamW hybrid. Muon for 2D weights, AdamW for embeddings/norms/head."""
-    def __init__(self, param_groups):
+
+class KimiMuonClip(torch.optim.Optimizer):
+    """
+    Kimi K2 MuonClip optimizer.
+    - Muon (Newton-Schulz + momentum) for 2D hidden weights
+    - AdamW for 1D scalars (norms, biases)
+    - AdamW for embeddings + lm_head
+    - Consistent RMS scaling across all layers
+    - Momentum warmup: 0.85 -> 0.95 over first 300 steps
+    - QK-Clip proxy: spectral norm cap on attention projections
+    """
+    def __init__(self, param_groups, tau: float = 100.0, ns_steps: int = 5):
         for group in param_groups:
             assert "use_muon" in group
             if group["use_muon"]:
-                group["lr"] = group.get("lr", 0.02)
-                group["momentum"] = group.get("momentum", 0.95)
-                group["weight_decay"] = group.get("weight_decay", 0)
-                assert set(group.keys()) == {"params", "lr", "momentum", "weight_decay", "use_muon"}
+                group.setdefault("lr", 0.01)
+                group.setdefault("momentum", 0.95)
+                group.setdefault("weight_decay", 0.0)
             else:
-                group["lr"] = group.get("lr", 3e-4)
-                group["betas"] = group.get("betas", (0.9, 0.95))
-                group["eps"] = group.get("eps", 1e-10)
-                group["weight_decay"] = group.get("weight_decay", 0)
-                assert set(group.keys()) == {"params", "lr", "betas", "eps", "weight_decay", "use_muon"}
-        super().__init__(param_groups, {})
+                group.setdefault("lr", 3e-4)
+                group.setdefault("betas", (0.9, 0.95))
+                group.setdefault("eps", 1e-10)
+                group.setdefault("weight_decay", 0.0)
+        defaults = dict(tau=tau, ns_steps=ns_steps)
+        super().__init__(param_groups, defaults)
 
     @torch.no_grad()
-    def step(self, closure=None):
+    def step(self, closure=None, global_step: int = 0):
         loss = None
         if closure is not None:
             with torch.enable_grad():
                 loss = closure()
+
+        # Momentum warmup: 0.85 -> 0.95 over first 300 steps
+        frac = min(global_step / 300.0, 1.0)
+        warmed_momentum = (1 - frac) * 0.85 + frac * 0.95
+
         for group in self.param_groups:
+            lr = group["lr"]
+            wd = group["weight_decay"]
+
             if group["use_muon"]:
+                # Use warmed momentum
+                beta = warmed_momentum if group.get("warmup", True) else group["momentum"]
                 for p in group["params"]:
                     if p.grad is None:
                         continue
                     state = self.state[p]
                     if len(state) == 0:
                         state["momentum_buffer"] = torch.zeros_like(p)
-                    update = muon_update(p.grad, state["momentum_buffer"], beta=group["momentum"])
-                    p.mul_(1 - group["lr"] * group["weight_decay"])
-                    p.add_(update.reshape(p.shape), alpha=-group["lr"])
+
+                    buf = state["momentum_buffer"]
+                    # Momentum: Mt = μ * Mt-1 + Gt
+                    buf.mul_(beta).add_(p.grad)
+
+                    # Newton-Schulz orthogonalization
+                    if p.ndim > 2:
+                        orig_shape = buf.shape
+                        buf_2d = buf.view(buf.shape[0], -1)
+                        update = newton_schulz(buf_2d, steps=self.defaults["ns_steps"])
+                        update = update.view(orig_shape)
+                    else:
+                        update = newton_schulz(buf, steps=self.defaults["ns_steps"])
+
+                    # Consistent RMS scaling: sqrt(max(n,m) * 0.2)
+                    n, m = p.shape[0], p.shape[1] if p.ndim > 1 else 1
+                    rms_factor = math.sqrt(max(n, m) * 0.2)
+                    update *= rms_factor
+
+                    # Weight decay + update
+                    if wd > 0:
+                        p.mul_(1 - lr * wd)
+                    p.add_(update, alpha=-lr)
+
             else:
+                # AdamW for 1D params / embed / head
                 for p in group["params"]:
                     if p.grad is None:
                         continue
@@ -98,17 +133,33 @@ class SingleDeviceMuonWithAuxAdam(torch.optim.Optimizer):
                     state["step"] += 1
                     update = adam_update(p.grad, state["exp_avg"], state["exp_avg_sq"],
                                          state["step"], group["betas"], group["eps"])
-                    p.mul_(1 - group["lr"] * group["weight_decay"])
-                    p.add_(update, alpha=-group["lr"])
+                    if wd > 0:
+                        p.mul_(1 - lr * wd)
+                    p.add_(update, alpha=-lr)
+
+        # QK-Clip proxy: cap spectral norm of attention-like projections
+        tau = self.defaults["tau"]
+        for group in self.param_groups:
+            if group.get("use_muon", False):
+                for p in group["params"]:
+                    if p.ndim >= 2 and p.shape[0] <= p.shape[1]:
+                        # Covers q_proj (1536,1536), k_proj (512,1536), v_proj (512,1536),
+                        # o_proj (1536,1536), down_proj (1536,4608)
+                        with torch.no_grad():
+                            spec_norm = torch.linalg.matrix_norm(p.data, ord=2)
+                            if spec_norm > tau:
+                                p.data.mul_(tau / spec_norm)
+
         return loss
 
 
 SHARDS_DIR = Path("/home/kenpeter/work/data/_shards_final")
 SEQ_LEN = 2048
 
+
 class BinShardDataset(Dataset):
     """Memory-maps .bin shards and yields sequences of SEQ_LEN tokens."""
-    _causal_mask_4d = None  # cached 4D bool causal mask
+    _causal_mask_4d = None
     def __init__(self, shards_dir, seq_len: int = 2048):
         shards_dir = Path(shards_dir)
         shard_paths = sorted(shards_dir.glob("shard_*.bin"))
@@ -120,7 +171,6 @@ class BinShardDataset(Dataset):
         self.shard_bounds = []
         self.total_seqs = 0
 
-        # Pre-compute bounds and validate dimensions
         for p in shard_paths:
             n_tokens = p.stat().st_size // 2
             n_seqs = n_tokens // seq_len
@@ -135,12 +185,10 @@ class BinShardDataset(Dataset):
         return self.total_seqs
 
     def __getitem__(self, idx):
-        # Find which shard this index belongs to
         for shard_path, n_seqs, start_idx in self.shard_bounds:
             if idx < start_idx + n_seqs:
                 local_idx = idx - start_idx
                 offset = local_idx * self.seq_len
-                # Memory-map and read one sequence
                 mm = np.memmap(str(shard_path), dtype=np.uint16, mode='r',
                                offset=offset * 2, shape=(self.seq_len,))
                 tokens = torch.from_numpy(mm.copy().astype(np.int64))
@@ -148,11 +196,10 @@ class BinShardDataset(Dataset):
                 return tokens
         raise IndexError(f"Index {idx} out of range")
 
+
 def collate_pretrain(batch):
-    """Collate pretraining batch: labels = input_ids (all tokens train)."""
-    input_ids = torch.stack(batch)  # (batch, seq_len)
+    input_ids = torch.stack(batch)
     B, T = input_ids.shape
-    # 4D causal mask for SDPA: True = attend (lower triangle). Cached globally.
     if BinShardDataset._causal_mask_4d is None or BinShardDataset._causal_mask_4d.shape[-1] != T:
         BinShardDataset._causal_mask_4d = torch.tril(torch.ones((1, 1, T, T), dtype=torch.bool))
     labels = input_ids.clone()
@@ -160,7 +207,6 @@ def collate_pretrain(batch):
 
 
 def validate_cpu_params(model, logger):
-    """Quick NaN/Inf check on CPU master params. Call after every optimizer step."""
     bad = 0
     bad_info = []
     params = model.get_parameters()
@@ -177,9 +223,6 @@ def validate_cpu_params(model, logger):
 
 
 def save_checkpoint_robust(state, output_dir, is_best, logger):
-    """Atomic save with NaN/Inf validation and backup rotation.
-    Skips write if any tensor is non-finite, preserving the last clean checkpoint."""
-    # 1. Validate all tensors
     model_sd = state.get("model_state_dict", {})
     bad_keys = []
     for k, v in model_sd.items():
@@ -195,14 +238,12 @@ def save_checkpoint_robust(state, output_dir, is_best, logger):
             logger.warning(f"  ... and {len(bad_keys) - 5} more")
         return False
 
-    # 2. Atomic write to temp then rename
     latest_path = os.path.join(output_dir, "megatrain_latest.pt")
     tmp_path = latest_path + ".tmp"
     torch.save(state, tmp_path)
     os.replace(tmp_path, latest_path)
     logger.info(f"  Saved checkpoint to {latest_path}")
 
-    # 3. Best checkpoint with rotation (keep previous best as .bak)
     if is_best:
         best_path = os.path.join(output_dir, "megatrain_best.pt")
         bak_path = best_path + ".bak"
@@ -220,7 +261,7 @@ def main():
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--batch-size", type=int, default=4)
-    parser.add_argument("--num-steps", type=int, default=484560)
+    parser.add_argument("--num-steps", type=int, default=50000)
     parser.add_argument("--lr", type=float, default=4e-4)
     parser.add_argument("--max-seq-len", type=int, default=SEQ_LEN)
     parser.add_argument("--checkpoint-interval", type=int, default=4)
@@ -228,21 +269,25 @@ def main():
     parser.add_argument("--num-grad-slabs", type=int, default=12)
     parser.add_argument("--device", type=int, default=0)
     parser.add_argument("--log-interval", type=int, default=120)
-    parser.add_argument("--save-interval", type=int, default=12000)
+    parser.add_argument("--save-interval", type=int, default=2000)
     parser.add_argument("--output-dir", type=str, default="/home/kenpeter/work/checkpoints")
+    parser.add_argument("--muon-lr", type=float, default=0.01, help="Learning rate for Muon 2D params")
+    parser.add_argument("--adam-lr", type=float, default=3e-4, help="Learning rate for AdamW 1D/embed/head params")
+    parser.add_argument("--tau", type=float, default=100.0, help="QK-Clip spectral norm threshold")
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
 
     logger.info("=" * 60)
+    logger.info("KIMI K2 MUONCLIP — Fresh training from scratch")
+    logger.info("=" * 60)
     logger.info(f"Model: Custom 1032M (dim=1536, L=32, h=12, kv=4, ffn=4608)")
     logger.info(f"Data: {SHARDS_DIR}")
     logger.info(f"Params: batch={args.batch_size}, seq_len={args.max_seq_len}, steps={args.num_steps}")
+    logger.info(f"Muon lr={args.muon_lr}, AdamW lr={args.adam_lr}, QK-Clip tau={args.tau}")
 
-    # Load tokenizer (for reference, not used in training since data is pre-tokenized)
     tokenizer = AutoTokenizer.from_pretrained("HuggingFaceTB/SmolLM2-135M", trust_remote_code=True)
 
-    # Load model from scratch (random init, using our custom architecture)
     logger.info("Creating model from custom config (random init)...")
     hf_config = LlamaConfig(
         vocab_size=49152,
@@ -272,35 +317,10 @@ def main():
     n_params = sum(p.numel() for p in hf_model.parameters())
     logger.info(f"Model loaded: {n_params:,} parameters ({n_params/1e9:.2f}B)")
 
-    # --- Resume from checkpoint if available ---
-    latest_path = os.path.join(args.output_dir, "megatrain_latest.pt")
-    start_step = 0
-    best_loss = float("inf")
-    if os.path.exists(latest_path):
-        logger.info(f"Resuming from {latest_path} ...")
-        state = torch.load(latest_path, map_location="cpu", weights_only=False)
-        # Load model weights
-        model_state = state.get("model_state_dict", {})
-        # Strip _orig_mod prefix if any
-        unwanted_prefix = "_orig_mod."
-        for k, v in list(model_state.items()):
-            if k.startswith(unwanted_prefix):
-                model_state[k[len(unwanted_prefix):]] = model_state.pop(k)
-        missing, unexpected = hf_model.load_state_dict(model_state, strict=False)
-        if missing:
-            logger.info(f"Missing keys: {missing[:5]}")
-        if unexpected:
-            logger.info(f"Unexpected keys: {unexpected[:5]}")
-        logger.info(f"Loaded model weights from step {state.get('step', 0)}")
-        start_step = state.get("step", 0)
-        best_loss = state.get("best_loss", float("inf"))
-    else:
-        logger.info("No checkpoint found, starting from scratch.")
-
     # MegaTrain config
     config = CPUMasterConfig(
         model_name="custom-1B",
-        dataset_path="/tmp/dummy",  # dummy — we use our own dataset
+        dataset_path="/tmp/dummy",
         max_seq_len=args.max_seq_len,
         batch_size=args.batch_size,
         num_steps=args.num_steps,
@@ -315,39 +335,31 @@ def main():
         trust_remote_code=True,
     )
 
-    # Create CPU Master model
     model = CPUMasterModel(hf_model, config)
     del hf_model
 
-    # Setup optimizer: Muon for 2D hidden weights, AdamW for embed/head/norms
+    # === KIMI K2 MUONCLIP SETUP ===
     params = model.get_parameters()
-    vocab_embed_numel = 49152 * 1536
+    vocab_embed_numel = 49152 * 1536  # embed_tokens + lm_head
+
     muon_params = [p for p in params if p.ndim >= 2 and p.numel() != vocab_embed_numel]
     embed_head_params = [p for p in params if p.ndim >= 2 and p.numel() == vocab_embed_numel]
     scalar_params = [p for p in params if p.ndim < 2]
-    muon_lr = max(args.lr * 25, 0.005)
-    logger.info(f"Optimizer: SingleDeviceMuonWithAuxAdam | Muon lr={muon_lr:.4f} ({len(muon_params)} params) | "
-                f"Embed/Head lr={muon_lr:.4f} ({len(embed_head_params)} params) | "
-                f"Scalar lr={args.lr:.1e} ({len(scalar_params)} params)")
-    muon_group = dict(params=muon_params, lr=muon_lr, momentum=0.95, weight_decay=config.weight_decay, use_muon=True)
-    embed_head_group = dict(params=embed_head_params, lr=muon_lr, betas=(0.8, 0.95), eps=1e-10, weight_decay=config.weight_decay, use_muon=False)
-    scalar_group = dict(params=scalar_params, lr=args.lr, betas=(0.9, 0.95), eps=1e-10, weight_decay=config.weight_decay, use_muon=False)
-    optimizer = SingleDeviceMuonWithAuxAdam([muon_group, embed_head_group, scalar_group])
 
-    # Resume optimizer state if checkpoint exists
-    latest_path = os.path.join(args.output_dir, "megatrain_latest.pt")
-    if os.path.exists(latest_path):
-        state = torch.load(latest_path, map_location="cpu", weights_only=False)
-        if "optimizer_state_dict" in state:
-            try:
-                optimizer.load_state_dict(state["optimizer_state_dict"])
-                logger.info("Resumed optimizer state from checkpoint")
-            except Exception as e:
-                logger.warning(f"Could not resume optimizer state: {e}")
-        else:
-            logger.info("No optimizer state in checkpoint, starting fresh")
-    else:
-        logger.info("No checkpoint found, starting from scratch")
+    logger.info(f"KimiMuonClip | Muon 2D: {len(muon_params)} params | "
+                f"Embed/Head: {len(embed_head_params)} params | "
+                f"Scalar: {len(scalar_params)} params")
+
+    param_groups = [
+        dict(params=muon_params, lr=args.muon_lr, momentum=0.95,
+             weight_decay=config.weight_decay, use_muon=True, warmup=True),
+        dict(params=embed_head_params, lr=args.adam_lr, betas=(0.8, 0.95),
+             eps=1e-10, weight_decay=config.weight_decay, use_muon=False),
+        dict(params=scalar_params, lr=args.adam_lr, betas=(0.9, 0.95),
+             eps=1e-10, weight_decay=config.weight_decay, use_muon=False),
+    ]
+    optimizer = KimiMuonClip(param_groups, tau=args.tau, ns_steps=5)
+    logger.info("Optimizer: KimiMuonClip (Newton-Schulz + RMS scaling + QK-Clip + momentum warmup)")
 
     # Dataset
     logger.info("Loading dataset...")
@@ -364,11 +376,13 @@ def main():
 
     # Training loop
     logger.info("=" * 60)
-    logger.info("Starting pretraining...")
+    logger.info("Starting pretraining from scratch...")
     logger.info("=" * 60)
 
-    best_loss = float("inf") if start_step == 0 else best_loss
-    for step in range(start_step, config.num_steps):
+    best_loss = float("inf")
+    global_step = 0
+
+    for step in range(config.num_steps):
         try:
             batch = next(data_iter)
         except StopIteration:
@@ -382,29 +396,14 @@ def main():
         )
 
         if (step + 1) % config.gradient_accumulation_steps == 0:
-            # Muon momentum warmup: 0.85 -> 0.95 over first 300 steps (KellerJordan modded-nanogpt recipe)
-            for group in optimizer.param_groups:
-                if group.get("use_muon", False):
-                    frac = min((step + 1) / 300.0, 1.0)
-                    group["momentum"] = (1 - frac) * 0.85 + frac * 0.95
+            global_step += 1
 
-            # Only clip AdamW params; Muon's Newton-Schulz already normalizes updates
+            # Only clip AdamW params; Muon already normalizes via Newton-Schulz
             for group in optimizer.param_groups:
                 if not group.get("use_muon", False):
                     torch.nn.utils.clip_grad_norm_(group["params"], config.max_grad_norm)
 
-            optimizer.step()
-
-            # QK-Clip: limit spectral norm of attention-like projections every 10 steps (Kimi K2 MuonClip)
-            if (step + 1) % (config.gradient_accumulation_steps * 10) == 0:
-                for group in optimizer.param_groups:
-                    if group.get("use_muon", False):
-                        for p in group["params"]:
-                            if p.ndim >= 2 and p.shape[0] <= p.shape[1]:  # q/k/v/o_proj and down_proj
-                                with torch.no_grad():
-                                    spec_norm = torch.linalg.matrix_norm(p.data, ord=2)
-                                    if spec_norm > 2.0:
-                                        p.data.mul_(2.0 / spec_norm)
+            optimizer.step(global_step=global_step)
 
             model._sync_params_to_gpu()
             validate_cpu_params(model, logger)
@@ -430,7 +429,6 @@ def main():
             if is_best:
                 best_loss = loss_val
 
-            # Reconstruct full state dict from CPUMasterModel components
             full_sd = {}
             embed_sd = model.embedding.state_dict()
             for k, v in embed_sd.items():
@@ -452,11 +450,11 @@ def main():
                 "model_state_dict": full_sd,
                 "optimizer_state_dict": optimizer.state_dict(),
             }
-
             save_checkpoint_robust(state, args.output_dir, is_best, logger)
 
     model.cleanup()
     logger.info("Pretraining complete!")
+
 
 if __name__ == "__main__":
     main()
