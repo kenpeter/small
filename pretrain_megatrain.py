@@ -406,7 +406,7 @@ def main():
     logger.info("KIMI K2 MUONCLIP — Fresh training from scratch")
     logger.info("=" * 60)
     logger.info(f"Model: Custom 1032M (dim=1536, L=32, h=12, kv=4, ffn=4608)")
-    logger.info(f"Data: {SHARDS_DIR}")
+    logger.info(f"Data: {SHARD_DIRS}")
     logger.info(f"Params: batch={args.batch_size}, seq_len={args.max_seq_len}, steps={args.num_steps}")
     logger.info(f"Muon lr={args.muon_lr}, AdamW lr={args.adam_lr}, QK-Clip tau={args.tau}")
 
