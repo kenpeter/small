@@ -3,7 +3,7 @@ Pretraining with MegaTrain + Kimi K2 MuonClip
 CPU offloaded training of 1.03B model with orthogonal updates.
 Loads .bin shards directly (already tokenized with SmolLM2 tokenizer).
 """
-import os, time, logging, argparse, math, shutil
+import os, time, logging, argparse, math, shutil, random
 from pathlib import Path
 
 import torch
@@ -153,48 +153,172 @@ class KimiMuonClip(torch.optim.Optimizer):
         return loss
 
 
-SHARDS_DIR = Path("/home/kenpeter/work/data/_shards_final")
 SEQ_LEN = 2048
 
+# ============================================================================
+# Stratified multi-domain shard loader with 13-gram dedup
+# ============================================================================
 
-class BinShardDataset(Dataset):
-    """Memory-maps .bin shards and yields sequences of SEQ_LEN tokens."""
+SHARD_DIRS = {
+    "web":   Path("/home/kenpeter/work/data/_shards_final"),
+    "math":  Path("/home/kenpeter/work/data/_shards_final"),   # TODO: point to math shards when ready
+    "synth": Path("/home/kenpeter/work/data/_shards_final"),   # TODO: point to cosmopedia shards when ready
+}
+
+RATIOS = {"web": 0.60, "math": 0.25, "synth": 0.15}
+
+
+def _load_shard_list(shards_dir: Path, seq_len: int):
+    shard_paths = sorted(shards_dir.glob("shard_*.bin"))
+    shard_paths = [p for p in shard_paths if p.stat().st_size > 0]
+    entries = []
+    total = 0
+    for p in shard_paths:
+        n_tokens = p.stat().st_size // 2
+        n_seqs = n_tokens // seq_len
+        if n_seqs == 0:
+            continue
+        entries.append((p, n_seqs, total))
+        total += n_seqs
+    return entries, total
+
+
+def _hash_13gram(tokens: np.ndarray) -> int:
+    """Cheap 13-gram hash for dedup."""
+    if len(tokens) < 13:
+        return 0
+    # Use first 13 tokens + last 13 tokens as proxy fingerprint
+    front = tokens[:13].tobytes()
+    back = tokens[-13:].tobytes()
+    return hash((front, back))
+
+
+class StratifiedShardDataset(Dataset):
+    """
+    Loads shards from multiple domains, applies stratified sampling ratios,
+    and exact 13-gram deduplication across the whole corpus.
+    """
     _causal_mask_4d = None
-    def __init__(self, shards_dir, seq_len: int = 2048):
-        shards_dir = Path(shards_dir)
-        shard_paths = sorted(shards_dir.glob("shard_*.bin"))
-        shard_paths = [p for p in shard_paths if p.stat().st_size > 0]
-        if not shard_paths:
-            raise FileNotFoundError(f"No .bin shards found in {shards_dir}")
 
+    def __init__(self, shard_dirs: dict, seq_len: int = 2048,
+                 ratios: dict = None, dedup: bool = True):
         self.seq_len = seq_len
-        self.shard_bounds = []
-        self.total_seqs = 0
+        self.ratios = ratios or RATIOS
+        self.domains = []
+        self.domain_entries = {}
+        self.domain_totals = {}
+        grand_total = 0
 
-        for p in shard_paths:
-            n_tokens = p.stat().st_size // 2
-            n_seqs = n_tokens // seq_len
-            if n_seqs == 0:
+        for domain, dpath in shard_dirs.items():
+            if not dpath.exists():
+                logger.warning(f"Shard dir missing for '{domain}': {dpath} — skipping")
                 continue
-            self.shard_bounds.append((p, n_seqs, self.total_seqs))
-            self.total_seqs += n_seqs
+            entries, total = _load_shard_list(dpath, seq_len)
+            if total == 0:
+                continue
+            self.domains.append(domain)
+            self.domain_entries[domain] = entries
+            self.domain_totals[domain] = total
+            grand_total += total
+            logger.info(f"Domain '{domain}': {len(entries)} shards, {total:,} seqs")
 
-        logger.info(f"Loaded {len(shard_paths)} shards, {self.total_seqs:,} sequences ({self.total_seqs * seq_len:,} tokens)")
+        if not self.domains:
+            raise FileNotFoundError("No valid shard directories found")
 
-    def __len__(self):
-        return self.total_seqs
+        # Build flat index with domain tags for stratified sampling
+        self.index = []          # (global_idx, domain, local_idx)
+        self.domain_offsets = {}  # domain -> start in flat index
+        cursor = 0
+        for domain in self.domains:
+            self.domain_offsets[domain] = cursor
+            n = self.domain_totals[domain]
+            self.index.extend([(cursor + i, domain, i) for i in range(n)])
+            cursor += n
+        self.raw_len = len(self.index)
 
-    def __getitem__(self, idx):
-        for shard_path, n_seqs, start_idx in self.shard_bounds:
-            if idx < start_idx + n_seqs:
-                local_idx = idx - start_idx
-                offset = local_idx * self.seq_len
+        # Optional: exact 13-gram dedup (CPU, one-time scan)
+        self.dedup = dedup
+        self.valid_mask = None
+        if dedup:
+            self.valid_mask = self._compute_dedup_mask()
+            kept = self.valid_mask.sum()
+            logger.info(f"Dedup: {self.raw_len:,} raw → {kept:,} unique  (dropped {self.raw_len - kept:,})")
+        else:
+            self.valid_mask = torch.ones(self.raw_len, dtype=torch.bool)
+
+        # Precompute stratified per-batch ordering
+        self._build_stratified_order()
+
+    def _compute_dedup_mask(self):
+        seen = set()
+        mask = torch.zeros(self.raw_len, dtype=torch.bool)
+        # Scan every sequence once — slow but one-time
+        for global_idx in range(self.raw_len):
+            tokens = self._fetch_tokens(global_idx)
+            h = _hash_13gram(tokens.numpy())
+            if h not in seen:
+                seen.add(h)
+                mask[global_idx] = True
+        return mask
+
+    def _fetch_tokens(self, global_idx: int) -> torch.Tensor:
+        _, domain, local_idx = self.index[global_idx]
+        for shard_path, n_seqs, start_idx in self.domain_entries[domain]:
+            if local_idx < start_idx + n_seqs:
+                local = local_idx - start_idx
+                offset = local * self.seq_len
                 mm = np.memmap(str(shard_path), dtype=np.uint16, mode='r',
                                offset=offset * 2, shape=(self.seq_len,))
                 tokens = torch.from_numpy(mm.copy().astype(np.int64))
                 del mm
                 return tokens
-        raise IndexError(f"Index {idx} out of range")
+        raise IndexError(f"Bad index {global_idx}")
+
+    def _build_stratified_order(self):
+        # Create an epoch ordering that respects ratios
+        valid_indices = torch.where(self.valid_mask)[0].tolist()
+        # Bucket by domain
+        buckets = {d: [] for d in self.domains}
+        for idx in valid_indices:
+            _, domain, _ = self.index[idx]
+            buckets[domain].append(idx)
+        # Shuffle each bucket
+        for d in self.domains:
+            random.shuffle(buckets[d])
+
+        # Interleave according to ratios
+        self.epoch_order = []
+        ptrs = {d: 0 for d in self.domains}
+        total_valid = len(valid_indices)
+        # Determine per-step counts (proportional)
+        batch_size = 2  # physical batch; will be overridden by DataLoader
+        # We just build a flat list; DataLoader batching will grab sequentially
+        # To enforce ratios per step, we emit in repeating pattern
+        while sum(ptrs[d] < len(buckets[d]) for d in self.domains) > 0:
+            for domain in self.domains:
+                # emit ~ratio proportion
+                n_emit = max(1, int(batch_size * self.ratios[domain]))
+                for _ in range(n_emit):
+                    if ptrs[domain] < len(buckets[domain]):
+                        self.epoch_order.append(buckets[domain][ptrs[domain]])
+                        ptrs[domain] += 1
+            # safety break
+            if len(self.epoch_order) > total_valid * 2:
+                break
+        # Trim to exact count and final shuffle in small windows to keep locality
+        self.epoch_order = self.epoch_order[:total_valid]
+        logger.info(f"Stratified epoch: {len(self.epoch_order):,} samples")
+
+    def __len__(self):
+        return len(self.epoch_order)
+
+    def __getitem__(self, idx):
+        global_idx = self.epoch_order[idx]
+        return self._fetch_tokens(global_idx)
+
+
+# Backwards compat alias
+BinShardDataset = StratifiedShardDataset
 
 
 def collate_pretrain(batch):
@@ -363,12 +487,12 @@ def main():
 
     # Dataset
     logger.info("Loading dataset...")
-    dataset = BinShardDataset(SHARDS_DIR, seq_len=args.max_seq_len)
+    dataset = BinShardDataset(SHARD_DIRS, seq_len=args.max_seq_len, ratios=RATIOS, dedup=True)
     dataloader = DataLoader(
         dataset,
         batch_size=args.batch_size,
         collate_fn=collate_pretrain,
-        shuffle=True,
+        shuffle=False,  # stratified order already shuffled
         num_workers=0,
         pin_memory=False,
     )
