@@ -149,18 +149,19 @@ class KimiMuonClip(torch.optim.Optimizer):
                         p.mul_(1 - lr * wd)
                     p.add_(update, alpha=-lr)
 
-        # QK-Clip proxy: cap spectral norm of attention-like projections
+        # QK-Clip proxy: cap spectral norm of attention-like projections — GPU
         tau = self.defaults["tau"]
         for group in self.param_groups:
             if group.get("use_muon", False):
                 for p in group["params"]:
                     if p.ndim >= 2 and p.shape[0] <= p.shape[1]:
-                        # Covers q_proj (1536,1536), k_proj (512,1536), v_proj (512,1536),
-                        # o_proj (1536,1536), down_proj (1536,4608)
                         with torch.no_grad():
-                            spec_norm = torch.linalg.matrix_norm(p.data, ord=2)
-                            if spec_norm > tau:
-                                p.data.mul_(tau / spec_norm)
+                            p_gpu = p.data.cuda(non_blocking=False)
+                            spec_norm = torch.linalg.matrix_norm(p_gpu, ord=2)
+                            if spec_norm.item() > tau:
+                                p_gpu.mul_(tau / spec_norm)
+                                p.data.copy_(p_gpu)
+                            del p_gpu
 
         return loss
 
