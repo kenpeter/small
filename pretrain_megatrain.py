@@ -57,7 +57,7 @@ class KimiMuonClip(torch.optim.Optimizer):
     - Momentum warmup: 0.90 -> 0.95 over first 300 steps
     - QK-Clip proxy: spectral norm cap on attention projections
     """
-    def __init__(self, param_groups, tau: float = 150.0, ns_steps: int = 7):
+    def __init__(self, param_groups, tau: float = 150.0, ns_steps: int = 7, use_gpu_ns: bool = True):
         for group in param_groups:
             assert "use_muon" in group
             if group["use_muon"]:
@@ -69,7 +69,7 @@ class KimiMuonClip(torch.optim.Optimizer):
                 group.setdefault("betas", (0.9, 0.95))
                 group.setdefault("eps", 1e-10)
                 group.setdefault("weight_decay", 0.0)
-        defaults = dict(tau=tau, ns_steps=ns_steps)
+        defaults = dict(tau=tau, ns_steps=ns_steps, use_gpu_ns=use_gpu_ns)
         super().__init__(param_groups, defaults)
 
     @torch.no_grad()
@@ -101,14 +101,26 @@ class KimiMuonClip(torch.optim.Optimizer):
                     # Momentum: Mt = μ * Mt-1 + (1-μ) * Gt  (EMA, not SGD-style)
                     buf.mul_(beta).add_(p.grad, alpha=1-beta)
 
-                    # Newton-Schulz orthogonalization
-                    if p.ndim > 2:
-                        orig_shape = buf.shape
-                        buf_2d = buf.view(buf.shape[0], -1)
-                        update = newton_schulz(buf_2d, steps=self.defaults["ns_steps"])
-                        update = update.view(orig_shape)
+                    # Newton-Schulz orthogonalization — GPU if available
+                    use_gpu = torch.cuda.is_available() and self.defaults.get("use_gpu_ns", True)
+                    if use_gpu:
+                        buf_gpu = buf.cuda(non_blocking=False)
+                        if p.ndim > 2:
+                            orig_shape = buf_gpu.shape
+                            buf_2d = buf_gpu.view(buf_gpu.shape[0], -1)
+                            update_gpu = newton_schulz(buf_2d, steps=self.defaults["ns_steps"])
+                            update = update_gpu.view(orig_shape).cpu()
+                        else:
+                            update = newton_schulz(buf_gpu, steps=self.defaults["ns_steps"]).cpu()
+                        del buf_gpu
                     else:
-                        update = newton_schulz(buf, steps=self.defaults["ns_steps"])
+                        if p.ndim > 2:
+                            orig_shape = buf.shape
+                            buf_2d = buf.view(buf.shape[0], -1)
+                            update = newton_schulz(buf_2d, steps=self.defaults["ns_steps"])
+                            update = update.view(orig_shape)
+                        else:
+                            update = newton_schulz(buf, steps=self.defaults["ns_steps"])
 
                     # Consistent RMS scaling: sqrt(max(n,m) * 0.2)
                     n, m = p.shape[0], p.shape[1] if p.ndim > 1 else 1
@@ -482,8 +494,8 @@ def main():
         dict(params=scalar_params, lr=args.adam_lr, betas=(0.9, 0.95),
              eps=1e-10, weight_decay=config.weight_decay, use_muon=False),
     ]
-    optimizer = KimiMuonClip(param_groups, tau=args.tau, ns_steps=7)
-    logger.info("Optimizer: KimiMuonClip (Newton-Schulz + RMS scaling + QK-Clip + momentum warmup)")
+    optimizer = KimiMuonClip(param_groups, tau=args.tau, ns_steps=7, use_gpu_ns=True)
+    logger.info("Optimizer: KimiMuonClip (Newton-Schulz + RMS scaling + QK-Clip + momentum warmup) [GPU NS enabled]")
 
     # Dataset
     logger.info("Loading dataset...")
