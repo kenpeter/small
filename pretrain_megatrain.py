@@ -17,6 +17,18 @@ from infinity.config import CPUMasterConfig
 logger = logging.getLogger(__name__)
 
 # ============================================================================
+# Cosine LR schedule with linear warmup
+# ============================================================================
+
+def get_lr(step, warmup_steps, total_steps, base_lr, min_lr=1e-6):
+    """Cosine decay with linear warmup."""
+    if step < warmup_steps:
+        return base_lr * step / max(warmup_steps, 1)
+    progress = (step - warmup_steps) / max(total_steps - warmup_steps, 1)
+    return min_lr + (base_lr - min_lr) * 0.5 * (1 + math.cos(math.pi * progress))
+
+
+# ============================================================================
 # Kimi K2 MuonClip Optimizer — Full Implementation
 # Based on arXiv 2502.16982 + github.com/AkulDatta/muonclip
 # ============================================================================
@@ -408,9 +420,11 @@ def main():
     parser.add_argument("--log-interval", type=int, default=120)
     parser.add_argument("--save-interval", type=int, default=2000)
     parser.add_argument("--output-dir", type=str, default="/home/kenpeter/work/checkpoints")
-    parser.add_argument("--muon-lr", type=float, default=0.005, help="Learning rate for Muon 2D params")
+    parser.add_argument("--muon-lr", type=float, default=0.02, help="Learning rate for Muon 2D params")
     parser.add_argument("--adam-lr", type=float, default=3e-4, help="Learning rate for AdamW 1D/embed/head params")
     parser.add_argument("--tau", type=float, default=150.0, help="QK-Clip spectral norm threshold")
+    parser.add_argument("--warmup-steps", type=int, default=1000, help="Linear warmup steps")
+    parser.add_argument("--min-lr", type=float, default=1e-6, help="Minimum LR for cosine decay")
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -422,6 +436,7 @@ def main():
     logger.info(f"Data: {SHARD_DIRS}")
     logger.info(f"Params: batch={args.batch_size}, seq_len={args.max_seq_len}, steps={args.num_steps}")
     logger.info(f"Muon lr={args.muon_lr}, AdamW lr={args.adam_lr}, QK-Clip tau={args.tau}")
+    logger.info(f"LR schedule: cosine, warmup={args.warmup_steps}, min_lr={args.min_lr}")
 
     tokenizer = AutoTokenizer.from_pretrained("HuggingFaceTB/SmolLM2-135M", trust_remote_code=True)
 
@@ -535,6 +550,19 @@ def main():
         if (step + 1) % config.gradient_accumulation_steps == 0:
             global_step += 1
 
+            # Apply cosine LR schedule to each param group
+            for group in optimizer.param_groups:
+                base_lr = group["base_lr"] if "base_lr" in group else group["lr"]
+                if "base_lr" not in group:
+                    group["base_lr"] = base_lr  # store original once
+                group["lr"] = get_lr(
+                    global_step,
+                    args.warmup_steps,
+                    args.num_steps,
+                    base_lr,
+                    args.min_lr,
+                )
+
             # Only clip AdamW params; Muon already normalizes via Newton-Schulz
             for group in optimizer.param_groups:
                 if not group.get("use_muon", False):
@@ -552,9 +580,12 @@ def main():
 
         if (step + 1) % args.log_interval == 0:
             gpu_mem = torch.cuda.max_memory_allocated(args.device) / 1024**3
+            current_muon_lr = next((g["lr"] for g in optimizer.param_groups if g.get("use_muon")), args.muon_lr)
+            current_adam_lr = next((g["lr"] for g in optimizer.param_groups if not g.get("use_muon")), args.adam_lr)
             logger.info(
                 f"Step {step+1}/{config.num_steps} | "
                 f"Loss {loss_val:.4f} | "
+                f"LR muon={current_muon_lr:.2e} adam={current_adam_lr:.2e} | "
                 f"{step_time:.2f}s/step | "
                 f"{tps:.0f} tok/s | "
                 f"GPU {gpu_mem:.2f}GB"
