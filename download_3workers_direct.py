@@ -1,30 +1,51 @@
 #!/usr/bin/env python3
-"""Parallel download with 3 workers using direct HTTP/curl."""
+"""Super-robust parallel download with resume, size validation, and retry.
+
+Fixed: handles large files (>2GB) with wget resume, longer timeouts,
+       and skips datasets already present on disk.
+"""
 import os, time, json, subprocess
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from statistics import median
 
 HF_TOKEN = os.environ.get("HF_TOKEN", "")
-STAGING = Path("/home/kenpeter/work/data/_staging_multi")
+STAGING = Path("/home/kenpeter/work/data/_raw_original")
 STAGING.mkdir(parents=True, exist_ok=True)
 
+# Dataset config: (name, repo, pattern, max_files, skip_if_present_threshold)
+# skip_if_present_threshold = min files on disk to consider "done"
 DATASETS = [
-    ("fineweb-edu", "HuggingFaceFW/fineweb-edu", "data/CC-MAIN-*/train-*.parquet", 200),
-    ("finemath-3plus", "HuggingFaceTB/finemath", "finemath-3plus/train-*.parquet", 200),
-    ("cosmopedia", "HuggingFaceTB/cosmopedia", "data/stanford/train-*.parquet", 200),
-    ("open-web-math", "open-web-math/open-web-math", "data/train-*.parquet", 200),
+    # fineweb-edu already have 42 sample files (~1.8GB) - skip full 2GB CC-MAIN files
+    ("fineweb-edu", "HuggingFaceFW/fineweb-edu", "data/CC-MAIN-*/train-*.parquet", 0, 30),
+    ("finemath-3plus", "HuggingFaceTB/finemath", "finemath-3plus/train-*.parquet", 200, 0),
+    ("cosmopedia", "HuggingFaceTB/cosmopedia", "data/stanford/train-*.parquet", 200, 0),
+    ("open-web-math", "open-web-math/open-web-math", "data/train-*.parquet", 200, 0),
 ]
 
+LOG = Path("/home/kenpeter/work/small/download.log")
+
+
+def log(msg):
+    ts = time.strftime("%H:%M:%S")
+    line = f"[{ts}] {msg}"
+    print(line, flush=True)
+    # Note: stdout is redirected to download.log by the launcher
+
+
 def list_files(repo, pattern, max_files=200):
-    """List files from HF API."""
     import urllib.request
     url = f"https://huggingface.co/api/datasets/{repo}/tree/main?recursive=true"
     headers = {}
     if HF_TOKEN:
         headers["Authorization"] = f"Bearer {HF_TOKEN}"
     req = urllib.request.Request(url, headers=headers)
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        data = json.loads(resp.read())
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = json.loads(resp.read())
+    except Exception as e:
+        log(f"[list_files] API error for {repo}: {e}")
+        return []
     files = [item["path"] for item in data
              if item.get("type") == "file"
              and item["path"].endswith(".parquet")
@@ -33,87 +54,168 @@ def list_files(repo, pattern, max_files=200):
     matched = [f for f in files if f.startswith(prefix)]
     return matched[:max_files]
 
-def download_file(repo, remote_path, local_path):
-    """Download using curl with 3 retries."""
-    if local_path.exists() and local_path.stat().st_size > 100000:
-        return "skip"
+
+def download_file(repo, remote_path, local_path, expected_size=None):
+    """Download using wget with resume. Handles files up to 5GB+."""
+    local_path = Path(local_path)
+
+    # Check if already complete
+    if local_path.exists():
+        actual = local_path.stat().st_size
+        if expected_size and actual >= expected_size * 0.98:
+            return "skip"
+        if not expected_size and actual > 10_000_000:  # >10MB heuristic
+            return "skip"
+        # Partial — delete and retry
+        log(f"  Removing partial {local_path.name} ({actual/1e6:.1f} MB)")
+        local_path.unlink()
+
     url = f"https://huggingface.co/datasets/{repo}/resolve/main/{remote_path}"
-    cmd = ["curl", "-sL", "--max-time", "300", "-o", str(local_path)]
+
+    # wget: resume, 20 retries, 20 min timeout, continue on slow networks
+    cmd = [
+        "wget", "-q",
+        "-c",           # resume
+        "-t", "20",     # 20 retries
+        "--timeout=1200",   # 20 min per attempt
+        "--read-timeout=600",
+        "-O", str(local_path),
+    ]
     if HF_TOKEN:
-        cmd.extend(["-H", f"Authorization: Bearer {HF_TOKEN}"])
+        cmd.extend(["--header", f"Authorization: Bearer {HF_TOKEN}"])
     cmd.append(url)
+
     for attempt in range(3):
         try:
-            result = subprocess.run(cmd, capture_output=True, timeout=310)
-            if result.returncode == 0 and local_path.exists() and local_path.stat().st_size > 100000:
-                return "ok"
-            if attempt < 2:
-                time.sleep(5)
+            result = subprocess.run(cmd, capture_output=True, timeout=7200)  # 2h total
+            if result.returncode == 0 and local_path.exists():
+                actual = local_path.stat().st_size
+                if expected_size and actual >= expected_size * 0.98:
+                    return "ok"
+                if actual > 10_000_000:
+                    return "ok"
+                # Too small — probably truncated
+                log(f"  {local_path.name} too small ({actual/1e6:.1f} MB), retrying")
+                local_path.unlink()
+            else:
+                stderr = result.stderr.decode() if result.stderr else ""
+                log(f"  wget err (attempt {attempt+1}): rc={result.returncode} {stderr[:120]}")
         except subprocess.TimeoutExpired:
-            if attempt < 2:
-                time.sleep(5)
-    return f"err: curl exit after 3 retries"
+            log(f"  wget TIMEOUT attempt {attempt+1} for {local_path.name}")
+            if local_path.exists():
+                local_path.unlink()
+        except Exception as e:
+            log(f"  wget exception: {e}")
 
-def download_dataset(name, repo, pattern, max_files):
-    print(f"\n[{name}] Listing files...", flush=True)
+        time.sleep(15 * (attempt + 1))
+
+    return "err: wget failed after 3 rounds"
+
+
+def download_dataset(name, repo, pattern, max_files, skip_threshold):
+    out_dir = STAGING / name
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Check how many files already exist
+    existing = list(out_dir.rglob("*.parquet"))
+    if len(existing) >= skip_threshold and skip_threshold > 0:
+        log(f"[{name}] Already have {len(existing)} files, skipping (threshold {skip_threshold})")
+        return
+
+    log(f"[{name}] Listing files...")
     files = list_files(repo, pattern, max_files)
     total = len(files)
     if total == 0:
-        print(f"[{name}] No files found", flush=True)
+        log(f"[{name}] No files found")
         return
-    print(f"[{name}] {total} files to download (3 workers, queue depth 8, 1.5s stagger)", flush=True)
+    log(f"[{name}] {total} files to download")
 
-    out_dir = STAGING / name
-    out_dir.mkdir(parents=True, exist_ok=True)
+    # Sample expected sizes from first 3 files via HEAD
+    sample_sizes = []
+    for f in files[:3]:
+        import urllib.request
+        url = f"https://huggingface.co/datasets/{repo}/resolve/main/{f}"
+        headers = {}
+        if HF_TOKEN:
+            headers["Authorization"] = f"Bearer {HF_TOKEN}"
+        req = urllib.request.Request(url, headers=headers, method="HEAD")
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                sz = resp.headers.get("Content-Length")
+                if sz:
+                    sample_sizes.append(int(sz))
+        except Exception:
+            pass
+    expected_size = int(median(sample_sizes)) if sample_sizes else None
+    if expected_size:
+        log(f"[{name}] Expected file size ~{expected_size/1e6:.1f} MB")
 
     done, ok, skip, fail = 0, 0, 0, 0
     t0 = time.time()
 
-    with ThreadPoolExecutor(max_workers=3) as pool:
+    with ThreadPoolExecutor(max_workers=4) as pool:  # 4 workers for faster downloads
         futures = {}
         idx = 0
 
-        # Seed initial queue
-        while len(futures) < 8 and idx < total:
+        # Seed initial queue (depth 4 for large files)
+        while len(futures) < 4 and idx < total:
             f = files[idx]
             local = out_dir / f.split("/")[-1]
-            if local.exists() and local.stat().st_size > 100000:
-                skip += 1; done += 1; idx += 1; continue
-            futures[pool.submit(download_file, repo, f, local)] = f
+            if local.exists():
+                actual = local.stat().st_size
+                if expected_size and actual >= expected_size * 0.98:
+                    skip += 1; done += 1; idx += 1
+                    continue
+                if actual > 10_000_000 and not expected_size:
+                    skip += 1; done += 1; idx += 1
+                    continue
+                # Partial — will be removed by download_file
+            futures[pool.submit(download_file, repo, f, local, expected_size)] = f
             idx += 1
-            time.sleep(1.5)  # stagger to keep network usable
+            time.sleep(3.0)  # slower stagger for large files
 
         while futures:
             for future in as_completed(futures):
                 f = futures.pop(future)
                 result = future.result()
                 done += 1
-                if result == "ok": ok += 1
-                elif result == "skip": skip += 1
+                if result == "ok":
+                    ok += 1
+                elif result == "skip":
+                    skip += 1
                 else:
                     fail += 1
-                    print(f"  {result}", flush=True)
-                if done % 5 == 0 or done == total:
+                    log(f"  {result}")
+
+                if done % 3 == 0 or done == total:
                     elapsed = time.time() - t0
-                    print(f"  [{name}] {done}/{total} | ok={ok} skip={skip} fail={fail} | {elapsed:.0f}s", flush=True)
+                    rate = done / (elapsed / 60) if elapsed > 0 else 0
+                    log(f"[{name}] {done}/{total} | ok={ok} skip={skip} fail={fail} | {elapsed:.0f}s | {rate:.1f} files/min")
                 break
 
             # Refill queue
-            while len(futures) < 8 and idx < total:
+            while len(futures) < 4 and idx < total:
                 f = files[idx]
                 local = out_dir / f.split("/")[-1]
-                if local.exists() and local.stat().st_size > 100000:
-                    skip += 1; done += 1; idx += 1; continue
-                futures[pool.submit(download_file, repo, f, local)] = f
+                if local.exists():
+                    actual = local.stat().st_size
+                    if expected_size and actual >= expected_size * 0.98:
+                        skip += 1; done += 1; idx += 1
+                        continue
+                    if actual > 10_000_000 and not expected_size:
+                        skip += 1; done += 1; idx += 1
+                        continue
+                futures[pool.submit(download_file, repo, f, local, expected_size)] = f
                 idx += 1
-                time.sleep(1.5)
+                time.sleep(3.0)
 
     elapsed = time.time() - t0
-    print(f"[{name}] Done: {ok} ok, {skip} skip, {fail} fail in {elapsed:.0f}s", flush=True)
+    log(f"[{name}] Done: {ok} ok, {skip} skip, {fail} fail in {elapsed:.0f}s")
+
 
 def main():
-    for name, repo, pattern, max_files in DATASETS:
-        download_dataset(name, repo, pattern, max_files)
+    for name, repo, pattern, max_files, skip_threshold in DATASETS:
+        download_dataset(name, repo, pattern, max_files, skip_threshold)
 
 if __name__ == "__main__":
     main()
