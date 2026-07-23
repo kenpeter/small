@@ -153,7 +153,7 @@ def download_dataset(name, repo, pattern, max_files, skip_threshold):
     done, ok, skip, fail = 0, 0, 0, 0
     t0 = time.time()
 
-    with ThreadPoolExecutor(max_workers=3) as pool:  # 3 workers for balanced speed
+    with ThreadPoolExecutor(max_workers=4) as pool:  # 4 workers for faster downloads
         futures = {}
         idx = 0
 
