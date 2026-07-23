@@ -54,10 +54,10 @@ class KimiMuonClip(torch.optim.Optimizer):
     - AdamW for 1D scalars (norms, biases)
     - AdamW for embeddings + lm_head
     - Consistent RMS scaling across all layers
-    - Momentum warmup: 0.85 -> 0.95 over first 300 steps
+    - Momentum warmup: 0.90 -> 0.95 over first 300 steps
     - QK-Clip proxy: spectral norm cap on attention projections
     """
-    def __init__(self, param_groups, tau: float = 100.0, ns_steps: int = 5):
+    def __init__(self, param_groups, tau: float = 150.0, ns_steps: int = 7):
         for group in param_groups:
             assert "use_muon" in group
             if group["use_muon"]:
@@ -79,9 +79,9 @@ class KimiMuonClip(torch.optim.Optimizer):
             with torch.enable_grad():
                 loss = closure()
 
-        # Momentum warmup: 0.85 -> 0.95 over first 300 steps
+        # Momentum warmup: 0.90 -> 0.95 over first 300 steps
         frac = min(global_step / 300.0, 1.0)
-        warmed_momentum = (1 - frac) * 0.85 + frac * 0.95
+        warmed_momentum = (1 - frac) * 0.90 + frac * 0.95
 
         for group in self.param_groups:
             lr = group["lr"]
@@ -98,8 +98,8 @@ class KimiMuonClip(torch.optim.Optimizer):
                         state["momentum_buffer"] = torch.zeros_like(p)
 
                     buf = state["momentum_buffer"]
-                    # Momentum: Mt = μ * Mt-1 + Gt
-                    buf.mul_(beta).add_(p.grad)
+                    # Momentum: Mt = μ * Mt-1 + (1-μ) * Gt  (EMA, not SGD-style)
+                    buf.mul_(beta).add_(p.grad, alpha=1-beta)
 
                     # Newton-Schulz orthogonalization
                     if p.ndim > 2:
@@ -395,9 +395,9 @@ def main():
     parser.add_argument("--log-interval", type=int, default=120)
     parser.add_argument("--save-interval", type=int, default=2000)
     parser.add_argument("--output-dir", type=str, default="/home/kenpeter/work/checkpoints")
-    parser.add_argument("--muon-lr", type=float, default=0.01, help="Learning rate for Muon 2D params")
+    parser.add_argument("--muon-lr", type=float, default=0.005, help="Learning rate for Muon 2D params")
     parser.add_argument("--adam-lr", type=float, default=3e-4, help="Learning rate for AdamW 1D/embed/head params")
-    parser.add_argument("--tau", type=float, default=100.0, help="QK-Clip spectral norm threshold")
+    parser.add_argument("--tau", type=float, default=150.0, help="QK-Clip spectral norm threshold")
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -482,7 +482,7 @@ def main():
         dict(params=scalar_params, lr=args.adam_lr, betas=(0.9, 0.95),
              eps=1e-10, weight_decay=config.weight_decay, use_muon=False),
     ]
-    optimizer = KimiMuonClip(param_groups, tau=args.tau, ns_steps=5)
+    optimizer = KimiMuonClip(param_groups, tau=args.tau, ns_steps=7)
     logger.info("Optimizer: KimiMuonClip (Newton-Schulz + RMS scaling + QK-Clip + momentum warmup)")
 
     # Dataset
