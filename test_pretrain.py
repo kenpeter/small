@@ -112,6 +112,28 @@ def test_lr_monotonic_during_warmup():
     print(f"  PASS: LR monotonic during warmup ({lrs[0]:.2e} -> {lrs[-1]:.2e})")
 
 
+def test_lr_must_use_outer_step_not_global_step():
+    """Regression: get_lr must receive outer step (sample count), not global_step.
+
+    With grad_accum=12, global_step at outer step 1000 is only ~83.
+    Passing global_step would stretch warmup 12x and make cosine decay
+    happen over optimizer steps that never reach num_steps.
+    """
+    base, warmup, total = 0.02, 1000, 50000
+    lr_at_outer_1000 = get_lr(1000, warmup, total, base)
+    lr_at_global_83 = get_lr(83, warmup, total, base)
+    assert abs(lr_at_outer_1000 - base) < 1e-12, (
+        f"{_test_name()}: outer step 1000 should reach peak LR {base}, got {lr_at_outer_1000}"
+    )
+    assert abs(lr_at_global_83 - base * 83 / warmup) < 1e-12, (
+        f"{_test_name()}: global_step 83 should still be in warmup, got {lr_at_global_83}"
+    )
+    assert lr_at_global_83 < lr_at_outer_1000, (
+        f"{_test_name()}: using global_step would under-power LR by factor {lr_at_outer_1000/lr_at_global_83:.1f}x"
+    )
+    print(f"  PASS: outer_step={lr_at_outer_1000:.2e} vs global_step={lr_at_global_83:.2e} — caller must pass outer step")
+
+
 # =============================================================================
 # 2. Data Collation
 # =============================================================================
@@ -535,6 +557,7 @@ TESTS = [
     test_lr_cosine_decay_falls,
     test_lr_zero_warmup,
     test_lr_monotonic_during_warmup,
+    test_lr_must_use_outer_step_not_global_step,
     test_collate_creates_causal_mask,
     test_collate_labels_equal_input_ids,
     test_checkpoint_rejects_nan,

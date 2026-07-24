@@ -556,7 +556,7 @@ def main():
                 if "base_lr" not in group:
                     group["base_lr"] = base_lr  # store original once
                 group["lr"] = get_lr(
-                    global_step,
+                    step + 1,  # outer sample step, not global_step (optimizer step)
                     args.warmup_steps,
                     args.num_steps,
                     base_lr,
