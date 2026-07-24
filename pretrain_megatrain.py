@@ -420,7 +420,7 @@ def main():
     parser.add_argument("--log-interval", type=int, default=120)
     parser.add_argument("--save-interval", type=int, default=2000)
     parser.add_argument("--output-dir", type=str, default="/home/kenpeter/work/checkpoints")
-    parser.add_argument("--muon-lr", type=float, default=0.02, help="Learning rate for Muon 2D params")
+    parser.add_argument("--muon-lr", type=float, default=0.01, help="Learning rate for Muon 2D params")
     parser.add_argument("--adam-lr", type=float, default=3e-4, help="Learning rate for AdamW 1D/embed/head params")
     parser.add_argument("--tau", type=float, default=150.0, help="QK-Clip spectral norm threshold")
     parser.add_argument("--warmup-steps", type=int, default=1000, help="Linear warmup steps")
