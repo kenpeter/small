@@ -532,14 +532,14 @@ def test_default_argparse_values():
     """Argparse defaults must match expected training config."""
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument("--muon-lr", type=float, default=0.01)
+    parser.add_argument("--muon-lr", type=float, default=3e-4)
     parser.add_argument("--adam-lr", type=float, default=3e-4)
     parser.add_argument("--warmup-steps", type=int, default=1000)
     parser.add_argument("--min-lr", type=float, default=1e-6)
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--grad-accum", type=int, default=12)
     args = parser.parse_args([])
-    assert args.muon_lr == 0.01, f"{_test_name()}: muon_lr default = {args.muon_lr}"
+    assert args.muon_lr == 3e-4, f"{_test_name()}: muon_lr default = {args.muon_lr}"
     assert args.adam_lr == 3e-4, f"{_test_name()}: adam_lr default = {args.adam_lr}"
     assert args.warmup_steps == 1000, f"{_test_name()}: warmup_steps default = {args.warmup_steps}"
     assert args.min_lr == 1e-6, f"{_test_name()}: min_lr default = {args.min_lr}"

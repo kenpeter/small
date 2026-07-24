@@ -134,9 +134,9 @@ class KimiMuonClip(torch.optim.Optimizer):
                         else:
                             update = newton_schulz(buf, steps=self.defaults["ns_steps"])
 
-                    # Consistent RMS scaling: sqrt(max(n,m) * 0.2)
+                    # Paper: Muon scaling = 0.2 * max(n, m)  (arXiv:2502.16982 §3)
                     n, m = p.shape[0], p.shape[1] if p.ndim > 1 else 1
-                    rms_factor = math.sqrt(max(n, m) * 0.2)
+                    rms_factor = max(n, m) * 0.2
                     update *= rms_factor
 
                     # Weight decay + update
@@ -420,7 +420,7 @@ def main():
     parser.add_argument("--log-interval", type=int, default=120)
     parser.add_argument("--save-interval", type=int, default=2000)
     parser.add_argument("--output-dir", type=str, default="/home/kenpeter/work/checkpoints")
-    parser.add_argument("--muon-lr", type=float, default=0.01, help="Learning rate for Muon 2D params")
+    parser.add_argument("--muon-lr", type=float, default=3e-4, help="Learning rate for Muon 2D params (paper matches AdamW base)")
     parser.add_argument("--adam-lr", type=float, default=3e-4, help="Learning rate for AdamW 1D/embed/head params")
     parser.add_argument("--tau", type=float, default=150.0, help="QK-Clip spectral norm threshold")
     parser.add_argument("--warmup-steps", type=int, default=1000, help="Linear warmup steps")
