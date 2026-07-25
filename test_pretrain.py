@@ -538,11 +538,13 @@ def test_default_argparse_values():
     parser.add_argument("--min-lr", type=float, default=1e-6)
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--grad-accum", type=int, default=12)
+    parser.add_argument("--resume", type=str, default=None)
     args = parser.parse_args([])
     assert args.muon_lr == 3e-4, f"{_test_name()}: muon_lr default = {args.muon_lr}"
     assert args.adam_lr == 3e-4, f"{_test_name()}: adam_lr default = {args.adam_lr}"
     assert args.warmup_steps == 1000, f"{_test_name()}: warmup_steps default = {args.warmup_steps}"
     assert args.min_lr == 1e-6, f"{_test_name()}: min_lr default = {args.min_lr}"
+    assert args.resume is None, f"{_test_name()}: resume default = {args.resume}"
     assert args.batch_size == 4
     assert args.grad_accum == 12
     print(f"  PASS: argparse defaults correct (muon_lr={args.muon_lr}, adam_lr={args.adam_lr})")

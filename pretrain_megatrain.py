@@ -425,6 +425,7 @@ def main():
     parser.add_argument("--tau", type=float, default=150.0, help="QK-Clip spectral norm threshold")
     parser.add_argument("--warmup-steps", type=int, default=1000, help="Linear warmup steps")
     parser.add_argument("--min-lr", type=float, default=1e-6, help="Minimum LR for cosine decay")
+    parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint .pt to resume from")
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -528,13 +529,42 @@ def main():
 
     # Training loop
     logger.info("=" * 60)
-    logger.info("Starting pretraining from scratch...")
-    logger.info("=" * 60)
-
     best_loss = float("inf")
     global_step = 0
+    start_step = 0
 
-    for step in range(config.num_steps):
+    if args.resume and os.path.exists(args.resume):
+        logger.info(f"Resuming from checkpoint: {args.resume}")
+        checkpoint = torch.load(args.resume, map_location="cpu")
+        # CPUMasterModel doesn't have load_state_dict; manually map HF keys to layers
+        sd = checkpoint["model_state_dict"]
+        for key, tensor in sd.items():
+            if key == "model.embed_tokens.weight":
+                model.embedding.weight.data.copy_(tensor)
+            elif key == "model.norm.weight":
+                model.norm.weight.data.copy_(tensor)
+            elif key == "lm_head.weight":
+                model.lm_head.weight.data.copy_(tensor)
+            elif key.startswith("model.layers."):
+                parts = key.split(".")  # model.layers.N.layer_name...
+                layer_idx = int(parts[2])
+                sub_key = ".".join(parts[3:])
+                target = model.cpu_layers[layer_idx]
+                for name, param in target.named_parameters():
+                    if name == sub_key:
+                        param.data.copy_(tensor)
+                        break
+        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        global_step = checkpoint.get("step", 0)
+        best_loss = checkpoint.get("best_loss", float("inf"))
+        start_step = global_step
+        logger.info(f"  Resumed at step {global_step}, best_loss={best_loss:.4f}")
+    else:
+        logger.info("Starting pretraining from scratch...")
+
+    logger.info("=" * 60)
+
+    for step in range(start_step, config.num_steps):
         try:
             batch = next(data_iter)
         except StopIteration:
