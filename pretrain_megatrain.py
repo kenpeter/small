@@ -187,6 +187,8 @@ class KimiMuonClip(torch.optim.Optimizer):
                     if p.ndim >= 2 and p.shape[0] <= p.shape[1]:
                         with torch.no_grad():
                             p_gpu = p.data.cuda(non_blocking=False)
+                            if p_gpu.dtype != torch.float32:
+                                p_gpu = p_gpu.float()
                             spec_norm = torch.linalg.matrix_norm(p_gpu, ord=2)
                             if spec_norm.item() > tau:
                                 p_gpu.mul_(tau / spec_norm)
@@ -225,28 +227,14 @@ SHARD_DIRS = {
 # Phase 3 (40-50%): ALL hard data
 def get_curriculum_ratios(step, total_steps):
     p = step / total_steps
-    if p < 0.30:  # Easy: all domains
-        return {
-            "math_easy": 0.30,
-            "code_easy": 0.10,
-            "synth_easy": 0.15,
-            "web_easy": 0.35,
-            "reformat_easy": 0.10,
-        }
-    elif p < 0.40:  # Medium: all domains
-        return {
-            "math_medium": 0.30,
-            "code_medium": 0.15,
-            "synth_medium": 0.25,
-            "web_medium": 0.30,
-        }
-    else:  # Hard: all domains
-        return {
-            "math_hard": 0.40,
-            "code_hard": 0.15,
-            "synth_hard": 0.20,
-            "web_hard": 0.25,
-        }
+    # Phase 1 (0-100%): ALL easy data — stay on Easy until loss converges
+    return {
+        "math_easy": 0.30,
+        "code_easy": 0.10,
+        "synth_easy": 0.15,
+        "web_easy": 0.35,
+        "reformat_easy": 0.10,
+    }
 
 
 def _load_shard_list(shards_dir: Path, seq_len: int):
@@ -358,25 +346,30 @@ class StratifiedShardDataset(Dataset):
     def _build_stratified_order(self):
         # Create an epoch ordering that respects ratios
         valid_indices = torch.where(self.valid_mask)[0].tolist()
+        # Only include domains that are in the current phase ratios
+        active_domains = [d for d in self.domains if d in self.ratios]
+        if not active_domains:
+            active_domains = self.domains[:]
         # Bucket by domain
-        buckets = {d: [] for d in self.domains}
+        buckets = {d: [] for d in active_domains}
         for idx in valid_indices:
             _, domain, _ = self.index[idx]
-            buckets[domain].append(idx)
+            if domain in buckets:
+                buckets[domain].append(idx)
         # Shuffle each bucket
-        for d in self.domains:
+        for d in active_domains:
             random.shuffle(buckets[d])
 
         # Interleave according to ratios
         self.epoch_order = []
-        ptrs = {d: 0 for d in self.domains}
+        ptrs = {d: 0 for d in active_domains}
         total_valid = len(valid_indices)
         # Determine per-step counts (proportional)
         batch_size = 2  # physical batch; will be overridden by DataLoader
         # We just build a flat list; DataLoader batching will grab sequentially
         # To enforce ratios per step, we emit in repeating pattern
-        while sum(ptrs[d] < len(buckets[d]) for d in self.domains) > 0:
-            for domain in self.domains:
+        while sum(ptrs[d] < len(buckets[d]) for d in active_domains) > 0:
+            for domain in active_domains:
                 # emit ~ratio proportion
                 n_emit = max(1, int(batch_size * self.ratios[domain]))
                 for _ in range(n_emit):
@@ -465,7 +458,7 @@ def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--batch-size", type=int, default=4)
+    parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--num-steps", type=int, default=50000)
     parser.add_argument("--lr", type=float, default=4e-4)
     parser.add_argument("--max-seq-len", type=int, default=SEQ_LEN)
@@ -476,6 +469,7 @@ def main():
     parser.add_argument("--log-interval", type=int, default=120)
     parser.add_argument("--save-interval", type=int, default=2000)
     parser.add_argument("--output-dir", type=str, default="/home/kenpeter/work/checkpoints")
+    parser.add_argument("--dtype", type=str, default="bfloat16", choices=["float32", "bfloat16", "float16"], help="Model dtype")
     parser.add_argument("--muon-lr", type=float, default=3e-4, help="Learning rate for Muon 2D params (paper matches AdamW base)")
     parser.add_argument("--adam-lr", type=float, default=3e-4, help="Learning rate for AdamW 1D/embed/head params")
     parser.add_argument("--tau", type=float, default=150.0, help="QK-Clip spectral norm threshold")
@@ -491,13 +485,15 @@ def main():
     logger.info("=" * 60)
     logger.info(f"Model: Custom 1032M (dim=1536, L=32, h=12, kv=4, ffn=4608)")
     logger.info(f"Data: {SHARD_DIRS}")
-    logger.info(f"Params: batch={args.batch_size}, seq_len={args.max_seq_len}, steps={args.num_steps}")
+    logger.info(f"Params: batch={args.batch_size}, seq_len={args.max_seq_len}, steps={args.num_steps}, dtype={args.dtype}")
     logger.info(f"Muon lr={args.muon_lr}, AdamW lr={args.adam_lr}, QK-Clip tau={args.tau}")
     logger.info(f"LR schedule: cosine, warmup={args.warmup_steps}, min_lr={args.min_lr}")
 
     tokenizer = AutoTokenizer.from_pretrained("HuggingFaceTB/SmolLM2-135M", trust_remote_code=True)
 
     logger.info("Creating model from custom config (random init)...")
+    dtype_map = {"float32": torch.float32, "bfloat16": torch.bfloat16, "float16": torch.float16}
+    torch_dtype = dtype_map[args.dtype]
     hf_config = LlamaConfig(
         vocab_size=49152,
         hidden_size=1536,
@@ -513,13 +509,13 @@ def main():
         attention_bias=False,
         mlp_bias=False,
         initializer_range=0.02,
-        torch_dtype="float32",
+        torch_dtype=args.dtype,
         head_dim=128,
         architectures=["LlamaForCausalLM"],
     )
     hf_model = AutoModelForCausalLM.from_config(
         hf_config,
-        dtype=torch.float32,
+        dtype=torch_dtype,
         trust_remote_code=True,
         attn_implementation="sdpa",
     )
@@ -538,7 +534,7 @@ def main():
         checkpoint_interval=args.checkpoint_interval,
         num_grad_slabs=args.num_grad_slabs,
         device=args.device,
-        dtype=torch.float32,
+        dtype=torch_dtype,
         log_interval=1,
         attn_implementation="sdpa",
         trust_remote_code=True,
