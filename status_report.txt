@@ -1,8 +1,8 @@
-=== Status Report: Sat Jul 25 04:30:01 PM AEST 2026 ===
+=== Status Report: Tue Jul 28 11:30:01 PM AEST 2026 ===
 
 ── Training ──
   2026-07-20 13:43:56,764 [INFO] Step 18240/242188 | Loss 3.4519 | 6.04s/step | 2712 tok/s | GPU 3.16GB
-  PID: stopped | GPU: Failed to initialize NVML: Driver/library version mismatch
+  PID: stopped | GPU: 28, 5.77, 11269, 12282
 
 ── Data Download ──
   Not started
@@ -12,4 +12,4 @@
 ── Staging ──
 
 ── Disk ──
-  Used: 300G / 506G (63% full)
+  Used: 215G / 506G (45% full)

@@ -1,9 +1,9 @@
 === Training Status ===
-Updated: Sat Jul 25 04:30:01 PM AEST 2026
+Updated: Tue Jul 28 11:30:01 PM AEST 2026
 
 2026-07-20 13:43:56,764 [INFO] Step 18240/242188 | Loss 3.4519 | 6.04s/step | 2712 tok/s | GPU 3.16GB
 
-GPU memory: Failed to initialize NVML: Driver/library version mismatch MB
+GPU memory: 11269, 12282 MB
 PID: stopped
 Started: 2026-07-19 12:13:50,7
 

@@ -61,8 +61,9 @@ def adam_update(grad, buf1, buf2, step, betas, eps):
 
 class KimiMuonClip(torch.optim.Optimizer):
     """
-    Kimi K2 MuonClip optimizer.
+    Kimi K2 MuonClip optimizer + Kimi K3 Per-Head Muon for attention projections.
     - Muon (Newton-Schulz + momentum) for 2D hidden weights
+    - Per-Head Muon for Q/K/V projections (Kimi K3 §2.5)
     - AdamW for 1D scalars (norms, biases)
     - AdamW for embeddings + lm_head
     - Consistent RMS scaling across all layers
@@ -76,6 +77,8 @@ class KimiMuonClip(torch.optim.Optimizer):
                 group.setdefault("lr", 0.01)
                 group.setdefault("momentum", 0.95)
                 group.setdefault("weight_decay", 0.0)
+                group.setdefault("per_head", False)
+                group.setdefault("head_dim", 128)
             else:
                 group.setdefault("lr", 3e-4)
                 group.setdefault("betas", (0.9, 0.95))
@@ -117,7 +120,15 @@ class KimiMuonClip(torch.optim.Optimizer):
                     use_gpu = torch.cuda.is_available() and self.defaults.get("use_gpu_ns", True)
                     if use_gpu:
                         buf_gpu = buf.cuda(non_blocking=False)
-                        if p.ndim > 2:
+                        if group.get("per_head", False) and p.ndim == 2:
+                            # Per-Head Muon (Kimi K3 §2.5): partition along head dimension
+                            head_dim = group.get("head_dim", 128)
+                            n_heads = p.shape[0] // head_dim
+                            blocks = buf_gpu.chunk(n_heads, dim=0)
+                            updates = [newton_schulz(b, steps=self.defaults["ns_steps"]) for b in blocks]
+                            update = torch.cat(updates, dim=0).cpu()
+                            del blocks, updates
+                        elif p.ndim > 2:
                             orig_shape = buf_gpu.shape
                             buf_2d = buf_gpu.view(buf_gpu.shape[0], -1)
                             update_gpu = newton_schulz(buf_2d, steps=self.defaults["ns_steps"])
@@ -126,7 +137,14 @@ class KimiMuonClip(torch.optim.Optimizer):
                             update = newton_schulz(buf_gpu, steps=self.defaults["ns_steps"]).cpu()
                         del buf_gpu
                     else:
-                        if p.ndim > 2:
+                        if group.get("per_head", False) and p.ndim == 2:
+                            # Per-Head Muon on CPU
+                            head_dim = group.get("head_dim", 128)
+                            n_heads = p.shape[0] // head_dim
+                            blocks = buf.chunk(n_heads, dim=0)
+                            updates = [newton_schulz(b, steps=self.defaults["ns_steps"]) for b in blocks]
+                            update = torch.cat(updates, dim=0)
+                        elif p.ndim > 2:
                             orig_shape = buf.shape
                             buf_2d = buf.view(buf.shape[0], -1)
                             update = newton_schulz(buf_2d, steps=self.defaults["ns_steps"])
@@ -185,16 +203,54 @@ SEQ_LEN = 2048
 # ============================================================================
 
 SHARD_DIRS = {
-    "web":   Path("/home/kenpeter/work/data/_shards_final"),
-    "math":  Path("/home/kenpeter/work/data/_shards_final"),   # TODO: point to math shards when ready
-    "synth": Path("/home/kenpeter/work/data/_shards_final"),   # TODO: point to cosmopedia shards when ready
+    # Tiered per domain: easy → medium → hard
+    "math_easy":     Path("/home/kenpeter/work/data/_shards_math_easy"),     # 25.6B tokens
+    "math_medium":   Path("/home/kenpeter/work/data/_shards_math_medium"),   # 144M tokens
+    "synth_easy":    Path("/home/kenpeter/work/data/_shards_synth_easy"),    # 72M tokens
+    "synth_medium":  Path("/home/kenpeter/work/data/_shards_synth_medium"),  # 757M tokens
+    "synth_hard":    Path("/home/kenpeter/work/data/_shards_synth_hard"),    # 59M tokens
+    "code_easy":     Path("/home/kenpeter/work/data/_shards_code_easy"),     # 75M tokens
+    "code_medium":   Path("/home/kenpeter/work/data/_shards_code_medium"),   # 132M tokens
+    "code_hard":     Path("/home/kenpeter/work/data/_shards_code_hard"),     # 5.9M tokens
+    "web_easy":      Path("/home/kenpeter/work/data/_shards_web_easy"),       # fineweb-edu
+    "web_medium":    Path("/home/kenpeter/work/data/_shards_web_medium"),    # 5.3G
+    "web_hard":      Path("/home/kenpeter/work/data/_shards_web_hard"),      # empty
+    "math_hard":     Path("/home/kenpeter/work/data/_shards_math_hard"),     # 5.1G
+    "reformat_easy": Path("/home/kenpeter/work/data/_shards_reformat_easy"),  # was 8.5M tokens
 }
 
-RATIOS = {"web": 0.60, "math": 0.25, "synth": 0.15}
+# Curriculum: one tier at a time, domains mixed within tier
+# Phase 1 (0-30%): ALL easy data
+# Phase 2 (30-40%): ALL medium data
+# Phase 3 (40-50%): ALL hard data
+def get_curriculum_ratios(step, total_steps):
+    p = step / total_steps
+    if p < 0.30:  # Easy: all domains
+        return {
+            "math_easy": 0.30,
+            "code_easy": 0.10,
+            "synth_easy": 0.15,
+            "web_easy": 0.35,
+            "reformat_easy": 0.10,
+        }
+    elif p < 0.40:  # Medium: all domains
+        return {
+            "math_medium": 0.30,
+            "code_medium": 0.15,
+            "synth_medium": 0.25,
+            "web_medium": 0.30,
+        }
+    else:  # Hard: all domains
+        return {
+            "math_hard": 0.40,
+            "code_hard": 0.15,
+            "synth_hard": 0.20,
+            "web_hard": 0.25,
+        }
 
 
 def _load_shard_list(shards_dir: Path, seq_len: int):
-    shard_paths = sorted(shards_dir.glob("shard_*.bin"))
+    shard_paths = sorted(shards_dir.glob("*.bin"))
     shard_paths = [p for p in shard_paths if p.stat().st_size > 0]
     entries = []
     total = 0
@@ -488,6 +544,12 @@ def main():
         trust_remote_code=True,
     )
 
+    # === IDENTIFY ATTENTION PROJECTION PARAMS (for Per-Head Muon) ===
+    # Capture param-to-name mapping from the HF model before wrapping
+    param_id_to_name = {}
+    for name, param in hf_model.named_parameters():
+        param_id_to_name[id(param)] = name
+
     model = CPUMasterModel(hf_model, config)
     del hf_model
 
@@ -495,17 +557,33 @@ def main():
     params = model.get_parameters()
     vocab_embed_numel = 49152 * 1536  # embed_tokens + lm_head
 
-    muon_params = [p for p in params if p.ndim >= 2 and p.numel() != vocab_embed_numel]
+    # Separate attention projections (q/k/v) for Per-Head Muon
+    muon_attn = []
+    muon_other = []
+    for p in params:
+        if p.ndim < 2 or p.numel() == vocab_embed_numel:
+            continue
+        name = param_id_to_name.get(id(p), "")
+        if any(x in name for x in ["q_proj", "k_proj", "v_proj"]):
+            muon_attn.append(p)
+        else:
+            muon_other.append(p)
+
     embed_head_params = [p for p in params if p.ndim >= 2 and p.numel() == vocab_embed_numel]
     scalar_params = [p for p in params if p.ndim < 2]
 
-    logger.info(f"KimiMuonClip | Muon 2D: {len(muon_params)} params | "
+    logger.info(f"KimiMuonClip | Per-Head Muon: {len(muon_attn)} attn params | "
+                f"Standard Muon: {len(muon_other)} params | "
                 f"Embed/Head: {len(embed_head_params)} params | "
                 f"Scalar: {len(scalar_params)} params")
 
     param_groups = [
-        dict(params=muon_params, lr=args.muon_lr, momentum=0.95,
-             weight_decay=config.weight_decay, use_muon=True, warmup=True),
+        dict(params=muon_attn, lr=args.muon_lr, momentum=0.95,
+             weight_decay=config.weight_decay, use_muon=True, warmup=True,
+             per_head=True, head_dim=128),
+        dict(params=muon_other, lr=args.muon_lr, momentum=0.95,
+             weight_decay=config.weight_decay, use_muon=True, warmup=True,
+             per_head=False),
         dict(params=embed_head_params, lr=args.adam_lr, betas=(0.8, 0.95),
              eps=1e-10, weight_decay=config.weight_decay, use_muon=False),
         dict(params=scalar_params, lr=args.adam_lr, betas=(0.9, 0.95),
@@ -516,16 +594,29 @@ def main():
 
     # Dataset
     logger.info("Loading dataset...")
-    dataset = BinShardDataset(SHARD_DIRS, seq_len=args.max_seq_len, ratios=RATIOS, dedup=False)
-    dataloader = DataLoader(
-        dataset,
-        batch_size=args.batch_size,
-        collate_fn=collate_pretrain,
-        shuffle=False,  # stratified order already shuffled
-        num_workers=0,
-        pin_memory=False,
-    )
-    data_iter = iter(dataloader)
+    dataset = None
+    dataloader = None
+    data_iter = None
+
+    def rebuild_dataset(current_step):
+        nonlocal dataset, dataloader, data_iter
+        ratios = get_curriculum_ratios(current_step, args.num_steps)
+        logger.info(f"Curriculum step {current_step}: ratios={ {k:v for k,v in ratios.items() if v>0} }")
+        dataset = BinShardDataset(SHARD_DIRS, seq_len=args.max_seq_len, ratios=ratios, dedup=False)
+        dataloader = DataLoader(
+            dataset,
+            batch_size=args.batch_size,
+            collate_fn=collate_pretrain,
+            shuffle=False,
+            num_workers=0,
+            pin_memory=False,
+        )
+        data_iter = iter(dataloader)
+
+    rebuild_dataset(0)
+
+    # Track last phase to detect changes
+    _last_phase = -1
 
     # Training loop
     logger.info("=" * 60)
@@ -565,6 +656,13 @@ def main():
     logger.info("=" * 60)
 
     for step in range(start_step, config.num_steps):
+        # Check if curriculum phase changed → rebuild dataset
+        cur_phase = int(step / config.num_steps * 3)  # 3 phases
+        if cur_phase != _last_phase:
+            _last_phase = cur_phase
+            rebuild_dataset(step)
+            logger.info(f"--- Curriculum phase {cur_phase+1}/3 ---")
+
         try:
             batch = next(data_iter)
         except StopIteration:
