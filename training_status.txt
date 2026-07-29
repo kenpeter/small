@@ -1,10 +1,10 @@
 === Training Status ===
-Updated: Wed Jul 29 12:00:01 AM AEST 2026
+Updated: Thu Jul 30 07:00:01 AM AEST 2026
 
 2026-07-20 13:43:56,764 [INFO] Step 18240/242188 | Loss 3.4519 | 6.04s/step | 2712 tok/s | GPU 3.16GB
 
-GPU memory: 5023, 12282 MB
-PID: 191289
+GPU memory: 83, 12282 MB
+PID: stopped
 Started: 2026-07-19 12:13:50,7
 
 === Last 20 log lines ===

@@ -226,14 +226,16 @@ SHARD_DIRS = {
 # Phase 2 (30-40%): ALL medium data
 # Phase 3 (40-50%): ALL hard data
 def get_curriculum_ratios(step, total_steps):
-    p = step / total_steps
-    # Phase 1 (0-100%): ALL easy data — stay on Easy until loss converges
+    # Easy + Medium mixed — harder data drives loss down faster
     return {
-        "math_easy": 0.30,
-        "code_easy": 0.10,
-        "synth_easy": 0.15,
-        "web_easy": 0.35,
-        "reformat_easy": 0.10,
+        "math_easy": 0.15,
+        "math_medium": 0.15,
+        "code_easy": 0.05,
+        "code_medium": 0.10,
+        "synth_easy": 0.05,
+        "synth_medium": 0.20,
+        "web_easy": 0.15,
+        "web_medium": 0.15,
     }
 
 
@@ -470,9 +472,7 @@ def main():
     parser.add_argument("--save-interval", type=int, default=2000)
     parser.add_argument("--output-dir", type=str, default="/home/kenpeter/work/checkpoints")
     parser.add_argument("--dtype", type=str, default="bfloat16", choices=["float32", "bfloat16", "float16"], help="Model dtype")
-    parser.add_argument("--muon-lr", type=float, default=3e-4, help="Learning rate for Muon 2D params (paper matches AdamW base)")
-    parser.add_argument("--adam-lr", type=float, default=3e-4, help="Learning rate for AdamW 1D/embed/head params")
-    parser.add_argument("--tau", type=float, default=150.0, help="QK-Clip spectral norm threshold")
+    parser.add_argument("--lr", type=float, default=3e-4, help="Learning rate")
     parser.add_argument("--warmup-steps", type=int, default=1000, help="Linear warmup steps")
     parser.add_argument("--min-lr", type=float, default=1e-6, help="Minimum LR for cosine decay")
     parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint .pt to resume from")
@@ -486,8 +486,7 @@ def main():
     logger.info(f"Model: Custom 1032M (dim=1536, L=32, h=12, kv=4, ffn=4608)")
     logger.info(f"Data: {SHARD_DIRS}")
     logger.info(f"Params: batch={args.batch_size}, seq_len={args.max_seq_len}, steps={args.num_steps}, dtype={args.dtype}")
-    logger.info(f"Muon lr={args.muon_lr}, AdamW lr={args.adam_lr}, QK-Clip tau={args.tau}")
-    logger.info(f"LR schedule: cosine, warmup={args.warmup_steps}, min_lr={args.min_lr}")
+    logger.info(f"LR={args.lr}, warmup={args.warmup_steps}, min_lr={args.min_lr}")
 
     tokenizer = AutoTokenizer.from_pretrained("HuggingFaceTB/SmolLM2-135M", trust_remote_code=True)
 
@@ -540,53 +539,29 @@ def main():
         trust_remote_code=True,
     )
 
-    # === IDENTIFY ATTENTION PROJECTION PARAMS (for Per-Head Muon) ===
-    # Capture param-to-name mapping from the HF model before wrapping
-    param_id_to_name = {}
-    for name, param in hf_model.named_parameters():
-        param_id_to_name[id(param)] = name
-
     model = CPUMasterModel(hf_model, config)
     del hf_model
 
-    # === KIMI K2 MUONCLIP SETUP ===
+    # === STANDARD ADAMW FOR ALL PARAMS ===
     params = model.get_parameters()
     vocab_embed_numel = 49152 * 1536  # embed_tokens + lm_head
 
-    # Separate attention projections (q/k/v) for Per-Head Muon
-    muon_attn = []
-    muon_other = []
-    for p in params:
-        if p.ndim < 2 or p.numel() == vocab_embed_numel:
-            continue
-        name = param_id_to_name.get(id(p), "")
-        if any(x in name for x in ["q_proj", "k_proj", "v_proj"]):
-            muon_attn.append(p)
-        else:
-            muon_other.append(p)
-
+    adamw_2d = [p for p in params if p.ndim >= 2 and p.numel() != vocab_embed_numel]
     embed_head_params = [p for p in params if p.ndim >= 2 and p.numel() == vocab_embed_numel]
     scalar_params = [p for p in params if p.ndim < 2]
 
-    logger.info(f"KimiMuonClip | Per-Head Muon: {len(muon_attn)} attn params | "
-                f"Standard Muon: {len(muon_other)} params | "
-                f"Embed/Head: {len(embed_head_params)} params | "
-                f"Scalar: {len(scalar_params)} params")
+    logger.info(f"AdamW | 2D: {len(adamw_2d)} params, Embed/Head: {len(embed_head_params)}, Scalars: {len(scalar_params)}")
 
     param_groups = [
-        dict(params=muon_attn, lr=args.muon_lr, momentum=0.95,
-             weight_decay=config.weight_decay, use_muon=True, warmup=True,
-             per_head=True, head_dim=128),
-        dict(params=muon_other, lr=args.muon_lr, momentum=0.95,
-             weight_decay=config.weight_decay, use_muon=True, warmup=True,
-             per_head=False),
-        dict(params=embed_head_params, lr=args.adam_lr, betas=(0.8, 0.95),
-             eps=1e-10, weight_decay=config.weight_decay, use_muon=False),
-        dict(params=scalar_params, lr=args.adam_lr, betas=(0.9, 0.95),
-             eps=1e-10, weight_decay=config.weight_decay, use_muon=False),
+        dict(params=adamw_2d, lr=args.lr, betas=(0.9, 0.95),
+             eps=1e-8, weight_decay=config.weight_decay),
+        dict(params=embed_head_params, lr=args.lr, betas=(0.9, 0.95),
+             eps=1e-8, weight_decay=config.weight_decay),
+        dict(params=scalar_params, lr=args.lr, betas=(0.9, 0.95),
+             eps=1e-8, weight_decay=0.0),
     ]
-    optimizer = KimiMuonClip(param_groups, tau=args.tau, ns_steps=7, use_gpu_ns=True)
-    logger.info("Optimizer: KimiMuonClip (Newton-Schulz + RMS scaling + QK-Clip + momentum warmup) [GPU NS enabled]")
+    optimizer = torch.optim.AdamW(param_groups)
+    logger.info("Optimizer: torch.optim.AdamW (all params)")
 
     # Dataset
     logger.info("Loading dataset...")
@@ -642,6 +617,11 @@ def main():
                         param.data.copy_(tensor)
                         break
         optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        # Override LR with CLI value on resume (checkpoint restores old base_lr)
+        for i, group in enumerate(optimizer.param_groups):
+            group["lr"] = args.lr
+            group.pop("base_lr", None)
+        logger.info(f"  LR overridden: adam={args.lr}")
         global_step = checkpoint.get("step", 0)
         best_loss = checkpoint.get("best_loss", float("inf"))
         start_step = global_step
@@ -687,12 +667,11 @@ def main():
                     args.min_lr,
                 )
 
-            # Only clip AdamW params; Muon already normalizes via Newton-Schulz
+            # Gradient clipping for all params
             for group in optimizer.param_groups:
-                if not group.get("use_muon", False):
-                    torch.nn.utils.clip_grad_norm_(group["params"], config.max_grad_norm)
+                torch.nn.utils.clip_grad_norm_(group["params"], config.max_grad_norm)
 
-            optimizer.step(global_step=global_step)
+            optimizer.step()
 
             model._sync_params_to_gpu()
             validate_cpu_params(model, logger)
@@ -704,12 +683,11 @@ def main():
 
         if (step + 1) % args.log_interval == 0:
             gpu_mem = torch.cuda.max_memory_allocated(args.device) / 1024**3
-            current_muon_lr = next((g["lr"] for g in optimizer.param_groups if g.get("use_muon")), args.muon_lr)
-            current_adam_lr = next((g["lr"] for g in optimizer.param_groups if not g.get("use_muon")), args.adam_lr)
+            current_adam_lr = next((g["lr"] for g in optimizer.param_groups), args.lr)
             logger.info(
                 f"Step {step+1}/{config.num_steps} | "
                 f"Loss {loss_val:.4f} | "
-                f"LR muon={current_muon_lr:.2e} adam={current_adam_lr:.2e} | "
+                f"LR {current_adam_lr:.2e} | "
                 f"{step_time:.2f}s/step | "
                 f"{tps:.0f} tok/s | "
                 f"GPU {gpu_mem:.2f}GB"
