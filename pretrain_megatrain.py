@@ -462,7 +462,6 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--num-steps", type=int, default=50000)
-    parser.add_argument("--lr", type=float, default=4e-4)
     parser.add_argument("--max-seq-len", type=int, default=SEQ_LEN)
     parser.add_argument("--checkpoint-interval", type=int, default=4)
     parser.add_argument("--grad-accum", type=int, default=12)
