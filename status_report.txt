@@ -1,8 +1,8 @@
-=== Status Report: Thu Jul 30 07:00:01 AM AEST 2026 ===
+=== Status Report: Thu Jul 30 07:30:01 PM AEST 2026 ===
 
 ── Training ──
   2026-07-20 13:43:56,764 [INFO] Step 18240/242188 | Loss 3.4519 | 6.04s/step | 2712 tok/s | GPU 3.16GB
-  PID: stopped | GPU: 31, 5.57, 83, 12282
+  PID: 437460 | GPU: 78, 178.71, 4233, 12282
 
 ── Data Download ──
   Not started
@@ -12,4 +12,4 @@
 ── Staging ──
 
 ── Disk ──
-  Used: 228G / 506G (48% full)
+  Used: 233G / 506G (49% full)
