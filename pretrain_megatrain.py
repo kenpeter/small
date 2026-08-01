@@ -221,22 +221,50 @@ SHARD_DIRS = {
     "reformat_easy": Path("/home/kenpeter/work/data/_shards_reformat_easy"),  # was 8.5M tokens
 }
 
-# Curriculum: one tier at a time, domains mixed within tier
-# Phase 1 (0-30%): ALL easy data
-# Phase 2 (30-40%): ALL medium data
-# Phase 3 (40-50%): ALL hard data
+# ============================================================
+# G1-G4 Curriculum (SAW-style data organization)
+# G1 Boundary Sharpening: easy-heavy start → hard-heavy end (smooth)
+# G2 Cyclic Scheduling: periodic easy-data review wave (anti-forgetting)
+# G3 Curriculum Continuity: smooth tier blend — ratios shift gradually,
+#    sampled every CURRICULUM_UPDATE_INTERVAL steps (no cliff switches)
+# G4 Local Diversity: JIT windowed shuffle in _build_stratified_order
+# ============================================================
+CURRICULUM_UPDATE_INTERVAL = 2000  # steps between ratio rebuilds (rebuild ~35s)
+
+# Tier → domain split fractions (within-tier proportions, sum=1 per tier)
+EASY_SPLIT = {"math_easy": 0.375, "web_easy": 0.375, "synth_easy": 0.125, "code_easy": 0.125}
+MED_SPLIT = {"math_medium": 0.25, "web_medium": 0.25, "synth_medium": 0.333, "code_medium": 0.167}
+HARD_SPLIT = {"math_hard": 0.55, "web_hard": 0.15, "synth_hard": 0.20, "code_hard": 0.10}  # web_hard live: QuRatedPajama 594M tok
+
+def _smooth_tier_weights(t):
+    """G1+G3: continuous easy→hard weight curves over progress t∈[0,1].
+    Hard-forward from the resume point (easy phase already completed):
+    easy: 0.30→0.05 (review floor)  hard: 0.25→0.70  medium: fills the hump."""
+    w_easy = 0.05 + 0.25 * (1 - t)
+    w_hard = min(0.70, 0.25 + 0.45 * t)
+    w_med = max(0.0, 1.0 - w_easy - w_hard)
+    return w_easy, w_med, w_hard
+
 def get_curriculum_ratios(step, total_steps):
-    # Easy + Medium mixed — harder data drives loss down faster
-    return {
-        "math_easy": 0.15,
-        "math_medium": 0.15,
-        "code_easy": 0.05,
-        "code_medium": 0.10,
-        "synth_easy": 0.05,
-        "synth_medium": 0.20,
-        "web_easy": 0.15,
-        "web_medium": 0.15,
-    }
+    t = min(1.0, max(0.0, step / total_steps))
+    w_easy, w_med, w_hard = _smooth_tier_weights(t)
+    # G2: cyclic review wave — easy data gets a periodic boost
+    # (full cosine cycle every 1/8 of training; amplitude 0.12)
+    cycle = max(1, total_steps // 8)
+    review = 0.12 * (0.5 - 0.5 * math.cos(2 * math.pi * step / cycle))
+    w_easy = min(0.5, w_easy + review)
+    # renormalize after G2 boost
+    s = w_easy + w_med + w_hard
+    w_easy, w_med, w_hard = w_easy / s, w_med / s, w_hard / s
+
+    ratios = {}
+    for dom, frac in EASY_SPLIT.items():
+        ratios[dom] = round(w_easy * frac, 4)
+    for dom, frac in MED_SPLIT.items():
+        ratios[dom] = round(w_med * frac, 4)
+    for dom, frac in HARD_SPLIT.items():
+        ratios[dom] = round(w_hard * frac, 4)
+    return {k: v for k, v in ratios.items() if v > 0}
 
 
 def _load_shard_list(shards_dir: Path, seq_len: int):
@@ -381,9 +409,16 @@ class StratifiedShardDataset(Dataset):
             # safety break
             if len(self.epoch_order) > total_valid * 2:
                 break
-        # Trim to exact count and final shuffle in small windows to keep locality
+        # Trim to exact count
         self.epoch_order = self.epoch_order[:total_valid]
-        logger.info(f"Stratified epoch: {len(self.epoch_order):,} samples")
+        # G4 (JIT - Jittering Ordering): shuffle within local windows to restore
+        # gradient diversity while preserving the global tier trend (paper w=5000)
+        jit_window = 5000
+        for i in range(0, len(self.epoch_order), jit_window):
+            chunk = self.epoch_order[i:i + jit_window]
+            random.shuffle(chunk)
+            self.epoch_order[i:i + jit_window] = chunk
+        logger.info(f"Stratified epoch: {len(self.epoch_order):,} samples (JIT w={jit_window})")
 
     def __len__(self):
         return len(self.epoch_order)
@@ -585,8 +620,8 @@ def main():
 
     rebuild_dataset(0)
 
-    # Track last phase to detect changes
-    _last_phase = -1
+    # Track last ratios to detect changes
+    _last_ratios = None
 
     # Training loop
     logger.info("=" * 60)
@@ -631,12 +666,13 @@ def main():
     logger.info("=" * 60)
 
     for step in range(start_step, config.num_steps):
-        # Check if curriculum phase changed → rebuild dataset
-        cur_phase = int(step / config.num_steps * 3)  # 3 phases
-        if cur_phase != _last_phase:
-            _last_phase = cur_phase
-            rebuild_dataset(step)
-            logger.info(f"--- Curriculum phase {cur_phase+1}/3 ---")
+        # G3 continuity: rebuild every CURRICULUM_UPDATE_INTERVAL steps with the
+        # current (smoothly evolving) ratios — each rebuild shifts the mix slightly
+        if (step - start_step) % CURRICULUM_UPDATE_INTERVAL == 0 or step == start_step:
+            cur_ratios = get_curriculum_ratios(step, config.num_steps)
+            if cur_ratios != _last_ratios:
+                _last_ratios = cur_ratios
+                rebuild_dataset(step)
 
         try:
             batch = next(data_iter)
