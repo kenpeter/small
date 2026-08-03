@@ -221,6 +221,10 @@ SHARD_DIRS = {
     "reformat_easy": Path("/home/kenpeter/work/data/_shards_reformat_easy"),  # was 8.5M tokens
 }
 
+# x-small style flat farm: uniform random interleave of ALL tiered shards
+# (1098-bin symlink farm over the SHARD_DIRS above, ~42B tokens)
+FARM_DIR = Path("/home/kenpeter/work/data/_shards_final")
+
 # ============================================================
 # G1-G4 Curriculum (SAW-style data organization)
 # G1 Boundary Sharpening: easy-heavy start → hard-heavy end (smooth)
@@ -432,13 +436,64 @@ class StratifiedShardDataset(Dataset):
 BinShardDataset = StratifiedShardDataset
 
 
+class FlatFarmDataset(Dataset):
+    """
+    x-small style flat-farm loader: consumes the `_shards_final` symlink farm
+    (uniform random interleave of all tiered shards) in sequential order with
+    the same per-shard mechanics as x-small's BinShardDataset:
+      - md5-hash stable split → tail n_val shards = val
+      - per-shard hash offset start (random-ish, avoids always starting at 0)
+      - paired reversal: even shards forward, odd shards reversed
+    """
+    _causal_mask_4d = None
+
+    def __init__(self, farm_dir: Path, seq_len: int = 2048,
+                 val_frac: float = 0.01, is_val: bool = False):
+        import hashlib
+        self.seq_len = seq_len
+        shards = sorted(farm_dir.glob("*.bin"))
+        if not shards:
+            raise FileNotFoundError(f"No .bin shards found in farm {farm_dir}")
+        sorted_shards = sorted(shards, key=lambda p: hashlib.md5(str(p).encode()).hexdigest())
+        n_val = max(1, int(len(sorted_shards) * val_frac))
+        self.shards = sorted_shards[-n_val:] if is_val else sorted_shards[:-n_val]
+
+        # Build flat sequence index with x-small ordering semantics
+        self.index = []  # (shard_idx, start)
+        for si, sp in enumerate(self.shards):
+            n_tokens = sp.stat().st_size // 2
+            n = n_tokens - seq_len
+            if n <= 0:
+                continue
+            offset = (hash(str(sp)) % n) if n > 0 else 0
+            starts = list(range(offset, n, seq_len))
+            if si % 2 == 1:
+                starts.reverse()
+            self.index.extend((si, s) for s in starts)
+        logger.info(
+            f"FlatFarm: {len(self.shards)} shards, {len(self.index):,} seqs "
+            f"(val={is_val})"
+        )
+
+    def __len__(self):
+        return len(self.index)
+
+    def __getitem__(self, idx):
+        si, start = self.index[idx]
+        sp = self.shards[si]
+        mm = np.memmap(str(sp), dtype=np.uint16, mode="r")
+        tokens = torch.from_numpy(mm[start:start + self.seq_len].astype(np.int64))
+        del mm
+        return tokens
+
+
 def collate_pretrain(batch):
     input_ids = torch.stack(batch)
     B, T = input_ids.shape
-    if BinShardDataset._causal_mask_4d is None or BinShardDataset._causal_mask_4d.shape[-1] != T:
-        BinShardDataset._causal_mask_4d = torch.tril(torch.ones((1, 1, T, T), dtype=torch.bool))
+    if FlatFarmDataset._causal_mask_4d is None or FlatFarmDataset._causal_mask_4d.shape[-1] != T:
+        FlatFarmDataset._causal_mask_4d = torch.tril(torch.ones((1, 1, T, T), dtype=torch.bool))
     labels = input_ids.clone()
-    return {"input_ids": input_ids, "attention_mask": BinShardDataset._causal_mask_4d.expand(B, -1, -1, -1).contiguous(), "labels": labels}
+    return {"input_ids": input_ids, "attention_mask": FlatFarmDataset._causal_mask_4d.expand(B, -1, -1, -1).contiguous(), "labels": labels}
 
 
 def validate_cpu_params(model, logger):
@@ -518,7 +573,7 @@ def main():
     logger.info("KIMI K2 MUONCLIP — Fresh training from scratch")
     logger.info("=" * 60)
     logger.info(f"Model: Custom 1032M (dim=1536, L=32, h=12, kv=4, ffn=4608)")
-    logger.info(f"Data: {SHARD_DIRS}")
+    logger.info(f"Data: {FARM_DIR} (x-small style flat farm)")
     logger.info(f"Params: batch={args.batch_size}, seq_len={args.max_seq_len}, steps={args.num_steps}, dtype={args.dtype}")
     logger.info(f"LR={args.lr}, warmup={args.warmup_steps}, min_lr={args.min_lr}")
 
@@ -605,9 +660,8 @@ def main():
 
     def rebuild_dataset(current_step):
         nonlocal dataset, dataloader, data_iter
-        ratios = get_curriculum_ratios(current_step, args.num_steps)
-        logger.info(f"Curriculum step {current_step}: ratios={ {k:v for k,v in ratios.items() if v>0} }")
-        dataset = BinShardDataset(SHARD_DIRS, seq_len=args.max_seq_len, ratios=ratios, dedup=False)
+        logger.info(f"Loading flat farm (x-small order): {FARM_DIR}")
+        dataset = FlatFarmDataset(FARM_DIR, seq_len=args.max_seq_len, val_frac=0.01, is_val=False)
         dataloader = DataLoader(
             dataset,
             batch_size=args.batch_size,
@@ -619,9 +673,6 @@ def main():
         data_iter = iter(dataloader)
 
     rebuild_dataset(0)
-
-    # Track last ratios to detect changes
-    _last_ratios = None
 
     # Training loop
     logger.info("=" * 60)
@@ -666,13 +717,7 @@ def main():
     logger.info("=" * 60)
 
     for step in range(start_step, config.num_steps):
-        # G3 continuity: rebuild every CURRICULUM_UPDATE_INTERVAL steps with the
-        # current (smoothly evolving) ratios — each rebuild shifts the mix slightly
-        if (step - start_step) % CURRICULUM_UPDATE_INTERVAL == 0 or step == start_step:
-            cur_ratios = get_curriculum_ratios(step, config.num_steps)
-            if cur_ratios != _last_ratios:
-                _last_ratios = cur_ratios
-                rebuild_dataset(step)
+        # Static flat-farm order (x-small style) — built once, no ratio rebuilds
 
         try:
             batch = next(data_iter)
