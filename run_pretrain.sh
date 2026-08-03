@@ -2,6 +2,8 @@
 unset ENABLE_CUDA_GRAPH
 unset ENABLE_HYDRA_PIKIA
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+export OMP_NUM_THREADS=12
+export MKL_NUM_THREADS=12
 source /home/kenpeter/work/small/venv/bin/activate
 cd /home/kenpeter/work/small
 
@@ -13,8 +15,8 @@ echo "Starting pretrain at $(date)"
 echo ""
 
 exec python3 pretrain_megatrain.py \
-  --batch-size 16 \
-  --grad-accum 2 \
+  --batch-size 8 \
+  --grad-accum 4 \
   --num-steps 60000 \
   --log-interval 400 \
   --save-interval 3000 \
