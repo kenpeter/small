@@ -53,27 +53,30 @@
 
 ### Pretraining Tokens (Ready to Feed)
 
-| Directory | Files | Size | Tokens | Domain | Status |
-|---|---|---|---|---|---|
-| `_shards_final/` | 17 `.bin` | 7.94 GB | ~3.97B uint16 | 100% FineWeb-Edu (web text) | ✅ Active |
+| Directory | Size | Tokens | Domain | Status |
+|---|---|---|---|---|
+| `_shards_math_{easy,medium,hard}/` | 25.6B easy / 144M med / 5.1G hard | — | Math (finemath-3plus + open-web-math) | ✅ Active |
+| `_shards_web_{easy,medium,hard}/` | 21G / 5.3G / 1.2G | — | Web (fineweb-edu + QuRatedPajama) | ✅ Active |
+| `_shards_synth_*` | 72M easy / 757M med / 59M hard | — | Synthetic (cosmopedia) | ✅ Active |
+| `_shards_code_*` | 75M easy / 132M med / 5.9M hard | — | Code (github-code) | ✅ Active |
+| `_shards_reformat_easy/` | ~8.5M | — | Textbook + QA (reformatted) | ✅ Active |
 
 **Notes:**
-- Shard size target: 512 MB (`shard_000000.bin` = 260 MB, `shard_000016.bin` = 0 B empty)
-- Tokenizer: SmolLM2-135M vocab (49152)
-- Currently **100% web** — math / synthetic shards do not exist yet
+- Shard format: `.bin` uint16 arrays, SmolLM2-135M vocab (49152)
+- Tiered per domain: easy → medium → hard; consumed as a flat farm via `FARM_DIR` (`_shards_final`) in pretrain_megatrain.py (x-small style, `FlatFarmDataset`). G1-G4 stratified sampling (`SHARD_DIRS`) kept but dormant.
 
 ### Raw Downloads (Staging → Needs Tokenization)
 
 | Dataset | Files | Size | Total Expected | Domain | Status |
 |---|---|---|---|---|---|
 | `fineweb-edu/` | 42 `.parquet` | 1.91 GB | ~10 GB | Web / educational | ✅ Complete |
-| `finemath-3plus/` | 24 `.parquet` | 4.71 GB | ~28 GB | Math (grade 3+) | ⬇️ In Progress (24/128) |
-| `cosmopedia/` | — | — | ~8–10 GB | Synthetic / encyclopedic | ❌ Not started |
-| `open-web-math/` | — | — | ~7–8 GB | Math / research | ❌ Not started |
+| `finemath-3plus/` | 24 `.parquet` | 4.71 GB | ~28 GB | Math (grade 3+) | ✅ Complete |
+| `cosmopedia/` | — | — | ~8–10 GB | Synthetic / encyclopedic | ✅ Complete |
+| `open-web-math/` | — | — | ~7–8 GB | Math / research | ✅ Complete |
 
 **Notes:**
-- Download worker: `download_3workers_direct.py` (3 workers, 1.5 s stagger)
-- Missing datasets block true 60/25/15 stratified mix
+- Download worker: `download_3workers_direct.py` (3 workers, resume + size validation) → `_raw_original/`
+- QRP (QuRatedPajama-260B) web-hard source: `download_qrp_par.py` (adaptive parallel wget, resumable)
 
 ### SFT / Instruction Data (Post-Pretraining)
 
@@ -110,24 +113,25 @@
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
-│  RAW STAGING (_staging_multi/)                                         │
+│  RAW STAGING (_raw_original/)                                          │
 │    fineweb-edu      ──►                                               │
-│    finemath-3plus   ──►──► tokenize.py ──► _shards_*/    .bin          │
-│    cosmopedia       ──►      (SmolLM2 vocab)                           │
+│    finemath-3plus   ──►──► tokenize_domain_parallel.py ──►             │
+│    cosmopedia       ──►      (per-domain easy/medium/hard .bin)        │
 │    open-web-math    ──►                                                │
+│    github-code      ──►                                                │
 └─────────────────────────────────────────────────────────────────────────┘
                               │
                               ▼
 ┌─────────────────────────────────────────────────────────────────────────┐
 │  PRETRAIN (pretrain_megatrain.py)                                       │
-│    _shards_final/   ──► StratifiedBinShardDataset                       │
-│    _shards_math/    ──► (60/25/15 web/math/synth)                    │
-│    _shards_synth/   ──► dedup=True (disabled at startup)              │
+│    _shards_final/   ──► FlatFarmDataset (x-small style, sequential)     │
+│    1098-bin farm    ──► md5 split: 1088 train / 10 val                  │
+│    G1-G4 stratified ──► legacy, dormant (StratifiedShardDataset)        │
 └─────────────────────────────────────────────────────────────────────────┘
                               │
                               ▼
 ┌─────────────────────────────────────────────────────────────────────────┐
-│  SFT / RLHF                                                           │
+│  SFT / RLHF (planned)                                                  │
 │    _sft_final_shards/  ──► supervised fine-tuning                      │
 │    _cot_raw/           ──► reasoning boost                            │
 │    bluemoon_roleplay/  ──► conversational style                        │
@@ -140,20 +144,16 @@
 
 | Parameter | Value |
 |-----------|-------|
-| Total tokens ready | ~3.97 billion (top-10% filtered FineWeb-Edu) |
+| Total tokens ready | ~78 GB across 5 domains (per-domain easy/medium/hard tiered shards) |
 | Sequence length | 2048 tokens |
 | Tokenizer | `HuggingFaceTB/SmolLM2-135M` (BPE, uint16 output) |
-| Shard format | `.bin` files (~256 M tokens each, 17 shards) |
-| Batch size | 1 per step × 12 gradient accumulation = effective 12 (24,576 tok/step) |
+| Shard format | `.bin` uint16 arrays, per tier (see Data Inventory) |
+| Batch size | 8 × grad-accum 4 = effective 32 (65,536 tok/step) |
 | Precision | `bfloat16` |
-| Optimizer | **Kimi K2 MuonClip** (Newton-Schulz 5-step, RMS scaling, QK-Clip, momentum warmup) |
-| Muon lr (2D weights) | 0.01 |
-| AdamW lr (1D scalars/embed/head) | 0.003 |
-| AdamW betas | (0.8, 0.95) for 2D weights; (0.9, 0.95) for scalars |
-| Momentum warmup | 0.85 → 0.95 over first 300 steps |
+| Optimizer | **AdamW** (3e-4 → cosine → 1e-6); MuonClip was removed after plateauing at loss ~5.0 |
+| AdamW betas | (0.9, 0.95) |
 | Weight decay | 0.1 |
-| QK-Clip tau | 100 (every optimizer step) |
-| Gradient clipping | Disabled on Muon params; max_norm = 1.0 on AdamW params |
+| Gradient clipping | max_norm = 1.0 |
 | Compilation | Disabled (`torch.compile = False`) |
 | Gradient checkpointing | Enabled |
 | CPU offloading | Enabled (CPUMasterModel) |
@@ -168,7 +168,7 @@ source venv/bin/activate
 bash run_pretrain.sh
 ```
 
-**Current training state:** Fresh MuonClip from step 0. PID 442720. Step 120 loss ~8.61. ~93 s/step. First checkpoint at step 2000.
+**Current training state:** AdamW from step 0. Resume via `megatrain_latest.pt`.
 
 ---
 
@@ -192,14 +192,14 @@ Not yet started. DPO data was cleaned up — will need fresh preparation when re
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
 │                          DATA PREPARATION                                │
-│  Raw datasets → Filter + Dedup → Tokenize → Shard into .bin → Train    │
-│  (FineWeb-Edu, FineMath-3Plus, Cosmopedia, OpenWebMath, FineMath)      │
-│  Output: _shards_final/ (17 shards, ~3.97B tokens)                    │
+│  Raw datasets → Filter + Tier → Tokenize → Shard into .bin → Train     │
+│  (FineWeb-Edu, FineMath-3Plus, Cosmopedia, OpenWebMath, GitHub-Code)   │
+│  Output: per-domain easy/medium/hard shards (see Data Inventory)        │
 └─────────────────────────────────────────────────────────────────────────┘
                                     ↓
 ┌─────────────────────────────────────────────────────────────────────────┐
 │  PHASE 1: PRETRAINING (Self-Supervised)                                  │
-│  Input: Next-token prediction on ~3.97B high-quality tokens              │
+│  Input: Next-token prediction on ~78 GB tiered tokens                    │
 │  Output: 1B base model — knows language, code, math, facts              │
 │  Script: pretrain_megatrain.py → megatrain_best.pt                       │
 └─────────────────────────────────────────────────────────────────────────┘
@@ -224,15 +224,15 @@ Not yet started. DPO data was cleaned up — will need fresh preparation when re
 | Decision | Why |
 |----------|-----|
 | **1B model on 12 GB VRAM** | Gradient checkpointing + CPUMasterModel offloading makes it fit (~5.1 GB VRAM active) |
-| **3.97B tokens (not 15B)** | Best-of-best filtered data (~90% rejection rate). Quality over quantity. |
+| **~78 GB tiered data (not 15B)** | Best-of-best filtered data across 5 domains. Quality over quantity. |
 | **Transformer++ architecture** | SOTA for <1B parameters (SmolLM2, Qwen3, Llama 3.2). |
-| **Kimi K2 MuonClip optimizer** | ~40% fewer steps vs AdamW. Newton-Schulz orthogonal updates explore full-rank space. |
-| **QK-Clip + momentum warmup** | Stabilizes MuonClip on fresh init. Without these, MuonClip NaNs immediately. |
-| **Batch=1, accum=12** | Effective batch 12 (24K tok/step). Smaller than old accum=48 because MuonClip overhead eats ~2–3 s/step. |
+| **AdamW optimizer** | Stable and proven on 12GB VRAM. MuonClip caused a plateau at loss ~5.0 and was removed. |
+| **QK-Clip + momentum warmup** | Stabilizes MuonClip on fresh init. Removed with MuonClip. |
+| **Batch=8, accum=4** | Effective batch 32 (65K tok/step). |
 | **Only 2 checkpoints** | Disk space conservation. `megatrain_latest.pt` for resume, `megatrain_best.pt` for downstream. |
-| **Stratified 60/25/15 mix** | Forces domain balance per batch. Prevents web-only collapse. Currently inactive (missing math/synth shards). |
+| **Flat farm data org (x-small style)** | `_shards_final` uniform random interleave, sequential consumption. G1–G4 stratified mix kept dormant. |
 | **13-gram dedup** | Exact hash collision drop. 5–10% token savings. Disabled at startup to avoid long scan; toggled via flag. |
-| **Direct curl downloads** | Bypasses HF API 502 errors. 3–8× faster than hf_hub_download for large parquet files. |
+| **Direct wget downloads** | Bypasses HF API / Xet throttling. 3–8× faster than hf_hub_download for large parquet files. |
 | **Power limit 180W** | Keeps GPU ~72–77°C vs 86°C. Persistence mode enabled. |
 
 ---
@@ -241,7 +241,7 @@ Not yet started. DPO data was cleaned up — will need fresh preparation when re
 
 | Phase | GPU VRAM | RAM | Disk | Time Estimate |
 |-------|----------|-----|------|---------------|
-| Pretraining 1B @ 3.97B tokens | ~5.1 GB (RTX 4070 Ti 12 GB, power limit 180W) | 93 GB | 7.94 GB shards | ~52 hours to first checkpoint (2000 steps) |
+| Pretraining 1B @ ~78 GB tokens | ~5.1 GB (RTX 4070 Ti 12 GB, power limit 180W) | 93 GB | ~7.9 GB shards | — |
 | SFT | 8 GB | 8 GB | +24 GB | ~4 hours |
 | DPO | 8 GB | 8 GB | +2 GB | ~2 hours |
 
@@ -251,12 +251,16 @@ Not yet started. DPO data was cleaned up — will need fresh preparation when re
 
 | File | Purpose |
 |------|---------|
-| `train.py` | Phase 1: Pretraining script (1B config, resumable, Transformer++) |
-| `pretrain_megatrain.py` | Alternate pretraining script using MegaTrain CPU-offload engine + MuonClip |
+| `pretrain_megatrain.py` | Pretraining script (1B config, resumable, MegaTrain CPU-offload + AdamW) |
 | `run_pretrain.sh` | Wrapper that unsets bad env vars and launches pretrain_megatrain.py |
-| `download_3workers_direct.py` | 3-worker curl downloader with stagger for raw datasets |
-| `tokenize_final.py` | Tokenization script: raw parquet → .bin shards |
-| `quality_filter_v3.py` | Data quality filtering pipeline (heuristic + dedup + tokenize) |
+| `download_3workers_direct.py` | 3-worker wget downloader with resume for raw datasets |
+| `download_qrp_par.py` | Adaptive parallel wget downloader for QuRatedPajama (resumable) |
+| `tokenize_domain_parallel.py` | Generic tiered tokenizer (math/code/synth/web → easy/medium/hard .bin shards) |
+| `tokenize_reformat.py` | Tokenizer for reformatted textbook+QA JSONL → reformat_easy shards |
+| `reformat_data.py` | Kimi K2-style data reformatting via vLLM chat API |
+| `quick_eval_pretrain.py` | Quick eval of 1B checkpoint (generation + perplexity) |
+| `check_status.sh` | Combined status report: training + downloads + disk |
+| `test_pretrain.py` | Test suite for pretrain_megatrain.py |
 | `abstraction.md` | This document — full pipeline roadmap |
 
 ---
@@ -269,15 +273,14 @@ Not yet started. DPO data was cleaned up — will need fresh preparation when re
 - All old checkpoints cleaned up (163M SFT/DPO/DPT models removed)
 
 ### Data Pipeline
-- `quality_filter_v3.py`: heuristic filtering + URL dedup + exact text dedup (MD5) + prefix dedup
-- Best-of-best filtering: ~90% rejection rate → 3.97B tokens
+- `download_3workers_direct.py` → raw parquet downloads in `_raw_original/`
+- `tokenize_domain_parallel.py` → filter (via `filter_all.py`) + tier + tokenize → per-domain .bin shards
 - Intermediate data cleaned up post-processing
-- **CRITICAL**: Never delete raw parquet downloads in `_staging_multi/` — they're the source of truth.
+- **CRITICAL**: Never delete raw parquet downloads in `_raw_original/` — they're the source of truth.
 
-### AdamW → MuonClip Pivot (2026-07-22)
-- Warm-starting Muon from AdamW checkpoint caused loss jump 4.98 → 10.12 → oscillation
-- **Deleted all old checkpoints.** Started fresh from step 0 with full Kimi K2 MuonClip.
-- Includes: Newton-Schulz 5-step, RMS scaling, QK-Clip, momentum warmup 0.85→0.95, separate AdamW groups for 1D params.
+### Optimizer History (July 2026)
+- AdamW → MuonClip (2026-07-22): warm-starting Muon from AdamW caused loss jump 4.98 → 10.12 → oscillation; deleted checkpoints, restarted fresh with Kimi K2 MuonClip.
+- **MuonClip → AdamW (reverted)**: Muon plateaued at loss ~5.0. Switched back to `torch.optim.AdamW` (3e-4 → cosine → 1e-6) with G1–G4 curriculum.
 - `non_blocking=False` fix in `cpu_master.py` (race condition on D2H copies).
 
 ### Disk Space Management
@@ -287,21 +290,18 @@ Not yet started. DPO data was cleaned up — will need fresh preparation when re
 
 ---
 
-## Current Blockers
+## Current State (2026-08-03)
 
-| Blocker | Impact | Fix |
-|---|---|---|
-| `finemath-3plus` download incomplete | Cannot build math shards | Wait for 128/128 files |
-| `cosmopedia` missing | Cannot build synthetic shards | Queue download after finemath |
-| `open-web-math` missing | Math diversity gap | Queue download after cosmopedia |
-| `_shards_math/` does not exist | Stratified loader falls back to web | Tokenize finemath → _shards_math/ |
-| `_shards_synth/` does not exist | Stratified loader falls back to web | Tokenize cosmopedia → _shards_synth/ |
+- **Training:** fresh 1B run on flat farm (x-small org), AdamW — see train_small.log
+- **Data:** all 5 domains downloaded and tokenized into per-domain easy/medium/hard tiered shards
+- **Reformat:** textbook + QA reformatted via Qwen3-8B (14 MB, reformat_easy tier)
+- **Next:** reach loss 2.7 → SFT → DPO
 
 ---
 
 ## Summary
 
-- **Tokens ready now:** ~3.97B (web only)
-- **Tokens needed for 60/25/15 mix:** ~6.6B web + ~2.75B math + ~1.65B synthetic = ~11B total
+- **Tokens ready:** ~78 GB across 5 domains (math, web, code, synth, reformat), tiered easy/medium/hard
+- **Training:** 1B pretraining at loss ~2.77 → 2.7 with AdamW + G1–G4 curriculum
 - **SFT assets ready:** 25.76 GB
-- **Next action:** Complete downloads → tokenize math + synth → update `SHARD_DIRS` → restart training with true stratified mix.
+- **Next action:** reach loss 2.7 → SFT → DPO.

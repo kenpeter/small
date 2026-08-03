@@ -13,11 +13,13 @@ echo "Starting pretrain at $(date)"
 echo ""
 
 exec python3 pretrain_megatrain.py \
-  --batch-size 4 \
-  --num-steps 50000 \
-  --lr 4e-4 \
-  --grad-accum 12 \
-  --num-grad-slabs 12 \
-  --log-interval 120 \
-  --save-interval 2000 \
-  > /tmp/pretrain.log 2>&1
+  --batch-size 8 \
+  --grad-accum 4 \
+  --num-steps 60000 \
+  --log-interval 400 \
+  --save-interval 3000 \
+  --warmup-steps 1000 \
+  --lr 3e-4 \
+  --dtype bfloat16 \
+  --output-dir /home/kenpeter/work/checkpoints \
+  > /home/kenpeter/work/train_small.log 2>&1
