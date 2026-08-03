@@ -123,9 +123,9 @@
                               │
                               ▼
 ┌─────────────────────────────────────────────────────────────────────────┐
-│  PRETRAIN (pretrain_megatrain.py)                                       │
+│  PRETRAIN (pretrain_gpu.py — pure GPU)                                    │
 │    _shards_final/   ──► FlatFarmDataset (x-small style, sequential)     │
-│    1098-bin farm    ──► md5 split: 1088 train / 10 val                  │
+│    1088-bin farm    ──► md5 split: 1088 train / 10 val                  │
 │    G1-G4 stratified ──► legacy, dormant (StratifiedShardDataset)        │
 └─────────────────────────────────────────────────────────────────────────┘
                               │
@@ -148,7 +148,7 @@
 | Sequence length | 2048 tokens |
 | Tokenizer | `HuggingFaceTB/SmolLM2-135M` (BPE, uint16 output) |
 | Shard format | `.bin` uint16 arrays, per tier (see Data Inventory) |
-| Batch size | 8 × grad-accum 4 = effective 32 (65,536 tok/step) |
+| Batch size | 2 × grad-accum 16 = effective 32 (65,536 tok/step) |
 | Precision | `bfloat16` |
 | Optimizer | **AdamW** (3e-4 → cosine → 1e-6); MuonClip was removed after plateauing at loss ~5.0 |
 | AdamW betas | (0.9, 0.95) |
@@ -156,19 +156,21 @@
 | Gradient clipping | max_norm = 1.0 |
 | Compilation | Disabled (`torch.compile = False`) |
 | Gradient checkpointing | Enabled |
-| CPU offloading | Enabled (CPUMasterModel) |
+| CPU offloading | Disabled — **pure GPU** (bf16 weights + bf16 AdamW states on GPU). CPUMasterModel offload was the previous approach. |
 | Attention | Flash Attention via `F.scaled_dot_product_attention` |
-| Checkpointing | Every 2000 steps → `megatrain_latest.pt` + `megatrain_best.pt` |
+| Memory config | `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` (kills fragmentation) |
+| Checkpointing | Every 1000 steps → `megatrain_latest.pt` + `megatrain_best.pt` (pure-GPU run) |
 
-### Pretraining Script
+### Pretraining Scripts
 
 ```bash
 cd /home/kenpeter/work/small
 source venv/bin/activate
-bash run_pretrain.sh
+bash run_pretrain_gpu.sh          # current: pure-GPU (2.1× faster)
+# bash run_pretrain.sh            # legacy: CPUMaster offload (kept for reference)
 ```
 
-**Current training state:** AdamW from step 0. Resume via `megatrain_latest.pt`.
+**Current training state:** warm-started from `megatrain_latest.pt` (step 9,000, loss 2.25-era weights) → running to 15,000 steps total. First log line at step 400 (~1.5h), then every 400 steps.
 
 ---
 
@@ -201,7 +203,7 @@ Not yet started. DPO data was cleaned up — will need fresh preparation when re
 │  PHASE 1: PRETRAINING (Self-Supervised)                                  │
 │  Input: Next-token prediction on ~78 GB tiered tokens                    │
 │  Output: 1B base model — knows language, code, math, facts              │
-│  Script: pretrain_megatrain.py → megatrain_best.pt                       │
+│  Script: pretrain_gpu.py → megatrain_best.pt (pure-GPU, 2.1× faster)    │
 └─────────────────────────────────────────────────────────────────────────┘
                                     ↓
 ┌─────────────────────────────────────────────────────────────────────────┐
@@ -223,7 +225,7 @@ Not yet started. DPO data was cleaned up — will need fresh preparation when re
 
 | Decision | Why |
 |----------|-----|
-| **1B model on 12 GB VRAM** | Gradient checkpointing + CPUMasterModel offloading makes it fit (~5.1 GB VRAM active) |
+| **1B model on 12 GB VRAM** | Pure-GPU fit (11.7 GB): bf16 weights + bf16 AdamW states on GPU, grad checkpointing, `expandable_segments:True`, checkpoint loaded on CPU then freed (`del ckpt`). CPUMasterModel offload was the previous approach (~5.1 GB active) but is 2.1× slower. |
 | **~78 GB tiered data (not 15B)** | Best-of-best filtered data across 5 domains. Quality over quantity. |
 | **Transformer++ architecture** | SOTA for <1B parameters (SmolLM2, Qwen3, Llama 3.2). |
 | **AdamW optimizer** | Stable and proven on 12GB VRAM. MuonClip caused a plateau at loss ~5.0 and was removed. |
@@ -233,7 +235,8 @@ Not yet started. DPO data was cleaned up — will need fresh preparation when re
 | **Flat farm data org (x-small style)** | `_shards_final` uniform random interleave, sequential consumption. G1–G4 stratified mix kept dormant. |
 | **13-gram dedup** | Exact hash collision drop. 5–10% token savings. Disabled at startup to avoid long scan; toggled via flag. |
 | **Direct wget downloads** | Bypasses HF API / Xet throttling. 3–8× faster than hf_hub_download for large parquet files. |
-| **Power limit 180W** | Keeps GPU ~72–77°C vs 86°C. Persistence mode enabled. |
+| **Pure-GPU training (2.1× faster)** | Batch-16 experiment found the bottleneck was single-thread CPU offload, not batch size → moved bf16 AdamW states to GPU → 4,800 tok/s vs 2,100 (CPUMaster). Warm-start from CPUMaster checkpoint preserved the overnight run. |
+| **Power limit 200W** | Default power limit; pure-GPU runs 75–78°C vs 86°C at 180W CPUMaster. Persistence mode enabled. |
 
 ---
 
@@ -241,7 +244,7 @@ Not yet started. DPO data was cleaned up — will need fresh preparation when re
 
 | Phase | GPU VRAM | RAM | Disk | Time Estimate |
 |-------|----------|-----|------|---------------|
-| Pretraining 1B @ ~78 GB tokens | ~5.1 GB (RTX 4070 Ti 12 GB, power limit 180W) | 93 GB | ~7.9 GB shards | — |
+| Pretraining 1B @ ~78 GB tokens | ~11.7 GB of 12 GB (RTX 4070 Ti, pure-GPU) | 93 GB | ~7.9 GB shards | ~2.4 days (15K steps @ 4,800 tok/s) |
 | SFT | 8 GB | 8 GB | +24 GB | ~4 hours |
 | DPO | 8 GB | 8 GB | +2 GB | ~2 hours |
 
@@ -251,8 +254,10 @@ Not yet started. DPO data was cleaned up — will need fresh preparation when re
 
 | File | Purpose |
 |------|---------|
-| `pretrain_megatrain.py` | Pretraining script (1B config, resumable, MegaTrain CPU-offload + AdamW) |
-| `run_pretrain.sh` | Wrapper that unsets bad env vars and launches pretrain_megatrain.py |
+| `pretrain_megatrain.py` | Legacy pretraining script (CPUMaster CPU-offload + AdamW) — replaced by pretrain_gpu.py |
+| `run_pretrain.sh` | Legacy wrapper for pretrain_megatrain.py (CPUMaster) |
+| `pretrain_gpu.py` | **Current** pure-GPU 1B trainer: bf16 AdamW on GPU, grad checkpointing, CPU-side checkpoint load, warm-start support |
+| `run_pretrain_gpu.sh` | **Current** wrapper: batch 2 × accum 16, 15K steps, warm-start from megatrain_latest.pt → train_small.log |
 | `download_3workers_direct.py` | 3-worker wget downloader with resume for raw datasets |
 | `download_qrp_par.py` | Adaptive parallel wget downloader for QuRatedPajama (resumable) |
 | `tokenize_domain_parallel.py` | Generic tiered tokenizer (math/code/synth/web → easy/medium/hard .bin shards) |
@@ -280,8 +285,16 @@ Not yet started. DPO data was cleaned up — will need fresh preparation when re
 
 ### Optimizer History (July 2026)
 - AdamW → MuonClip (2026-07-22): warm-starting Muon from AdamW caused loss jump 4.98 → 10.12 → oscillation; deleted checkpoints, restarted fresh with Kimi K2 MuonClip.
-- **MuonClip → AdamW (reverted)**: Muon plateaued at loss ~5.0. Switched back to `torch.optim.AdamW` (3e-4 → cosine → 1e-6) with G1–G4 curriculum.
+| **MuonClip → AdamW (reverted)**: Muon plateaued at loss ~5.0. Switched back to `torch.optim.AdamW` (3e-4 → cosine → 1e-6) with G1–G4 curriculum.
 - `non_blocking=False` fix in `cpu_master.py` (race condition on D2H copies).
+
+### Pure-GPU Transition (2026-08-04)
+- Batch-16 experiment measured SLOWER (>7.8s/step vs 6.8s baseline) → bottleneck was single-thread CPU offload, not batch size
+- Built `pretrain_gpu.py`: bf16 weights + bf16 AdamW states on GPU, grad checkpointing, warm-start from CPUMaster checkpoint
+- **OOM bug found & fixed**: `--init-from` loaded the 6.2 GB checkpoint onto the GPU and never freed it → fixed with `map_location="cpu"` + `del ckpt, sd` after `load_state_dict`
+- Result: **4,800 tok/s vs 2,100 (2.1×)** → ETA ~2.4 days instead of 4.7
+- Warm-started from step 9,000 checkpoint (loss 2.25-era) → new run continues at step 400+, not from zero
+- Ops hardening: run launched **detached** (PPID 1/systemd) after a session interruption SIGTERM'd the tracked process; watchdog updated for `pretrain_gpu.py` + re-enabled (5-min auto-restart); 30-min progress cron reports step/loss
 
 ### Disk Space Management
 - 506 GB total. 151 GB used, 330 GB free.
@@ -290,11 +303,12 @@ Not yet started. DPO data was cleaned up — will need fresh preparation when re
 
 ---
 
-## Current State (2026-08-03)
+## Current State (2026-08-04)
 
-- **Training:** fresh 1B run on flat farm (x-small org), AdamW — see train_small.log
+- **Training:** pure-GPU warm-started run (step 9,000 → 15,000), AdamW, 4,800 tok/s — see train_small.log
 - **Data:** all 5 domains downloaded and tokenized into per-domain easy/medium/hard tiered shards
 - **Reformat:** textbook + QA reformatted via Qwen3-8B (14 MB, reformat_easy tier)
+- **Ops:** training runs detached (survives session resets) + 5-min watchdog + 30-min progress cron
 - **Next:** reach loss 2.7 → SFT → DPO
 
 ---
@@ -302,6 +316,6 @@ Not yet started. DPO data was cleaned up — will need fresh preparation when re
 ## Summary
 
 - **Tokens ready:** ~78 GB across 5 domains (math, web, code, synth, reformat), tiered easy/medium/hard
-- **Training:** 1B pretraining at loss ~2.77 → 2.7 with AdamW + G1–G4 curriculum
+- **Training:** 1B pretraining, pure-GPU (2.1× faster), warm-started from step 9,000 → target 15,000; ETA ~Aug 6
 - **SFT assets ready:** 25.76 GB
 - **Next action:** reach loss 2.7 → SFT → DPO.
