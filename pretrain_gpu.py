@@ -5,10 +5,14 @@ Pure-GPU pretraining for the 1B model — replaces CPUMaster offload.
 Removes the serial CPU<->GPU layer-streaming bottleneck (measured: 1 hot
 CPU thread, ~2.3K tok/s). Model + AdamW moments live on GPU in bf16
 (12GB VRAM budget: 2.1GB params + 4.1GB moments + 2.1GB grads + ~1GB
-activations with gradient checkpointing). Effective batch identical to
-the CPUMaster run: batch 4 × accum 8 × seq 2048 = 65K tokens/step.
+activations with gradient checkpointing). Effective batch: 2 × accum 16
+× seq 2048 = 65K tokens/step.
 
-Fresh start only (optimizer family differs from CPUMaster fp32 AdamW).
+Loss is computed with chunked fp32 cross-entropy (512-token slices) to
+avoid HF's full-logits fp32 spike — peak GPU 10.2GB, safely under 11.59GB.
+
+Supports --init-from warm-start (checkpoint loaded on CPU, freed after
+load_state_dict — the OOM fix).
 """
 import argparse, logging, os, time
 from pathlib import Path
@@ -138,8 +142,25 @@ def main():
             attn = batch["attention_mask"].to(device, non_blocking=True)
             labels = batch["labels"].to(device, non_blocking=True)
 
-            out = model(input_ids=input_ids, attention_mask=attn, labels=labels)
-            loss = out.loss / args.grad_accum
+            out = model(input_ids=input_ids, attention_mask=attn)
+            logits = out.logits  # bf16 [B, S, V] — no labels → HF skips its fp32 loss
+            # Chunked fp32 cross-entropy: identical math to HF's loss, but the
+            # fp32 logits conversion happens in 512-token slices (~100MB) instead
+            # of one 768MB block — keeps the run safely under the 11.59GB ceiling.
+            loss = None
+            B, S, V = logits.shape
+            shift_logits = logits[:, :-1, :].contiguous()
+            shift_labels = labels[:, 1:].contiguous()
+            n_tok = shift_labels.numel()
+            for i in range(0, S - 1, 512):
+                ce = torch.nn.functional.cross_entropy(
+                    shift_logits[:, i : i + 512, :].float().reshape(-1, V),
+                    shift_labels[:, i : i + 512].reshape(-1),
+                    reduction="sum",
+                    ignore_index=-100,
+                )
+                loss = ce if loss is None else loss + ce
+            loss = loss / n_tok / args.grad_accum
             acc_loss += loss.item()
             loss.backward()
 

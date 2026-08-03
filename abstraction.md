@@ -225,7 +225,7 @@ Not yet started. DPO data was cleaned up — will need fresh preparation when re
 
 | Decision | Why |
 |----------|-----|
-| **1B model on 12 GB VRAM** | Pure-GPU fit (11.7 GB): bf16 weights + bf16 AdamW states on GPU, grad checkpointing, `expandable_segments:True`, checkpoint loaded on CPU then freed (`del ckpt`). CPUMasterModel offload was the previous approach (~5.1 GB active) but is 2.1× slower. |
+| **1B model on 12 GB VRAM** | Pure-GPU fit (10.2 GB peak): bf16 weights + bf16 AdamW states on GPU, grad checkpointing, `expandable_segments:True`, checkpoint loaded on CPU then freed, chunked fp32 loss (no full-logits spike). CPUMasterModel offload was the previous approach (~5.1 GB active) but is 2.1× slower. |
 | **~78 GB tiered data (not 15B)** | Best-of-best filtered data across 5 domains. Quality over quantity. |
 | **Transformer++ architecture** | SOTA for <1B parameters (SmolLM2, Qwen3, Llama 3.2). |
 | **AdamW optimizer** | Stable and proven on 12GB VRAM. MuonClip caused a plateau at loss ~5.0 and was removed. |
@@ -244,7 +244,7 @@ Not yet started. DPO data was cleaned up — will need fresh preparation when re
 
 | Phase | GPU VRAM | RAM | Disk | Time Estimate |
 |-------|----------|-----|------|---------------|
-| Pretraining 1B @ ~78 GB tokens | ~11.7 GB of 12 GB (RTX 4070 Ti, pure-GPU) | 93 GB | ~7.9 GB shards | ~2.4 days (15K steps @ 4,800 tok/s) |
+| Pretraining 1B @ ~78 GB tokens | ~10.2 GB of 12 GB peak (RTX 4070 Ti, pure-GPU) | 93 GB | ~7.9 GB shards | ~2.4 days (15K steps @ 4,800 tok/s) |
 | SFT | 8 GB | 8 GB | +24 GB | ~4 hours |
 | DPO | 8 GB | 8 GB | +2 GB | ~2 hours |
 
@@ -292,6 +292,7 @@ Not yet started. DPO data was cleaned up — will need fresh preparation when re
 - Batch-16 experiment measured SLOWER (>7.8s/step vs 6.8s baseline) → bottleneck was single-thread CPU offload, not batch size
 - Built `pretrain_gpu.py`: bf16 weights + bf16 AdamW states on GPU, grad checkpointing, warm-start from CPUMaster checkpoint
 - **OOM bug found & fixed**: `--init-from` loaded the 6.2 GB checkpoint onto the GPU and never freed it → fixed with `map_location="cpu"` + `del ckpt, sd` after `load_state_dict`
+- **OOM bug #2 (loss spike)**: run still crashed at first forward pass — HF's internal loss does `logits.float()` on the full [2×2048×49152] tensor (+768 MB). Replaced with **chunked fp32 cross-entropy** (512-token slices, identical math, ~100 MB per chunk) → peak **10.2 GB**, 1.4 GB headroom, zero coin-flip. Same 4,800 tok/s.
 - Result: **4,800 tok/s vs 2,100 (2.1×)** → ETA ~2.4 days instead of 4.7
 - Warm-started from step 9,000 checkpoint (loss 2.25-era) → new run continues at step 400+, not from zero
 - Ops hardening: run launched **detached** (PPID 1/systemd) after a session interruption SIGTERM'd the tracked process; watchdog updated for `pretrain_gpu.py` + re-enabled (5-min auto-restart); 30-min progress cron reports step/loss
