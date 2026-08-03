@@ -13,8 +13,8 @@ echo "Starting pretrain at $(date)"
 echo ""
 
 exec python3 pretrain_megatrain.py \
-  --batch-size 8 \
-  --grad-accum 4 \
+  --batch-size 16 \
+  --grad-accum 2 \
   --num-steps 60000 \
   --log-interval 400 \
   --save-interval 3000 \
