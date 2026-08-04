@@ -147,43 +147,35 @@
 > `pretrain_megatrain.py` (`StratifiedShardDataset`) as the curriculum upgrade path.
 
 ```
- 5 DOMAINS × 3 TIERS  (SHARD_DIRS — tokenized .bin shards)
- ┌────────────┬────────────┬────────────┬────────────┬──────────────┐
- │ math       │ web        │ code       │ synth      │ reformat     │
- │ _easy      │ _easy      │ _easy      │ _easy      │ _easy        │
- │ _medium    │ _medium    │ _medium    │ _medium    │ (medium/hard │
- │ _hard      │ _hard      │ _hard      │ _hard      │  not built)  │
- └────────────┴────────────┴────────────┴────────────┴──────────────┘
-        │  within-tier domain splits (sum = 1 per tier):
-        │  EASY = math .375 | web .375 | synth .125 | code .125
-        │  MED  = math .25 | web .25 | synth .333 | code .167
-        │  HARD = math .55 | web .15 | synth .20 | code .10
+ tiered .bin shards — 5 domains × 3 tiers (13 dirs, SHARD_DIRS)
+   math │ web │ code │ synth │ reformat   ×   easy │ medium │ hard
+        │
         ▼
- ┌───────────────────────────────────────────────────────────────┐
- │  STRATIFIED CURRICULUM MIXER  (get_curriculum_ratios(step))   │
- │                                                               │
- │  G1  Boundary Sharpening ── smooth easy→hard curve over t:    │
- │      t = step/total_steps                                     │
- │      easy 0.30 → 0.05   (starts easy-heavy)                   │
- │      hard 0.25 → 0.70   (ends hard-heavy)                     │
- │      med  = fills the hump (1 − easy − hard)                  │
- │                                                               │
- │  G3  Curriculum Continuity ── ratios recomputed every         │
- │      2000 steps (CURRICULUM_UPDATE_INTERVAL) → no cliff       │
- │      switches; tier blend glides, never jumps                 │
- │                                                               │
- │  G2  Cyclic Review Wave ── anti-forgetting: easy tier gets    │
- │      a periodic boost +0.12 × cosine(2π·step/cycle),          │
- │      one full cycle every ⅛ of training, then renormalize     │
- │      (so old-easy knowledge keeps getting reviewed)           │
- │                                                               │
- │  G4  Local Diversity ── JIT windowed shuffle (window 5000):   │
- │      jitters the batch order locally so gradients stay        │
- │      diverse while the global easy→hard trend is preserved    │
- └───────────────────────────────────────────────────────────────┘
-        │  per-step ratios → weighted shard sampling
+┌─ ① G1 Boundary Sharpening ────────────────────────────────────────┐
+│   smooth easy→hard curve over t = step/total:                     │
+│   easy 0.30→0.05 · hard 0.25→0.70 · medium = fills the hump       │
+└───────────────────────────────────────────────────────────────────┘
+        │  tier weights × within-tier domain splits (sum=1/tier)
         ▼
-      MODEL TRAINING  (batches mix all 5 domains, tier-ratio changes over time)
+┌─ ② G3 Curriculum Continuity ──────────────────────────────────────┐
+│   ratios recomputed every 2000 steps → blend glides, no cliffs    │
+└───────────────────────────────────────────────────────────────────┘
+        │
+        ▼
+┌─ ③ G2 Cyclic Review Wave ─────────────────────────────────────────┐
+│   easy gets periodic boost +0.12·cos(2π·step/cycle) (anti-        │
+│   forgetting), cycle = ⅛ of training → renormalize               │
+└───────────────────────────────────────────────────────────────────┘
+        │  final per-domain ratios → weighted shard sampling
+        ▼
+┌─ ④ G4 Local Diversity ────────────────────────────────────────────┐
+│   JIT windowed shuffle (w=5000): jitter batch order locally,      │
+│   keep global easy→hard trend                                     │
+└───────────────────────────────────────────────────────────────────┘
+        │
+        ▼
+   TRAINING — every batch mixes all 5 domains; tier ratio glides
+   easy-heavy (start) → hard-heavy (end) with periodic easy reviews
 ```
 
 **Worked example (t = 0.5, mid-training):** base weights easy .175 / med .35 / hard .475;
