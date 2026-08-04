@@ -252,7 +252,7 @@ bash run_pretrain_gpu.sh          # current: pure-GPU (2.1× faster)
 # bash run_pretrain.sh            # legacy: CPUMaster offload (kept for reference)
 ```
 
-**Current training state:** warm-started from `megatrain_latest.pt` (step 9,000, loss 2.25-era weights) → running to 15,000 steps total. First log line at step 400 (~1.5h), then every 400 steps.
+**Current training state:** ⏸️ **PAUSED 2026-08-04 23:15** — warm-started from `megatrain_latest.pt` (step 9,000, loss 2.25-era weights) → reached **~step 1,890 / 15,000** (loss 2.8704 @ step 1600, logged 22:00) → frozen via SIGSTOP. See **Pause & Resume** section below.
 
 ---
 
@@ -388,11 +388,65 @@ Not yet started. DPO data was cleaned up — will need fresh preparation when re
 
 ## Current State (2026-08-04)
 
-- **Training:** pure-GPU warm-started run (step 9,000 → 15,000), AdamW, 4,800 tok/s — see train_small.log
+- **Training:** ⏸️ **PAUSED** at ~step 1,890 / 15,000 (frozen 23:15, SIGSTOP). Loss 2.8704 @ step 1600, LR 2.99e-04, 15.57s/step, 4,210 tok/s, GPU 10.2GB peak. See **Pause & Resume** below.
 - **Data:** all 5 domains downloaded and tokenized into per-domain easy/medium/hard tiered shards
 - **Reformat:** textbook + QA reformatted via Qwen3-8B (14 MB, reformat_easy tier)
-- **Ops:** training runs detached (survives session resets) + 5-min watchdog + 30-min progress cron
-- **Next:** reach loss 2.7 → SFT → DPO
+- **Ops:** training runs detached (survives session resets) + 5-min watchdog + 30-min progress cron — **both cron jobs PAUSED with training**
+- **Power limit:** 100W (user's final choice; card is memory-bound, throughput identical at 100–250W)
+- **Next:** resume → reach loss 2.7 → SFT → DPO
+
+---
+
+## Pause & Resume (2026-08-04)
+
+> Training was paused at the user's request ("Save everything. And pause"). The process was
+> **frozen with SIGSTOP, not killed** — the clock is halted mid-run, nothing was lost.
+
+### Frozen state (if process still alive)
+
+| Item | Value |
+|------|-------|
+| Process | pid `980795` (STAT `Tl` = stopped), started 15:30 |
+| Frozen at | ~step 1,890 / 15,000 |
+| Log | `/home/kenpeter/work/train_small.log` |
+| VRAM while frozen | 11.5 GB held (GPU otherwise idle, ~10W) |
+
+**Resume (zero loss):**
+```bash
+kill -CONT 980795        # unfreeze — training continues exactly where it stopped
+```
+Verify: `ps -o pid,stat -p 980795` shows `Rl`, then `tail -f /home/kenpeter/work/train_small.log`.
+Checkpoint saves resume on schedule (every 1,000 steps → next at step 2,000).
+
+**If the frozen process died** (reboot/kill): relaunch the exact command — it auto-resumes
+from `megatrain_latest.pt` (currently **step 1,000**, saved 19:24; best 2.9666). This loses
+~890 steps (~3.9h) of post-checkpoint progress:
+```bash
+cd /home/kenpeter/work/small
+source venv/bin/activate
+bash run_pretrain_gpu.sh        # batch 2 × accum 16, 15K steps, warm-start, log → train_small.log
+```
+(`run_pretrain_gpu.sh` preflight aborts if a training process is already running.)
+
+### Cron jobs to re-enable after resume
+
+Both were paused 2026-08-04 23:17 to prevent the watchdog from auto-restarting (or the
+progress cron from reporting 🔴 DOWN) while paused:
+
+| Job | ID | Schedule | Purpose |
+|-----|----|----------|---------|
+| pretrain-watchdog | `e25e7b032689` | every 5m | auto-restart if training dies (writes `/tmp/pretrain_restarted.flag`) |
+| training-progress | `6fca7f20fe2b` | every 30m | one-line step/loss/ETA report to Telegram |
+
+Re-enable with `cronjob action=resume` on both IDs.
+
+### Notes
+
+- **No signal handler in `pretrain_gpu.py`** — it saves ONLY at `step % 1000 == 0`. A hard
+  kill mid-interval always costs up to 1,000 steps of progress. If this matters, add a
+  `signal.signal(SIGTERM, ...)` handler that saves the current state before exiting.
+- **Power limit:** 100W (persists until reboot; re-apply with `sudo nvidia-smi -pl 100`).
+- Progress milestone for next stage: loss **2.7** → then SFT (data ready in `_sft_final_shards/`).
 
 ---
 
@@ -415,6 +469,6 @@ Not yet started. DPO data was cleaned up — will need fresh preparation when re
 ## Summary
 
 - **Tokens ready:** ~78 GB across 5 domains (math, web, code, synth, reformat), tiered easy/medium/hard
-- **Training:** 1B pretraining, pure-GPU (2.1× faster), warm-started from step 9,000 → target 15,000; ETA ~Aug 6
+- **Training:** 1B pretraining, pure-GPU (2.1× faster), warm-started from step 9,000 → target 15,000; **⏸️ PAUSED 2026-08-04 23:15 at ~step 1,890** (frozen via SIGSTOP, zero loss — resume with `kill -CONT 980795`; see **Pause & Resume**)
 - **SFT assets ready:** 25.76 GB
-- **Next action:** reach loss 2.7 → SFT → DPO.
+- **Next action:** resume training → reach loss 2.7 → SFT → DPO.
