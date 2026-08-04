@@ -553,6 +553,250 @@ def test_default_argparse_values():
 # =============================================================================
 # Main
 # =============================================================================
+# =============================================================================
+# G1-G4 curriculum tests — each mechanism individually + integrated together
+# =============================================================================
+def _tier_weights(ratios):
+    """Aggregate per-domain ratios into (easy, medium, hard) tier weights."""
+    e = sum(v for k, v in ratios.items() if k.endswith("_easy"))
+    m = sum(v for k, v in ratios.items() if k.endswith("_medium"))
+    h = sum(v for k, v in ratios.items() if k.endswith("_hard"))
+    return e, m, h
+
+
+def test_g1_boundary_sharpening():
+    """G1: fold-1 easy→hard, fold-2 mirrored, symmetric, continuous at fold."""
+    # fold 1 (t ≤ 0.5): easy ↓, hard ↑ monotonic
+    prev_e, prev_h = 1.0, 0.0
+    for i in range(11):
+        t = i / 20.0  # 0.0, 0.05, ..., 0.5
+        w_e, w_m, w_h = pmt._smooth_tier_weights(t)
+        assert w_e <= prev_e + 1e-9, f"fold-1 easy not monotonic at t={t}"
+        assert w_h >= prev_h - 1e-9, f"fold-1 hard not monotonic at t={t}"
+        assert abs(w_e + w_m + w_h - 1.0) < 1e-9, "weights must sum to 1"
+        prev_e, prev_h = w_e, w_h
+    # fold 2 (t ≥ 0.5): easy ↑ back up, hard ↓ back down (mirror)
+    prev_e, prev_h = 0.0, 1.0
+    for i in range(11):
+        t = 0.5 + i / 20.0  # 0.5, 0.55, ..., 1.0
+        w_e, w_m, w_h = pmt._smooth_tier_weights(t)
+        assert w_e >= prev_e - 1e-9, f"fold-2 easy not rising at t={t}"
+        assert w_h <= prev_h + 1e-9, f"fold-2 hard not falling at t={t}"
+        prev_e, prev_h = w_e, w_h
+    # symmetry: w(t) == w(1-t) exactly (mirror)
+    for t in (0.0, 0.1, 0.3, 0.49, 0.6, 0.9, 1.0):
+        a = pmt._smooth_tier_weights(t)
+        b = pmt._smooth_tier_weights(1.0 - t)
+        assert all(abs(x - y) < 1e-12 for x, y in zip(a, b)), f"mirror broken at t={t}"
+    # continuity at the fold point (G3: no cliff mid-run)
+    left = pmt._smooth_tier_weights(0.5 - 1e-9)
+    mid = pmt._smooth_tier_weights(0.5)
+    right = pmt._smooth_tier_weights(0.5 + 1e-9)
+    assert all(abs(x - y) < 1e-6 for x, y in zip(left, mid)), "fold discontinuity (left)"
+    assert all(abs(x - y) < 1e-6 for x, y in zip(mid, right)), "fold discontinuity (right)"
+    # endpoints via the real mixer: start AND end are easy-heavy (cancellation)
+    total = 15000
+    e0, m0, h0 = _tier_weights(pmt.get_curriculum_ratios(0, total))
+    e1, m1, h1 = _tier_weights(pmt.get_curriculum_ratios(total - 1, total))
+    assert e0 > 0.25 and e0 < 0.35, f"start easy {e0:.3f} not in (0.25, 0.35)"
+    assert e0 > h0, "start must be easy-heavy"
+    assert e1 > h1, "end must ALSO be easy-heavy (fold-2 mirror cancels bias)"
+    assert abs(e0 - e1) < 0.02 and abs(h0 - h1) < 0.02, "start ≈ end (cancellation)"
+    print("  PASS: G1 boundary sharpening — 2-fold: easy→hard then mirrored hard→easy, symmetric & continuous")
+
+
+def test_g1_two_fold_reverse_cancels():
+    """2-fold reversal: hard peaks mid-training, easy bottoms mid-training."""
+    total = 15000
+    def easy_at(s):
+        return _tier_weights(pmt.get_curriculum_ratios(s, total))[0]
+    def hard_at(s):
+        return _tier_weights(pmt.get_curriculum_ratios(s, total))[2]
+    e_start, e_mid, e_end = easy_at(0), easy_at(total // 2), easy_at(total - 1)
+    h_start, h_mid, h_end = hard_at(0), hard_at(total // 2), hard_at(total - 1)
+    # hard peaks at the fold point; easy bottoms there
+    assert h_mid > h_start and h_mid > h_end, \
+        f"hard must peak mid-run: start {h_start:.3f} mid {h_mid:.3f} end {h_end:.3f}"
+    assert e_mid < e_start and e_mid < e_end, \
+        f"easy must bottom mid-run: start {e_start:.3f} mid {e_mid:.3f} end {e_end:.3f}"
+    # both directions are seen: fold-1 hard rises, fold-2 hard falls
+    h_q1 = hard_at(total // 4)
+    h_q3 = hard_at(3 * total // 4)
+    assert h_q1 > h_start, "fold 1: hard must rise from start"
+    assert h_q3 < h_mid, "fold 2: hard must fall after the peak"
+    # start ≈ end (order bias cancels) — within G2-wave tolerance
+    assert abs(e_start - e_end) < 0.02, f"easy start {e_start:.3f} != end {e_end:.3f}"
+    print("  PASS: 2-fold reverse — hard peaks mid-run, start≈end, both directions seen")
+
+
+def test_g2_cyclic_review_wave():
+    """G2: periodic easy review boost (anti-forgetting), renormalized, capped."""
+    total = 15000
+    cycle = total // 8
+    def g1_easy_only(s):
+        return 0.05 + 0.25 * (1.0 - s / total)
+    def easy_at(s):
+        return _tier_weights(pmt.get_curriculum_ratios(s, total))[0]
+    # at cycle boundaries the cosine term is 0 → exactly the G1 curve
+    # (tolerance 1e-3: get_curriculum_ratios rounds per-domain ratios to 4dp)
+    assert abs(easy_at(0) - g1_easy_only(0)) < 1e-3, "G2 must be 0 at step 0"
+    assert abs(easy_at(cycle) - g1_easy_only(cycle)) < 1e-3, "G2 must return to baseline at cycle end"
+    # mid-cycle: cosine = -1 → max boost +0.12 (pre-renorm); must be clearly visible
+    peak = easy_at(cycle // 2)
+    assert peak > g1_easy_only(cycle // 2) + 0.05, \
+        f"G2 peak boost too small: G1 {g1_easy_only(cycle//2):.3f} vs actual {peak:.3f}"
+    # periodic: second cycle has the same boost shape
+    assert easy_at(cycle + cycle // 2) > g1_easy_only(cycle + cycle // 2) + 0.05, \
+        "G2 boost must be periodic (second cycle peak also boosted)"
+    # cap + renormalization everywhere (tol 5e-4: ratios rounded to 4dp)
+    for s in range(0, total, 137):
+        r = pmt.get_curriculum_ratios(s, total)
+        e, m, h = _tier_weights(r)
+        assert e <= 0.5 + 1e-6, f"G2 easy cap violated at {s}: {e:.4f}"
+        assert abs(e + m + h - 1.0) < 5e-4, f"G2 renormalization failed at {s}"
+    print("  PASS: G2 cyclic review wave — periodic easy boost, renormalized, capped at 0.5")
+
+
+def test_g3_curriculum_continuity_no_cliffs():
+    """G3: consecutive ratio rebuilds glide — no cliff switches between tiers."""
+    total = 15000
+    interval = pmt.CURRICULUM_UPDATE_INTERVAL
+    prev = None
+    for step in range(0, total, interval):
+        r = pmt.get_curriculum_ratios(step, total)
+        if prev is not None:
+            keys = set(prev) | set(r)
+            max_delta = max(abs(prev.get(k, 0.0) - r.get(k, 0.0)) for k in keys)
+            assert max_delta < 0.05, f"G3 cliff at step {step}: max delta {max_delta:.4f}"
+        prev = r
+    print("  PASS: G3 continuity — ratio rebuilds glide, no cliffs")
+
+
+def _make_fake_shards(tmpdir, domains_seqs, seq_len=32, seed=7):
+    """Create fake .bin uint16 shards; returns {domain: Path}."""
+    import numpy as np
+    from pathlib import Path
+    rng = np.random.default_rng(seed)
+    dirs = {}
+    for dom, n_seqs in domains_seqs.items():
+        d = os.path.join(tmpdir, dom)
+        os.makedirs(d, exist_ok=True)
+        arr = rng.integers(0, 49152, size=n_seqs * seq_len, dtype=np.uint16)
+        arr.tofile(os.path.join(d, "shard_0.bin"))
+        dirs[dom] = Path(d)
+    return dirs
+
+
+def _domain_mix(ds, order, n=None):
+    """Count domain fractions in the first n items of epoch_order."""
+    order = order[:n] if n else order
+    counts = {}
+    for i in order:
+        dom = ds.index[i][1]
+        counts[dom] = counts.get(dom, 0) + 1
+    tot = len(order)
+    return {d: c / tot for d, c in counts.items()}
+
+
+def test_g4_windowed_jit_shuffle_and_ratios():
+    """G4 + ratio enforcement: permutation preserved, ratio mix enforced inside
+    the JIT window (5000), rebuild with new ratios reshuffles and re-mixes."""
+    tmp = tempfile.mkdtemp(prefix="g4_test_")
+    try:
+        # buckets ∝ ratios1 so all exhaust together; smallest bucket (2000)
+        # outlasts one JIT window (5000 items = 500 passes @ 10/pass)
+        ratios1 = {"math_easy": 0.1, "web_easy": 0.2, "synth_easy": 0.3, "code_easy": 0.4}
+        ratios2 = {"math_easy": 0.4, "web_easy": 0.3, "synth_easy": 0.2, "code_easy": 0.1}
+        dirs = _make_fake_shards(tmp, {"math_easy": 2000, "web_easy": 4000,
+                                       "synth_easy": 6000, "code_easy": 8000}, seq_len=32)
+        ds = pmt.StratifiedShardDataset(dirs, seq_len=32, ratios=ratios1, dedup=False)
+        order = ds.epoch_order
+        # full permutation: no dups, no drops
+        assert len(order) == len(set(order)) == 20000, "epoch_order must be a permutation"
+        # every active domain present
+        doms_in_order = {ds.index[i][1] for i in order}
+        assert doms_in_order == set(ratios1), f"domains {doms_in_order} != active {set(ratios1)}"
+        # ratio enforcement inside the first JIT window (5000 items)
+        mix = _domain_mix(ds, order, n=5000)
+        for dom, frac in ratios1.items():
+            assert abs(mix[dom] - frac) < 0.02, \
+                f"ratio not enforced: {dom} actual {mix[dom]:.3f} vs {frac}"
+        # rebuild with different ratios → reshuffled, mix shifts toward new ratios
+        ds.ratios = ratios2
+        ds._build_stratified_order()
+        order2 = ds.epoch_order
+        assert order2 != order, "rebuild must reshuffle the order"
+        assert len(order2) == len(set(order2)) == 20000, "rebuild must keep permutation"
+        mix2 = _domain_mix(ds, order2, n=5000)
+        for dom, frac in ratios2.items():
+            assert abs(mix2[dom] - frac) < 0.02, \
+                f"rebuild ratio not enforced: {dom} actual {mix2[dom]:.3f} vs {frac}"
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    print("  PASS: G4 windowed jitter — permutation preserved, ratios enforced on rebuild")
+
+
+def test_g1234_together_full_run():
+    """Integration: G1+G2+G3 produce valid ratios over the whole run and the
+    dataset rebuild path (as wired in pretrain_gpu.py) keeps them enforced."""
+    total = 15000
+    # whole-run ratio validity + 2-fold shape: easy bottoms mid, hard peaks mid
+    easy_series, hard_series = [], []
+    for s in range(0, total, 2000):
+        r = pmt.get_curriculum_ratios(s, total)
+        assert all(v >= 0 for v in r.values()), f"negative ratio at {s}"
+        assert abs(sum(r.values()) - 1.0) < 5e-4, f"ratios don't sum to 1 at {s}"
+        e, m, h = _tier_weights(r)
+        easy_series.append(e)
+        hard_series.append(h)
+        assert "reformat_easy" in r, "5-domain mix: reformat_easy must be sampled early"
+    mid = len(easy_series) // 2
+    # fold 1: easy declines, hard rises (first half); fold 2: mirrored back
+    assert easy_series[0] > easy_series[mid], "fold 1: easy must decline to mid-run"
+    assert hard_series[0] < hard_series[mid], "fold 1: hard must rise to mid-run"
+    assert easy_series[mid] < easy_series[-1], "fold 2: easy must rise back after mid-run"
+    assert hard_series[mid] > hard_series[-1], "fold 2: hard must fall back after mid-run"
+    # cancellation: start ≈ end, both easy-heavy (compare at wave-zero steps 0/14999)
+    e0_end = _tier_weights(pmt.get_curriculum_ratios(0, total))[0]
+    e_end = _tier_weights(pmt.get_curriculum_ratios(total - 1, total))[0]
+    h_end = _tier_weights(pmt.get_curriculum_ratios(total - 1, total))[2]
+    assert abs(e0_end - e_end) < 0.01, f"start {e0_end:.4f} != end {e_end:.4f} easy (cancellation)"
+    assert e0_end > _tier_weights(pmt.get_curriculum_ratios(0, total))[2] and e_end > h_end, \
+        "both ends must be easy-heavy (mirror cancels order bias)"
+    # dataset rebuild loop (same as pretrain_gpu.py): ratios swap → order rebuilds
+    tmp = tempfile.mkdtemp(prefix="g1234_test_")
+    try:
+        # fake subset covers 3 easy + 3 hard domains so the easy/hard balance
+        # of the ACTIVE subset mirrors the real tier weights (easy is spread
+        # over 5 domains in the real split — 2 easy dirs would bias hard-heavy)
+        dirs = _make_fake_shards(tmp, {"math_easy": 3000, "web_easy": 3000,
+                                       "synth_easy": 1000, "math_hard": 4000,
+                                       "synth_hard": 2000, "web_hard": 1500}, seq_len=32)
+        ds = pmt.StratifiedShardDataset(dirs, seq_len=32,
+                                        ratios=pmt.get_curriculum_ratios(0, total), dedup=False)
+        assert len(ds.epoch_order) == len(set(ds.epoch_order)) == 14500, "permutation at start"
+        # mid-run rebuild: hard must dominate the interleave window (fold peak)
+        ds.ratios = pmt.get_curriculum_ratios(total // 2, total)
+        ds._build_stratified_order()  # exactly what the training loop does every 2000 steps
+        assert len(ds.epoch_order) == len(set(ds.epoch_order)) == 14500, "permutation after rebuild"
+        mix = _domain_mix(ds, ds.epoch_order, n=500)
+        hard_frac = mix.get("math_hard", 0) + mix.get("synth_hard", 0) + mix.get("web_hard", 0)
+        easy_frac = mix.get("math_easy", 0) + mix.get("synth_easy", 0) + mix.get("web_easy", 0)
+        assert hard_frac > easy_frac, \
+            f"fold peak violated: hard {hard_frac:.3f} vs easy {easy_frac:.3f} in window"
+        # end-state rebuild: mirrored back to easy-heavy (cancellation)
+        ds.ratios = pmt.get_curriculum_ratios(total - 1, total)
+        ds._build_stratified_order()
+        mix_end = _domain_mix(ds, ds.epoch_order, n=500)
+        hard_end = mix_end.get("math_hard", 0) + mix_end.get("synth_hard", 0) + mix_end.get("web_hard", 0)
+        easy_end = mix_end.get("math_easy", 0) + mix_end.get("synth_easy", 0) + mix_end.get("web_easy", 0)
+        assert easy_end > hard_end, \
+            f"end-state must be easy-heavy (mirror): easy {easy_end:.3f} vs hard {hard_end:.3f}"
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    print("  PASS: G1-G4 together — valid ratios all run, fold peak mid-run, rebuild enforces end-state")
+
+
 TESTS = [
     test_module_imports_cleanly,
     test_lr_warmup_rises_linearly,
@@ -585,6 +829,12 @@ TESTS = [
     test_grad_none_skipped,
     test_adam_update_formula,
     test_default_argparse_values,
+    test_g1_boundary_sharpening,
+    test_g1_two_fold_reverse_cancels,
+    test_g2_cyclic_review_wave,
+    test_g3_curriculum_continuity_no_cliffs,
+    test_g4_windowed_jit_shuffle_and_ratios,
+    test_g1234_together_full_run,
 ]
 
 if __name__ == "__main__":

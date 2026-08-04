@@ -23,9 +23,13 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, LlamaConfig
 
 from pretrain_megatrain import (
     FARM_DIR,
+    SHARD_DIRS,
     FlatFarmDataset,
+    StratifiedShardDataset,
     collate_pretrain,
     get_lr,
+    get_curriculum_ratios,
+    CURRICULUM_UPDATE_INTERVAL,
     save_checkpoint_robust,
 )
 
@@ -96,6 +100,9 @@ def main():
     parser.add_argument("--init-from", type=str, default=None,
                         help="Optional checkpoint .pt to load MODEL WEIGHTS from "
                              "(warm start; optimizer starts fresh — bf16 family)")
+    parser.add_argument("--curriculum", action="store_true",
+                        help="Enable G1-G4 curriculum (StratifiedShardDataset + "
+                             "get_curriculum_ratios). Default: flat farm.")
     args = parser.parse_args()
 
     torch.manual_seed(42)
@@ -115,7 +122,14 @@ def main():
         torch.cuda.empty_cache()
     optimizer = make_optimizer(model, args.lr)
 
-    ds = FlatFarmDataset(FARM_DIR, seq_len=args.max_seq_len, val_frac=0.01, is_val=False)
+    if args.curriculum:
+        ratios0 = get_curriculum_ratios(0, args.num_steps)
+        logger.info(f"📚 G1-G4 curriculum ON — start ratios: {ratios0}")
+        ds = StratifiedShardDataset(SHARD_DIRS, seq_len=args.max_seq_len,
+                                    ratios=ratios0, dedup=False)
+    else:
+        logger.info(f"Flat farm: {FARM_DIR}")
+        ds = FlatFarmDataset(FARM_DIR, seq_len=args.max_seq_len, val_frac=0.01, is_val=False)
     dl = DataLoader(ds, batch_size=args.batch_size, collate_fn=collate_pretrain,
                     shuffle=False, num_workers=0, pin_memory=True)
     data_iter = iter(dl)
@@ -127,6 +141,16 @@ def main():
     t0 = time.time()
 
     for step in range(args.num_steps):
+        # ── G1-G4 curriculum: rebuild tier ratios every CURRICULUM_UPDATE_INTERVAL ──
+        # G1+G3: smooth easy→hard weights at t=step/total (no cliffs)
+        # G2: cosine easy-review boost + renormalize (inside get_curriculum_ratios)
+        # G4: windowed JIT shuffle (inside _build_stratified_order)
+        if args.curriculum and step > 0 and step % CURRICULUM_UPDATE_INTERVAL == 0:
+            new_ratios = get_curriculum_ratios(step, args.num_steps)
+            ds.ratios = new_ratios
+            ds._build_stratified_order()
+            data_iter = iter(dl)
+            logger.info(f"📚 G1-G4 curriculum @ step {step}: {new_ratios}")
         lr = get_lr(step + 1, args.warmup_steps, args.num_steps, args.lr, args.min_lr)
         for g in optimizer.param_groups:
             g["lr"] = lr

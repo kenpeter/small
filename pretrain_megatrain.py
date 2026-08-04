@@ -236,16 +236,24 @@ FARM_DIR = Path("/home/kenpeter/work/data/_shards_final")
 CURRICULUM_UPDATE_INTERVAL = 2000  # steps between ratio rebuilds (rebuild ~35s)
 
 # Tier → domain split fractions (within-tier proportions, sum=1 per tier)
-EASY_SPLIT = {"math_easy": 0.375, "web_easy": 0.375, "synth_easy": 0.125, "code_easy": 0.125}
+# reformat_easy included so the 5-domain mix (math/web/code/synth/reformat) is
+# preserved under G1-G4 curriculum (it's absent from all splits → excluded otherwise)
+EASY_SPLIT = {"math_easy": 0.35, "web_easy": 0.35, "synth_easy": 0.125, "code_easy": 0.10, "reformat_easy": 0.075}
 MED_SPLIT = {"math_medium": 0.25, "web_medium": 0.25, "synth_medium": 0.333, "code_medium": 0.167}
 HARD_SPLIT = {"math_hard": 0.55, "web_hard": 0.15, "synth_hard": 0.20, "code_hard": 0.10}  # web_hard live: QuRatedPajama 594M tok
 
 def _smooth_tier_weights(t):
-    """G1+G3: continuous easy→hard weight curves over progress t∈[0,1].
-    Hard-forward from the resume point (easy phase already completed):
-    easy: 0.30→0.05 (review floor)  hard: 0.25→0.70  medium: fills the hump."""
-    w_easy = 0.05 + 0.25 * (1 - t)
-    w_hard = min(0.70, 0.25 + 0.45 * t)
+    """G1+G3: 2-fold reversal (paper STR/SAW-2, arXiv:2605.30334).
+
+    Fold 1 (t < 0.5): easy→hard — easy 0.30→0.175, hard 0.25→0.475.
+    Fold 2 (t ≥ 0.5): MIRRORED hard→easy — the curve runs back, so the
+    run starts AND ends easy-heavy with a hard peak mid-training. Order
+    bias from fold 1 cancels out in fold 2.
+    Continuous at the fold point (t=0.5 both sides give identical weights) → G3.
+    """
+    tt = t if t < 0.5 else 1.0 - t
+    w_easy = 0.05 + 0.25 * (1 - tt)
+    w_hard = min(0.70, 0.25 + 0.45 * tt)
     w_med = max(0.0, 1.0 - w_easy - w_hard)
     return w_easy, w_med, w_hard
 
@@ -398,14 +406,18 @@ class StratifiedShardDataset(Dataset):
         self.epoch_order = []
         ptrs = {d: 0 for d in active_domains}
         total_valid = len(valid_indices)
-        # Determine per-step counts (proportional)
-        batch_size = 2  # physical batch; will be overridden by DataLoader
+        # Emit proportionally to ratios: integer multiples of the smallest
+        # active ratio so proportions are exact. Physical batch size is
+        # handled by the DataLoader; this only shapes the interleave mix.
+        # (Fixed: was max(1, int(2*ratio)) → floored every ratio to 1 and
+        #  silently disabled ratio enforcement.)
+        min_ratio = min(self.ratios[d] for d in active_domains)
         # We just build a flat list; DataLoader batching will grab sequentially
         # To enforce ratios per step, we emit in repeating pattern
         while sum(ptrs[d] < len(buckets[d]) for d in active_domains) > 0:
             for domain in active_domains:
-                # emit ~ratio proportion
-                n_emit = max(1, int(batch_size * self.ratios[domain]))
+                # emit ~ratio proportion (exact integer multiples of min ratio)
+                n_emit = max(1, round(self.ratios[domain] / min_ratio))
                 for _ in range(n_emit):
                     if ptrs[domain] < len(buckets[domain]):
                         self.epoch_order.append(buckets[domain][ptrs[domain]])
