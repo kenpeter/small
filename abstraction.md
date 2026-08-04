@@ -142,18 +142,19 @@
 
 ## G1–G4 Curriculum Pipeline (how the tiers work together)
 
-> **Status:** DORMANT — the current run uses the flat farm (`_shards_final`, uniform
-> interleave of all tiers, sequential). G1–G4 stratified sampling is kept in
-> `pretrain_megatrain.py` (`StratifiedShardDataset`) as the curriculum upgrade path.
+> **Status: ACTIVE (2026-08-04)** — the pure-GPU run uses `StratifiedShardDataset`
+> with `--curriculum`: smooth 2-fold reverse G1–G4 (see diagram). The flat farm
+> (`_shards_final`) remains the fallback when `--curriculum` is off.
 
 ```
  tiered .bin shards — 5 domains × 3 tiers (13 dirs, SHARD_DIRS)
    math │ web │ code │ synth │ reformat   ×   easy │ medium │ hard
         │
         ▼
-┌─ ① G1 Boundary Sharpening ────────────────────────────────────────┐
-│   smooth easy→hard curve over t = step/total:                     │
-│   easy 0.30→0.05 · hard 0.25→0.70 · medium = fills the hump       │
+┌─ ① G1 Boundary Sharpening (2-FOLD REVERSE) ────────────────────────┐
+│   fold 1 (t<0.5): easy 0.30→0.175 · hard 0.25→0.475 (easy→hard)    │
+│   fold 2 (t≥0.5): MIRRORED hard→easy — start ≈ end easy-heavy,     │
+│   hard peaks mid-run → order bias cancels (paper STR/SAW-2)         │
 └───────────────────────────────────────────────────────────────────┘
         │  tier weights × within-tier domain splits (sum=1/tier)
         ▼
@@ -175,12 +176,13 @@
         │
         ▼
    TRAINING — every batch mixes all 5 domains; tier ratio glides
-   easy-heavy (start) → hard-heavy (end) with periodic easy reviews
+   easy-heavy → HARD PEAK mid-run → easy-heavy (mirrored, bias cancels)
 ```
 
-**Worked example (t = 0.5, mid-training):** base weights easy .175 / med .35 / hard .475;
+**Worked example (t = 0.5, mid-training = fold peak):** base weights easy .175 / med .35 / hard .475;
 at the G2 review peak (~+0.12 to easy) → renormalized ≈ easy .29 / med .31 / hard .40 —
-a visible "easy review week" inside the hard-forward trend.
+a visible "easy review week" inside the mid-run hard peak. After t=0.5 the curve mirrors
+back: easy rises toward .30, hard falls toward .25 → start ≈ end (order bias cancels).
 
 **How it differs from the active flat farm:** flat farm = *uniform random interleave of
 ALL 1088 tiered shards, no curriculum* (x-small style, `FlatFarmDataset`). G1–G4 = the
