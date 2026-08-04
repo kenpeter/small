@@ -63,7 +63,7 @@
 
 **Notes:**
 - Shard format: `.bin` uint16 arrays, SmolLM2-135M vocab (49152)
-- Tiered per domain: easy → medium → hard; consumed as a flat farm via `FARM_DIR` (`_shards_final`) in pretrain_megatrain.py (x-small style, `FlatFarmDataset`). G1-G4 stratified sampling (`SHARD_DIRS`) kept but dormant.
+- Tiered per domain: easy → medium → hard; consumed via the stratified curriculum sampler (`SHARD_DIRS`, `--curriculum`) — **Boundary Sharpening · Cyclic Scheduling · Curriculum Continuity · Local Diversity (G1–G4)** — with the flat farm (`FARM_DIR`, `FlatFarmDataset`) as the no-curriculum fallback.
 
 ### Raw Downloads (Staging → Needs Tokenization)
 
@@ -126,7 +126,7 @@
 │  PRETRAIN (pretrain_gpu.py — pure GPU)                                    │
 │    _shards_final/   ──► FlatFarmDataset (x-small style, sequential)     │
 │    1088-bin farm    ──► md5 split: 1088 train / 10 val                  │
-│    G1-G4 stratified ──► legacy, dormant (StratifiedShardDataset)        │
+│  Curriculum sampler (G1–G4: Sharpening/Scheduling/Continuity/Diversity)│
 └─────────────────────────────────────────────────────────────────────────┘
                               │
                               ▼
@@ -140,10 +140,10 @@
 
 ---
 
-## G1–G4 Curriculum Pipeline (how the tiers work together)
+## Curriculum Pipeline — Boundary Sharpening · Cyclic Scheduling · Curriculum Continuity · Local Diversity (G1–G4)
 
 > **Status: ACTIVE (2026-08-04)** — the pure-GPU run uses `StratifiedShardDataset`
-> with `--curriculum`: smooth 2-fold reverse G1–G4 (see diagram). The flat farm
+> with `--curriculum`: smooth **2-fold reverse** curriculum (see diagram). The flat farm
 > (`_shards_final`) remains the fallback when `--curriculum` is off.
 
 ```
@@ -151,25 +151,25 @@
    math │ web │ code │ synth │ reformat   ×   easy │ medium │ hard
         │
         ▼
-┌─ ① G1 Boundary Sharpening (2-FOLD REVERSE) ────────────────────────┐
+┌─ ① Boundary Sharpening (G1) — 2-FOLD REVERSE ────────────────────────┐
 │   fold 1 (t<0.5): easy 0.30→0.175 · hard 0.25→0.475 (easy→hard)    │
 │   fold 2 (t≥0.5): MIRRORED hard→easy — start ≈ end easy-heavy,     │
 │   hard peaks mid-run → order bias cancels (paper STR/SAW-2)         │
 └───────────────────────────────────────────────────────────────────┘
         │  tier weights × within-tier domain splits (sum=1/tier)
         ▼
-┌─ ② G3 Curriculum Continuity ──────────────────────────────────────┐
+┌─ ② Curriculum Continuity (G3) ──────────────────────────────────────┐
 │   ratios recomputed every 2000 steps → blend glides, no cliffs    │
 └───────────────────────────────────────────────────────────────────┘
         │
         ▼
-┌─ ③ G2 Cyclic Review Wave ─────────────────────────────────────────┐
+┌─ ③ Cyclic Scheduling (G2) — review wave ────────────────────────────┐
 │   easy gets periodic boost +0.12·cos(2π·step/cycle) (anti-        │
 │   forgetting), cycle = ⅛ of training → renormalize               │
 └───────────────────────────────────────────────────────────────────┘
         │  final per-domain ratios → weighted shard sampling
         ▼
-┌─ ④ G4 Local Diversity ────────────────────────────────────────────┐
+┌─ ④ Local Diversity (G4) — windowed shuffle ─────────────────────────┐
 │   JIT windowed shuffle (w=5000): jitter batch order locally,      │
 │   keep global easy→hard trend                                     │
 └───────────────────────────────────────────────────────────────────┘
@@ -180,14 +180,45 @@
 ```
 
 **Worked example (t = 0.5, mid-training = fold peak):** base weights easy .175 / med .35 / hard .475;
-at the G2 review peak (~+0.12 to easy) → renormalized ≈ easy .29 / med .31 / hard .40 —
+at the Cyclic Scheduling review peak (G2, ~+0.12 to easy) → renormalized ≈ easy .29 / med .31 / hard .40 —
 a visible "easy review week" inside the mid-run hard peak. After t=0.5 the curve mirrors
 back: easy rises toward .30, hard falls toward .25 → start ≈ end (order bias cancels).
 
 **How it differs from the active flat farm:** flat farm = *uniform random interleave of
-ALL 1088 tiered shards, no curriculum* (x-small style, `FlatFarmDataset`). G1–G4 = the
-same shards, but *ratio-controlled over time*: easy-heavy → hard-heavy with periodic
+ALL 1088 tiered shards, no curriculum* (x-small style, `FlatFarmDataset`). The curriculum = the
+same shards, but *ratio-controlled over time*: easy-heavy → hard-heavy → easy-heavy with periodic
 easy reviews. Same data, different scheduling — switchable via `SHARD_DIRS` vs `FARM_DIR`.
+
+### Concrete Example: One Week of Training (40,000 steps, ~5,700 steps/day)
+
+> All four mechanisms active simultaneously — every batch mixes all 3 tiers, only the
+> percentages move. Data is consumed once, never replayed (40K steps ≈ 2.6B tokens ≈ 6% of corpus).
+
+```
+Mon          Wed         ★Thu         Fri          Sun
+|←──── FOLD 1: easy→hard ────→|←── FOLD 2: hard→easy ──→|
+```
+
+| Day | Steps | Fold | Batch mix trend | Cyclic Scheduling wave (G2) |
+|-----|-------|------|-----------------|------------------------------|
+| Mon | 0–5,700 | 1 | easy 30%→26%, hard 25%→31% | peak ~Mon night |
+| Tue | 5,700–11,400 | 1 | easy 26%→23%, hard 31%→37% | peak Tue |
+| Wed | 11,400–17,100 | 1 | easy 23%→20%, hard 37%→43% | peak Wed |
+| **Thu (step 20,000)** | | **★ FOLD POINT** | **HARD PEAK: easy 17%, hard 48%** | |
+| Thu–Fri | 17,100–22,800 | 2 | easy 20%→23%, hard 43%→37% | peak Thu night |
+| Fri–Sat | 22,800–28,500 | 2 | easy 23%→26%, hard 37%→31% | peak Sat |
+| Sun | 28,500–40,000 | 2 | easy 26%→**30%**, hard 31%→**25%** | peak Sun |
+
+**All four genes during the week:**
+- **Boundary Sharpening (G1)** — the 2-fold arc: fold 1 climbs easy→hard (Mon→Wed), fold 2 mirrors back (Thu→Sun)
+- **Curriculum Continuity (G3)** — every ~7.7h (2,000 steps) the mix re-glides → 20 smooth steps of change, no jumps
+- **Cyclic Scheduling (G2)** — 8 review waves (one per 5,000 steps ≈ every 19h): easy gets a temporary +12% boost at each peak, then renormalized
+- **Local Diversity (G4)** — at every G3 rebuild, example order reshuffles in 5,000-item windows
+
+**What a batch looks like at 3 moments:**
+- Mon 9am (step 500): 30% easy + 45% med + 25% hard
+- Thu 2pm (step 20,000): 17% easy + 35% med + 48% hard ← hardest week moment
+- Sun 9pm (step 39,500): 30% easy + 45% med + 25% hard (Monday's mix, different examples)
 
 ---
 
@@ -283,7 +314,7 @@ Not yet started. DPO data was cleaned up — will need fresh preparation when re
 | **QK-Clip + momentum warmup** | Stabilizes MuonClip on fresh init. Removed with MuonClip. |
 | **Batch=8, accum=4** | Effective batch 32 (65K tok/step). |
 | **Only 2 checkpoints** | Disk space conservation. `megatrain_latest.pt` for resume, `megatrain_best.pt` for downstream. |
-| **Flat farm data org (x-small style)** | `_shards_final` uniform random interleave, sequential consumption. G1–G4 stratified mix kept dormant. |
+| **Flat farm data org (x-small style)** | `_shards_final` uniform random interleave, sequential consumption. Curriculum sampler (Boundary Sharpening/Cyclic Scheduling/Continuity/Diversity) now ACTIVE on the pure-GPU run. |
 | **13-gram dedup** | Exact hash collision drop. 5–10% token savings. Disabled at startup to avoid long scan; toggled via flag. |
 | **Direct wget downloads** | Bypasses HF API / Xet throttling. 3–8× faster than hf_hub_download for large parquet files. |
 | **Pure-GPU training (2.1× faster)** | Batch-16 experiment found the bottleneck was single-thread CPU offload, not batch size → moved bf16 AdamW states to GPU → 4,800 tok/s vs 2,100 (CPUMaster). Warm-start from CPUMaster checkpoint preserved the overnight run. |
@@ -336,7 +367,7 @@ Not yet started. DPO data was cleaned up — will need fresh preparation when re
 
 ### Optimizer History (July 2026)
 - AdamW → MuonClip (2026-07-22): warm-starting Muon from AdamW caused loss jump 4.98 → 10.12 → oscillation; deleted checkpoints, restarted fresh with Kimi K2 MuonClip.
-| **MuonClip → AdamW (reverted)**: Muon plateaued at loss ~5.0. Switched back to `torch.optim.AdamW` (3e-4 → cosine → 1e-6) with G1–G4 curriculum.
+| **MuonClip → AdamW (reverted)**: Muon plateaued at loss ~5.0. Switched back to `torch.optim.AdamW` (3e-4 → cosine → 1e-6) with the G1–G4 curriculum (Boundary Sharpening · Cyclic Scheduling · Curriculum Continuity · Local Diversity).
 - `non_blocking=False` fix in `cpu_master.py` (race condition on D2H copies).
 
 ### Pure-GPU Transition (2026-08-04)
