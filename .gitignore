@@ -10,6 +10,10 @@ venv/
 # Logs
 *.log
 
+# Generated status snapshots
+status_report.txt
+training_status.txt
+
 # Model files
 *.bin
 *.pt

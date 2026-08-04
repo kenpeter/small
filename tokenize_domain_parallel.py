@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""Generic parallel domain tokenizer — spawns N workers per domain."""
+"""Generic parallel domain tokenizer — classifies into easy/medium/hard tiers and writes .bin shards.
+
+Usage: python3 tokenize_domain_parallel.py --domains math,code,synth,web --workers 4
+"""
 import sys, os, gc, time, re, json, multiprocessing, importlib.util
 from pathlib import Path
 import numpy as np
@@ -11,7 +14,7 @@ ROOT = Path("/home/kenpeter/work/data")
 SEQ_LEN = 2048
 FLUSH_TOKENS = 100_000_000
 
-# Domain configs
+# Domain configs (column: parquet field holding the document text)
 DOMAIN_CONFIGS = {
     "math": {
         "sources": [ROOT / "_raw_original" / "finemath-3plus", ROOT / "_raw_original" / "open-web-math"],
@@ -23,6 +26,10 @@ DOMAIN_CONFIGS = {
     },
     "synth": {
         "sources": [ROOT / "_raw_original" / "cosmopedia"],
+        "column": "text",
+    },
+    "web": {
+        "sources": [ROOT / "_raw_original" / "fineweb-edu"],
         "column": "text",
     },
 }
