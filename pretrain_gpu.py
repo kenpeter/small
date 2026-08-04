@@ -31,6 +31,7 @@ from pretrain_megatrain import (
     get_curriculum_ratios,
     CURRICULUM_UPDATE_INTERVAL,
     save_checkpoint_robust,
+    should_save_checkpoint,
 )
 
 logger = logging.getLogger("pretrain_gpu")
@@ -94,6 +95,9 @@ def main():
     parser.add_argument("--max-seq-len", type=int, default=SEQ_LEN)
     parser.add_argument("--log-interval", type=int, default=400)
     parser.add_argument("--save-interval", type=int, default=3000)
+    parser.add_argument("--save-every-minutes", type=int, default=0,
+                        help="Also save every N wall-clock minutes (0 = step-based only). "
+                             "Keeps worst-case loss window small regardless of step speed.")
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--warmup-steps", type=int, default=1000)
     parser.add_argument("--min-lr", type=float, default=1e-6)
@@ -139,6 +143,7 @@ def main():
     global_step = 0
     running = 0.0
     t0 = time.time()
+    last_save_time = time.time()
 
     for step in range(args.num_steps):
         # ── G1-G4 curriculum: rebuild tier ratios every CURRICULUM_UPDATE_INTERVAL ──
@@ -206,7 +211,8 @@ def main():
                 f"{dt/args.log_interval:.2f}s/step | {tps:.0f} tok/s | GPU {mem:.2f}GB"
             )
 
-        if (step + 1) % args.save_interval == 0 or step == args.num_steps - 1:
+        if should_save_checkpoint(step + 1, args.save_interval, last_save_time,
+                                  time.time(), args.save_every_minutes) or step + 1 == args.num_steps:
             is_best = acc_loss < best_loss
             if is_best:
                 best_loss = acc_loss
@@ -219,6 +225,7 @@ def main():
                 "config": args.__dict__,
             }
             save_checkpoint_robust(state, OUTPUT_DIR, is_best, logger)
+            last_save_time = time.time()
 
     logger.info("✅ Pure-GPU pretraining complete!")
 

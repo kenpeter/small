@@ -558,6 +558,23 @@ def save_checkpoint_robust(state, output_dir, is_best, logger):
     return True
 
 
+def should_save_checkpoint(step_num, save_interval, last_save_time, now, save_every_minutes=0):
+    """Decide whether a checkpoint save is due (step-based OR time-based).
+
+    step_num is 1-indexed (the step that just completed). Returns True when:
+      - step-based: step_num is a positive multiple of save_interval, or
+      - time-based: save_every_minutes > 0 and now - last_save_time >= save_every_minutes*60.
+    Time-based cadence keeps the worst-case loss window small (e.g. 20 min)
+    regardless of step speed — a crash/pause/restart loses at most the time
+    since the last save.
+    """
+    if save_interval and step_num > 0 and step_num % save_interval == 0:
+        return True
+    if save_every_minutes and save_every_minutes > 0 and (now - last_save_time) >= save_every_minutes * 60:
+        return True
+    return False
+
+
 def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 

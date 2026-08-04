@@ -39,6 +39,7 @@ exec python3 pretrain_gpu.py \
   --num-steps 15000 \
   --log-interval 400 \
   --save-interval 1000 \
+  --save-every-minutes 20 \
   --warmup-steps 1000 \
   --lr 3e-4 \
   --curriculum \

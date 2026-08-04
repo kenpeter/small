@@ -44,7 +44,8 @@ def test_module_imports_cleanly():
 import pretrain_megatrain as pmt
 from pretrain_megatrain import (
     get_lr, newton_schulz, KimiMuonClip, adam_update,
-    collate_pretrain, validate_cpu_params, save_checkpoint_robust
+    collate_pretrain, validate_cpu_params, save_checkpoint_robust,
+    should_save_checkpoint,
 )
 
 
@@ -207,6 +208,39 @@ def test_checkpoint_saves_clean_state():
     finally:
         shutil.rmtree(tmpdir)
     print(f"  PASS: clean checkpoint saved")
+
+
+def test_save_trigger_step_based():
+    """should_save_checkpoint fires on save_interval multiples, not before."""
+    assert should_save_checkpoint(1000, 1000, 0.0, 0.0, 0) is True
+    assert should_save_checkpoint(2000, 1000, 0.0, 0.0, 0) is True
+    assert should_save_checkpoint(999, 1000, 0.0, 0.0, 0) is False
+    assert should_save_checkpoint(1, 1000, 0.0, 0.0, 0) is False
+    assert should_save_checkpoint(0, 1000, 0.0, 0.0, 0) is False
+    print(f"  PASS: step-based save trigger")
+
+
+def test_save_trigger_time_based():
+    """should_save_checkpoint fires once save_every_minutes elapses."""
+    last = 1000.0
+    # 20-min cadence: not due at 19:59, due at exactly 20:00
+    assert should_save_checkpoint(1, 1000, last, last + 19 * 60 + 59, 20) is False
+    assert should_save_checkpoint(1, 1000, last, last + 20 * 60, 20) is True
+    assert should_save_checkpoint(1, 1000, last, last + 61 * 60, 20) is True
+    # disabled (0) never fires on time, no matter how long
+    assert should_save_checkpoint(1, 1000, last, last + 99999 * 60, 0) is False
+    print(f"  PASS: time-based save trigger")
+
+
+def test_save_trigger_either_wins():
+    """Step-based fires even when time not due; time-based fires even mid-interval."""
+    # step due, time not due
+    assert should_save_checkpoint(1000, 1000, 0.0, 5.0, 20) is True
+    # time due, step not due (mid-interval save keeps loss window small)
+    assert should_save_checkpoint(7, 1000, 0.0, 20 * 60, 20) is True
+    # neither due
+    assert should_save_checkpoint(7, 1000, 0.0, 19 * 60, 20) is False
+    print(f"  PASS: either trigger wins")
 
 
 # =============================================================================
