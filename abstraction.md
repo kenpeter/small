@@ -314,6 +314,22 @@ Not yet started. DPO data was cleaned up — will need fresh preparation when re
 
 ---
 
+## Failure Prevention (Ops Rules — learned 2026-08-04)
+
+| Failure | Prevention (enforced) |
+|---------|----------------------|
+| **Process killed by session reset** | Launch detached (PPID 1/systemd) via `start_new_session=True`; 5-min watchdog auto-restarts; 30-min cron reports |
+| **OOM: checkpoint on GPU** | `--init-from` must `map_location="cpu"` + `del ckpt` after `load_state_dict` |
+| **OOM: HF full-logits fp32 loss spike (+768MB)** | Chunked fp32 cross-entropy (512-token slices) — peak 10.2GB, 1.4GB headroom |
+| **OOM: double-launch / no headroom** | `run_pretrain_gpu.sh` preflight: abort if process already running, <2GB free VRAM, <10GB disk, or checkpoint missing |
+| **OOM: "it fit" fallacy** | Smoke test MUST use exact real-run flags (incl. `--init-from`); fresh-init measure runs are NOT representative of warm-start |
+| **Secret in repo (HF token)** | Pre-commit hook `scripts/scan_secrets.sh` (installed at `.git/hooks/pre-commit`) blocks token patterns; GitHub push protection as backstop; tokens live in `~/.huggingface/token` (chmod 600) or env vars |
+| **Silent death** | Watchdog writes `/tmp/pretrain_restarted.flag`; 30-min cron reports 🔴 DOWN + crash reason |
+
+**Golden rule:** keep ≥1GB VRAM headroom. "It fits" at 100MB margin is luck, not stability.
+
+---
+
 ## Summary
 
 - **Tokens ready:** ~78 GB across 5 domains (math, web, code, synth, reformat), tiered easy/medium/hard
