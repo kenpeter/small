@@ -304,6 +304,17 @@ def test_compile_oom_fallback():
     print("  PASS: compile OOM fallback unwraps to eager model")
 
 
+def test_ce_chunk_512_for_vram_safety():
+    """CE_CHUNK must stay 512 — the 2048 full-seq slice's fp32 transient
+    (2047×49152×4 = 805MB) OOM'd the 12GB card at step ~570 on allocator
+    fragmentation (measured twice 2026-08-05). 512 = 201MB transient."""
+    import pretrain_gpu
+    assert pretrain_gpu.CE_CHUNK == 512, (
+        f"{_test_name()}: CE_CHUNK={pretrain_gpu.CE_CHUNK}, want 512"
+    )
+    print("  PASS: CE_CHUNK=512 keeps the fp32 transient at 201MB")
+
+
 # =============================================================================
 # 3. Checkpoint Saving
 # =============================================================================
@@ -1063,6 +1074,7 @@ TESTS = [
     test_warmup_default_400,
     test_liger_replaces_modules,
     test_compile_oom_fallback,
+    test_ce_chunk_512_for_vram_safety,
     test_checkpoint_rejects_nan,
     test_checkpoint_rejects_inf,
     test_checkpoint_saves_clean_state,

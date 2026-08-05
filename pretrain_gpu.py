@@ -8,8 +8,8 @@ CPU thread, ~2.3K tok/s). Model + AdamW moments live on GPU in bf16
 activations with gradient checkpointing). Effective batch: 2 × accum 16
 × seq 2048 = 65K tokens/step.
 
-Loss is computed with chunked fp32 cross-entropy (2048-token slices = one
-pass) to avoid HF's full-logits fp32 spike — peak GPU 10.2GB, under 11.59GB.
+Loss is computed with chunked fp32 cross-entropy (512-token slices) to
+avoid HF's full-logits fp32 spike — peak GPU ~10.3GB, under 11.59GB.
 
 Speed features: fused AdamW, flash SDPA (no mask), GPU loss accumulation,
 async checkpoints, optional Liger fused kernels (--liger) and torch.compile
@@ -42,7 +42,10 @@ logger = logging.getLogger("pretrain_gpu")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
 SEQ_LEN = 2048
-CE_CHUNK = 2048          # #3: one fp32 CE slice over the whole sequence
+CE_CHUNK = 512           # fp32 CE slice size. NOT 2048: the full-seq slice's
+                         # fp32 transient (2047×49152×4 = 805MB) OOMs the 12GB
+                         # card on allocator fragmentation (measured 2026-08-05,
+                         # step ~570, twice). 512 keeps the transient at 201MB.
 WARMUP_DEFAULT = 400     # #4: 1000-step re-warmup wastes ~2h on warm-starts
 OUTPUT_DIR = Path("/home/kenpeter/work/checkpoints")
 LATEST = OUTPUT_DIR / "megatrain_latest.pt"
@@ -54,8 +57,8 @@ def chunked_ce(logits, labels, chunk_size=CE_CHUNK):
 
     Identical math to one big call (sum of parts = whole), but the fp32
     logits conversion peaks at chunk_size×V×4 bytes instead of S×V×4
-    (~805MB) — keeps the run under the 11.59GB ceiling. #3 raised the slice
-    from 512 to the whole sequence now that flash + no-mask freed headroom.
+    (~805MB) — keeps the run under the 11.59GB ceiling. CE_CHUNK=512 is the
+    proven-safe size (2048's 805MB transient OOMs on fragmentation).
     """
     B, S, V = logits.shape
     shift_logits = logits[:, :-1, :].contiguous()
