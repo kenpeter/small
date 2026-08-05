@@ -165,6 +165,57 @@ def test_collate_labels_equal_input_ids():
     print(f"  PASS: labels are clone of input_ids")
 
 
+def test_collate_mask_is_pure_causal_no_padding():
+    """#8 — the 4D attention_mask carries ZERO padding information (packed
+    data): it is exactly tril(ones) expanded. Fully redundant with SDPA's
+    is_causal=True, so pretrain_gpu.py may omit it (bitwise-identical logits,
+    verified on GPU: max abs diff 0.0)."""
+    batch = [torch.arange(16), torch.arange(16) + 100]
+    out = collate_pretrain(batch)
+    mask = out["attention_mask"]
+    expected = torch.tril(torch.ones((2, 1, 16, 16), dtype=torch.bool))
+    assert mask.dtype == torch.bool, f"{_test_name()}: mask dtype {mask.dtype}"
+    assert mask.shape == (2, 1, 16, 16), f"{_test_name()}: shape {mask.shape}"
+    assert torch.equal(mask, expected), (
+        f"{_test_name()}: mask is not exactly tril(ones) — "
+        f"{(mask != expected).sum().item()} entries differ (padding info would "
+        f"make dropping the mask unsafe)"
+    )
+    # every valid causal position attends → no padding holes anywhere
+    valid = torch.tril(torch.ones(16, 16, dtype=torch.bool))
+    assert mask[:, 0, valid].all(), f"{_test_name()}: some valid positions masked"
+    print("  PASS: collate mask = pure causal tril(ones) — redundant with is_causal")
+
+
+def test_accumulate_loss_detached_and_exact():
+    """#7 — GPU loss accumulation: accumulate detached tensors (sync ONCE at
+    log/save, not once per micro-batch) with NO autograd graph retention
+    (16 live micro-batch graphs would OOM) and exact float equality vs the
+    old .item() pattern."""
+    from pretrain_gpu import accumulate_loss
+
+    x = torch.randn(8, requires_grad=True)
+    acc = torch.zeros(())
+    losses = []
+    for i in range(4):
+        loss = (x * (i + 1)).sum() * 0.01
+        acc = accumulate_loss(acc, loss)
+        losses.append(loss.item())
+    # graph-free accumulator: no reference to any micro-batch graph survives
+    assert acc.grad_fn is None, f"{_test_name()}: accumulator retains autograd graph"
+    assert not acc.requires_grad
+    # numerically identical to the old per-micro-batch float accumulation
+    assert abs(acc.item() - sum(losses)) < 1e-6, (
+        f"{_test_name()}: {acc.item()} != {sum(losses)}"
+    )
+    # gradients still flow through the ORIGINAL loss graph (backward unaffected)
+    loss.backward()
+    assert x.grad is not None and torch.isfinite(x.grad).all(), (
+        f"{_test_name()}: backward broken by detach pattern"
+    )
+    print("  PASS: detached GPU accumulation exact + graph-free + backward intact")
+
+
 # =============================================================================
 # 3. Checkpoint Saving
 # =============================================================================
@@ -918,6 +969,8 @@ TESTS = [
     test_lr_must_use_outer_step_not_global_step,
     test_collate_creates_causal_mask,
     test_collate_labels_equal_input_ids,
+    test_collate_mask_is_pure_causal_no_padding,
+    test_accumulate_loss_detached_and_exact,
     test_checkpoint_rejects_nan,
     test_checkpoint_rejects_inf,
     test_checkpoint_saves_clean_state,

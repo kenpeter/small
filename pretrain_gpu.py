@@ -98,6 +98,18 @@ def build_dataloader(ds, batch_size, num_workers=2):
                       prefetch_factor=2)
 
 
+def accumulate_loss(acc, loss):
+    """GPU-friendly loss accumulator.
+
+    Old pattern: acc += loss.item() — one GPU→CPU sync per micro-batch (16 per
+    step on the 1B run), each draining the async pipeline. New pattern: accumulate
+    the detached GPU tensor and sync ONCE at log/save time. .detach() is critical —
+    without it acc would retain the autograd graph of every micro-batch (16 graphs
+    alive at once → OOM).
+    """
+    return acc + loss.detach()
+
+
 _save_lock = threading.Lock()
 
 
@@ -191,7 +203,7 @@ def main():
     logger.info("Starting pure-GPU pretraining from scratch (bf16 AdamW, grad checkpointing)...")
     best_loss = float("inf")
     global_step = 0
-    running = 0.0
+    running = torch.zeros((), device=device)
     t0 = time.time()
     last_save_time = time.time()
 
@@ -210,7 +222,7 @@ def main():
         for g in optimizer.param_groups:
             g["lr"] = lr
 
-        acc_loss = 0.0
+        acc_loss = torch.zeros((), device=device, dtype=torch.float32)
         for _ in range(args.grad_accum):
             try:
                 batch = next(data_iter)
@@ -218,10 +230,12 @@ def main():
                 data_iter = iter(dl)
                 batch = next(data_iter)
             input_ids = batch["input_ids"].to(device, non_blocking=True)
-            attn = batch["attention_mask"].to(device, non_blocking=True)
             labels = batch["labels"].to(device, non_blocking=True)
 
-            out = model(input_ids=input_ids, attention_mask=attn)
+            # No attention_mask: collate's 4D mask is a pure causal tril(ones)
+            # (packed data, zero padding) — bitwise-identical to SDPA's is_causal,
+            # so shipping + processing the 8MB mask every micro-batch is pure waste.
+            out = model(input_ids=input_ids)
             logits = out.logits  # bf16 [B, S, V] — no labels → HF skips its fp32 loss
             # Chunked fp32 cross-entropy: identical math to HF's loss, but the
             # fp32 logits conversion happens in 512-token slices (~100MB) instead
@@ -240,7 +254,7 @@ def main():
                 )
                 loss = ce if loss is None else loss + ce
             loss = loss / n_tok / args.grad_accum
-            acc_loss += loss.item()
+            acc_loss = accumulate_loss(acc_loss, loss)
             loss.backward()
 
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -252,8 +266,8 @@ def main():
         if (step + 1) % args.log_interval == 0:
             dt = time.time() - t0
             t0 = time.time()
-            avg = running / args.log_interval
-            running = 0.0
+            avg = (running / args.log_interval).item()
+            running = torch.zeros((), device=device)
             tps = args.batch_size * args.max_seq_len * args.grad_accum * args.log_interval / dt
             mem = torch.cuda.max_memory_allocated(device) / 1024**3
             logger.info(
@@ -263,12 +277,13 @@ def main():
 
         if should_save_checkpoint(step + 1, args.save_interval, last_save_time,
                                   time.time(), args.save_every_minutes) or step + 1 == args.num_steps:
-            is_best = acc_loss < best_loss
+            acc_loss_f = acc_loss.item()  # ONE sync per save, not 16 per step
+            is_best = acc_loss_f < best_loss
             if is_best:
-                best_loss = acc_loss
+                best_loss = acc_loss_f
             state = {
                 "step": step + 1,
-                "loss": acc_loss,
+                "loss": acc_loss_f,
                 "best_loss": best_loss,
                 "model_state_dict": model.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
