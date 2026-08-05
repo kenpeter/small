@@ -8,8 +8,12 @@ CPU thread, ~2.3K tok/s). Model + AdamW moments live on GPU in bf16
 activations with gradient checkpointing). Effective batch: 2 × accum 16
 × seq 2048 = 65K tokens/step.
 
-Loss is computed with chunked fp32 cross-entropy (512-token slices) to
-avoid HF's full-logits fp32 spike — peak GPU 10.2GB, safely under 11.59GB.
+Loss is computed with chunked fp32 cross-entropy (2048-token slices = one
+pass) to avoid HF's full-logits fp32 spike — peak GPU 10.2GB, under 11.59GB.
+
+Speed features: fused AdamW, flash SDPA (no mask), GPU loss accumulation,
+async checkpoints, optional Liger fused kernels (--liger) and torch.compile
+(--compile, with OOM→eager auto-fallback).
 
 Supports --init-from warm-start (checkpoint loaded on CPU, freed after
 load_state_dict — the OOM fix).
@@ -38,9 +42,77 @@ logger = logging.getLogger("pretrain_gpu")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
 SEQ_LEN = 2048
+CE_CHUNK = 2048          # #3: one fp32 CE slice over the whole sequence
+WARMUP_DEFAULT = 400     # #4: 1000-step re-warmup wastes ~2h on warm-starts
 OUTPUT_DIR = Path("/home/kenpeter/work/checkpoints")
 LATEST = OUTPUT_DIR / "megatrain_latest.pt"
 BEST = OUTPUT_DIR / "megatrain_best.pt"
+
+
+def chunked_ce(logits, labels, chunk_size=CE_CHUNK):
+    """fp32 cross-entropy computed in sequence slices.
+
+    Identical math to one big call (sum of parts = whole), but the fp32
+    logits conversion peaks at chunk_size×V×4 bytes instead of S×V×4
+    (~805MB) — keeps the run under the 11.59GB ceiling. #3 raised the slice
+    from 512 to the whole sequence now that flash + no-mask freed headroom.
+    """
+    B, S, V = logits.shape
+    shift_logits = logits[:, :-1, :].contiguous()
+    shift_labels = labels[:, 1:].contiguous()
+    n_tok = shift_labels.numel()
+    loss = None
+    for i in range(0, S - 1, chunk_size):
+        ce = torch.nn.functional.cross_entropy(
+            shift_logits[:, i : i + chunk_size, :].float().reshape(-1, V),
+            shift_labels[:, i : i + chunk_size].reshape(-1),
+            reduction="sum",
+            ignore_index=-100,
+        )
+        loss = ce if loss is None else loss + ce
+    return loss / n_tok
+
+
+def apply_liger_if_requested(enable: bool):
+    """#2 — swap Llama's RMSNorm/MLP/RoPE for Liger fused Triton kernels.
+
+    MUST run before the model is built (it monkey-patches the transformers
+    module). State-dict key names are unchanged, so --init-from warm-start
+    stays compatible (strict=False). CE replacements are NOT enabled: the
+    training loop computes its own chunked CE.
+    """
+    if not enable:
+        return
+    try:
+        from liger_kernel.transformers import apply_liger_kernel_to_llama
+    except ImportError:
+        logger.warning("liger-kernel not installed — continuing with vanilla ops")
+        return
+    apply_liger_kernel_to_llama(
+        rope=True, rms_norm=True, swiglu=True,
+        cross_entropy=False, fused_linear_cross_entropy=False,
+    )
+    logger.info("⚡ Liger fused kernels ON (RMSNorm/SwiGLU/RoPE → Triton)")
+
+
+def _unwrap_compiled(model):
+    """Return the underlying eager module if model is torch.compile-wrapped
+    (compile stores the original as _orig_mod)."""
+    return getattr(model, "_orig_mod", model)
+
+
+def _compile_warmup(model, dl, device):
+    """One real-shape forward+backward to trigger inductor JIT (both graphs),
+    so any OOM during compilation surfaces here — where main() can fall back
+    to eager — instead of mid-training."""
+    data_iter = iter(dl)
+    batch = next(data_iter)
+    input_ids = batch["input_ids"].to(device, non_blocking=True)
+    labels = batch["labels"].to(device, non_blocking=True)
+    out = model(input_ids=input_ids)
+    loss = chunked_ce(out.logits, labels)
+    loss.backward()
+    model.zero_grad(set_to_none=True)
 
 
 def build_model(dtype: torch.dtype) -> torch.nn.Module:
@@ -156,7 +228,7 @@ def main():
                         help="Also save every N wall-clock minutes (0 = step-based only). "
                              "Keeps worst-case loss window small regardless of step speed.")
     parser.add_argument("--lr", type=float, default=3e-4)
-    parser.add_argument("--warmup-steps", type=int, default=1000)
+    parser.add_argument("--warmup-steps", type=int, default=WARMUP_DEFAULT)
     parser.add_argument("--min-lr", type=float, default=1e-6)
     parser.add_argument("--init-from", type=str, default=None,
                         help="Optional checkpoint .pt to load MODEL WEIGHTS from "
@@ -166,12 +238,17 @@ def main():
                              "get_curriculum_ratios). Default: flat farm.")
     parser.add_argument("--compile", action="store_true",
                         help="Wrap model in torch.compile (fused kernels — first steps "
-                             "slower due to JIT warmup, then faster).")
+                             "slower due to JIT warmup, then faster). Falls back to "
+                             "eager automatically if JIT warmup OOMs.")
+    parser.add_argument("--liger", action="store_true",
+                        help="Swap RMSNorm/SwiGLU/RoPE for Liger fused Triton kernels "
+                             "before building the model.")
     args = parser.parse_args()
 
     torch.manual_seed(42)
     device = "cuda"
 
+    apply_liger_if_requested(args.liger)  # #2 — must precede model build
     model = build_model(torch.bfloat16).to(device)
     if args.init_from and os.path.exists(args.init_from):
         ckpt = torch.load(args.init_from, map_location="cpu", weights_only=False)
@@ -199,6 +276,18 @@ def main():
         ds = FlatFarmDataset(FARM_DIR, seq_len=args.max_seq_len, val_frac=0.01, is_val=False)
     dl = build_dataloader(ds, args.batch_size)
     data_iter = iter(dl)
+
+    if args.compile:
+        # #1 — surface any compile-time OOM here, then fall back to eager.
+        try:
+            _compile_warmup(model, dl, device)
+            logger.info("⚡ torch.compile JIT warmup OK — training compiled")
+        except torch.cuda.OutOfMemoryError:
+            logger.warning("⚡ torch.compile OOM during JIT warmup — falling back to eager")
+            model = _unwrap_compiled(model)
+            torch.cuda.empty_cache()
+            args.compile = False
+        data_iter = iter(dl)
 
     logger.info("Starting pure-GPU pretraining from scratch (bf16 AdamW, grad checkpointing)...")
     best_loss = float("inf")
@@ -237,23 +326,7 @@ def main():
             # so shipping + processing the 8MB mask every micro-batch is pure waste.
             out = model(input_ids=input_ids)
             logits = out.logits  # bf16 [B, S, V] — no labels → HF skips its fp32 loss
-            # Chunked fp32 cross-entropy: identical math to HF's loss, but the
-            # fp32 logits conversion happens in 512-token slices (~100MB) instead
-            # of one 768MB block — keeps the run safely under the 11.59GB ceiling.
-            loss = None
-            B, S, V = logits.shape
-            shift_logits = logits[:, :-1, :].contiguous()
-            shift_labels = labels[:, 1:].contiguous()
-            n_tok = shift_labels.numel()
-            for i in range(0, S - 1, 512):
-                ce = torch.nn.functional.cross_entropy(
-                    shift_logits[:, i : i + 512, :].float().reshape(-1, V),
-                    shift_labels[:, i : i + 512].reshape(-1),
-                    reduction="sum",
-                    ignore_index=-100,
-                )
-                loss = ce if loss is None else loss + ce
-            loss = loss / n_tok / args.grad_accum
+            loss = chunked_ce(logits, labels) / args.grad_accum
             acc_loss = accumulate_loss(acc_loss, loss)
             loss.backward()
 

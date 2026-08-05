@@ -216,6 +216,94 @@ def test_accumulate_loss_detached_and_exact():
     print("  PASS: detached GPU accumulation exact + graph-free + backward intact")
 
 
+def test_chunked_ce_matches_full_ce():
+    """#3 — chunked_ce must be numerically identical to the full (non-chunked)
+    fp32 cross-entropy, regardless of chunk size (512 vs 2048 vs whole)."""
+    from pretrain_gpu import chunked_ce
+    torch.manual_seed(7)
+    logits = torch.randn(2, 64, 4096)          # [B, S, V] fp32
+    labels = torch.randint(0, 4096, (2, 64))
+    labels[:, :5] = -100                        # ignore_index holes
+    full = torch.nn.functional.cross_entropy(
+        logits[:, :-1, :].reshape(-1, 4096), labels[:, 1:].reshape(-1),
+        reduction="sum", ignore_index=-100) / labels[:, 1:].numel()
+    for chunk in (16, 32, 64):                  # 64 = whole seq in one slice
+        got = chunked_ce(logits, labels, chunk_size=chunk)
+        assert abs(got - full) < 1e-5, (
+            f"{_test_name()}: chunk={chunk} -> {got:.8f}, full={full:.8f}"
+        )
+    print(f"  PASS: chunked_ce identical to full CE (chunks 16/32/64)")
+
+
+def test_warmup_default_400():
+    """#4 — CLI default warmup is 400 steps (was 1000): on warm-started runs a
+    1000-step re-warmup wastes ~2h at half-speed LR; 400 is the new default."""
+    import pretrain_gpu
+    assert pretrain_gpu.WARMUP_DEFAULT == 400, (
+        f"{_test_name()}: WARMUP_DEFAULT={pretrain_gpu.WARMUP_DEFAULT}, want 400"
+    )
+    # sanity: get_lr with the new default reaches base_lr exactly at step 400
+    lr = get_lr(400, 400, 15000, 3e-4)
+    assert abs(lr - 3e-4) < 1e-8, f"{_test_name()}: LR at warmup end = {lr}"
+    print("  PASS: warmup default 400, LR reaches base exactly at step 400")
+
+
+def test_liger_replaces_modules():
+    """#2 — apply_liger_if_requested(True) must swap Llama's RMSNorm/MLP/RoPE
+    for Liger fused kernels (Triton) BEFORE model build; state-dict key names
+    are unchanged (strict=False warm-start stays compatible). Restores the
+    original transformers classes afterwards so later tests are unaffected."""
+    from pretrain_gpu import apply_liger_if_requested
+    import transformers.models.llama.modeling_llama as mll
+    from liger_kernel.transformers.rms_norm import LigerRMSNorm
+    from liger_kernel.transformers.swiglu import LigerSwiGLUMLP
+
+    orig = {n: getattr(mll, n) for n in
+            ("LlamaRMSNorm", "LlamaMLP", "LlamaRotaryEmbedding")}
+    orig_rope_fn = mll.apply_rotary_pos_emb
+    try:
+        apply_liger_if_requested(True)
+        assert mll.LlamaRMSNorm is LigerRMSNorm, "RMSNorm not replaced"
+        assert mll.LlamaMLP is LigerSwiGLUMLP, "MLP not replaced"
+        # v0.8.x patches RoPE as the free function, not the class
+        assert mll.apply_rotary_pos_emb is not orig_rope_fn, "RoPE not replaced"
+
+        from transformers import LlamaConfig, LlamaForCausalLM
+        cfg = LlamaConfig(vocab_size=512, hidden_size=64, intermediate_size=128,
+                          num_hidden_layers=2, num_attention_heads=4,
+                          num_key_value_heads=2, max_position_embeddings=128)
+        m = LlamaForCausalLM(cfg)
+        layer = m.model.layers[0]
+        assert isinstance(layer.input_layernorm, LigerRMSNorm), type(layer.input_layernorm)
+        assert isinstance(layer.mlp, LigerSwiGLUMLP), type(layer.mlp)
+        # key names identical to vanilla Llama (warm-start compat)
+        keys = set(layer.mlp.state_dict().keys())
+        assert keys == {"gate_proj.weight", "up_proj.weight", "down_proj.weight"}, keys
+        print("  PASS: Liger fused RMSNorm/MLP/RoPE applied, keys compatible")
+    finally:
+        for n, cls in orig.items():
+            setattr(mll, n, cls)
+        mll.apply_rotary_pos_emb = orig_rope_fn
+
+
+def test_compile_oom_fallback():
+    """#1 — _unwrap_compiled must return the original module when torch.compile
+    OOMs during JIT warmup, so training can fall back to eager instead of dying."""
+    from pretrain_gpu import _unwrap_compiled
+    import torch.nn as nn
+
+    plain = nn.Linear(4, 4)
+    assert _unwrap_compiled(plain) is plain, "non-compiled model must pass through"
+
+    class StubCompiled:
+        def __init__(self, orig):
+            self._orig_mod = orig
+    orig = nn.Linear(4, 4)
+    wrapped = StubCompiled(orig)
+    assert _unwrap_compiled(wrapped) is orig, "must unwrap _orig_mod"
+    print("  PASS: compile OOM fallback unwraps to eager model")
+
+
 # =============================================================================
 # 3. Checkpoint Saving
 # =============================================================================
@@ -971,6 +1059,10 @@ TESTS = [
     test_collate_labels_equal_input_ids,
     test_collate_mask_is_pure_causal_no_padding,
     test_accumulate_loss_detached_and_exact,
+    test_chunked_ce_matches_full_ce,
+    test_warmup_default_400,
+    test_liger_replaces_modules,
+    test_compile_oom_fallback,
     test_checkpoint_rejects_nan,
     test_checkpoint_rejects_inf,
     test_checkpoint_saves_clean_state,
