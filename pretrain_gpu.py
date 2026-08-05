@@ -107,6 +107,9 @@ def main():
     parser.add_argument("--curriculum", action="store_true",
                         help="Enable G1-G4 curriculum (StratifiedShardDataset + "
                              "get_curriculum_ratios). Default: flat farm.")
+    parser.add_argument("--compile", action="store_true",
+                        help="Wrap model in torch.compile (fused kernels — first steps "
+                             "slower due to JIT warmup, then faster).")
     args = parser.parse_args()
 
     torch.manual_seed(42)
@@ -124,6 +127,9 @@ def main():
         logger.info(f"🔥 Warm-started from {args.init_from} (step {ckpt.get('step', '?')})")
         del ckpt, sd
         torch.cuda.empty_cache()
+    if args.compile:
+        logger.info("⚡ Compiling model with torch.compile (JIT warmup on first steps)...")
+        model = torch.compile(model)
     optimizer = make_optimizer(model, args.lr)
 
     if args.curriculum:

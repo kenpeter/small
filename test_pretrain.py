@@ -243,6 +243,25 @@ def test_save_trigger_either_wins():
     print(f"  PASS: either trigger wins")
 
 
+def test_torch_compile_smoke():
+    """torch.compile must wrap a tiny HF Llama and run a forward pass (CUDA)."""
+    import torch
+    if not torch.cuda.is_available():
+        print("  SKIP: no CUDA available")
+        return
+    from transformers import LlamaConfig, LlamaForCausalLM
+    cfg = LlamaConfig(vocab_size=512, hidden_size=64, intermediate_size=128,
+                      num_hidden_layers=2, num_attention_heads=4,
+                      num_key_value_heads=2, max_position_embeddings=128)
+    m = LlamaForCausalLM(cfg).to("cuda").bfloat16().eval()
+    m = torch.compile(m)
+    x = torch.randint(0, 512, (1, 16)).to("cuda")
+    with torch.no_grad():
+        out = m(input_ids=x).logits
+    assert out.shape == (1, 16, 512), f"unexpected logits shape {out.shape}"
+    print(f"  PASS: torch.compile wraps and runs a tiny model")
+
+
 # =============================================================================
 # 4. CPU Param Validation
 # =============================================================================
@@ -869,6 +888,10 @@ TESTS = [
     test_g3_curriculum_continuity_no_cliffs,
     test_g4_windowed_jit_shuffle_and_ratios,
     test_g1234_together_full_run,
+    test_save_trigger_step_based,
+    test_save_trigger_time_based,
+    test_save_trigger_either_wins,
+    test_torch_compile_smoke,
 ]
 
 if __name__ == "__main__":
