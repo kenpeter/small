@@ -262,6 +262,65 @@ def test_torch_compile_smoke():
     print(f"  PASS: torch.compile wraps and runs a tiny model")
 
 
+def test_optimizer_groups_fused():
+    """make_optimizer must return AdamW with fused=True on every param group."""
+    from pretrain_gpu import make_optimizer
+    import torch.nn as nn
+    m = nn.Sequential(nn.Linear(16, 16), nn.LayerNorm(16))
+    opt = make_optimizer(m, 3e-4)
+    assert len(opt.param_groups) == 3, f"{_test_name()}: expected 3 param groups"
+    assert all(g.get("fused") is True for g in opt.param_groups), (
+        f"{_test_name()}: fused not set on all groups"
+    )
+    print("  PASS: AdamW fused=True on all 3 groups")
+
+
+def test_build_dataloader_workers():
+    """build_dataloader must use worker processes (off-GPU-thread shard reads)."""
+    from pretrain_gpu import build_dataloader
+
+    class TinySeqDs(torch.utils.data.Dataset):
+        def __len__(self):
+            return 64
+
+        def __getitem__(self, i):
+            return torch.arange(8) + i * 100
+
+    dl = build_dataloader(TinySeqDs(), 2)
+    assert dl.num_workers == 2, f"{_test_name()}: num_workers={dl.num_workers}"
+    assert dl.pin_memory is True
+    batch = next(iter(dl))
+    assert batch["input_ids"].shape == (2, 8), f"{_test_name()}: {batch['input_ids'].shape}"
+    print("  PASS: dataloader uses 2 workers + pin_memory, collates fine")
+
+
+def test_async_save_writes_file():
+    """save_checkpoint_async must snapshot to CPU and write a loadable file."""
+    from pretrain_gpu import save_checkpoint_async
+    tmpdir = tempfile.mkdtemp()
+    try:
+        dev = "cuda" if torch.cuda.is_available() else "cpu"
+        state = {
+            "step": 42,
+            "loss": 3.3,
+            "best_loss": 3.3,
+            "model_state_dict": {"w": torch.randn(4, 4, device=dev)},
+            "optimizer_state_dict": {"state": {0: {"exp_avg": torch.randn(4, 4, device=dev)}}},
+            "config": {"foo": 1},
+        }
+        t = save_checkpoint_async(state, False, pmt.logger, output_dir=tmpdir)
+        t.join(timeout=120)
+        assert not t.is_alive(), f"{_test_name()}: saver thread did not finish"
+        ck = torch.load(os.path.join(tmpdir, "megatrain_latest.pt"),
+                        map_location="cpu", weights_only=False)
+        assert ck["step"] == 42
+        assert ck["model_state_dict"]["w"].shape == (4, 4)
+        assert ck["optimizer_state_dict"]["state"][0]["exp_avg"].device.type == "cpu"
+    finally:
+        shutil.rmtree(tmpdir)
+    print("  PASS: async checkpoint written + loadable (CPU snapshot)")
+
+
 # =============================================================================
 # 4. CPU Param Validation
 # =============================================================================
@@ -892,6 +951,9 @@ TESTS = [
     test_save_trigger_time_based,
     test_save_trigger_either_wins,
     test_torch_compile_smoke,
+    test_optimizer_groups_fused,
+    test_build_dataloader_workers,
+    test_async_save_writes_file,
 ]
 
 if __name__ == "__main__":

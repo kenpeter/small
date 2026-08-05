@@ -14,7 +14,7 @@ avoid HF's full-logits fp32 spike — peak GPU 10.2GB, safely under 11.59GB.
 Supports --init-from warm-start (checkpoint loaded on CPU, freed after
 load_state_dict — the OOM fix).
 """
-import argparse, logging, os, time
+import argparse, logging, os, threading, time
 from pathlib import Path
 import numpy as np
 import torch
@@ -80,11 +80,56 @@ def make_optimizer(model, base_lr: float):
     geh = [p for p in params if p.ndim >= 2 and p.numel() == vocab_embed_numel]
     gsc = [p for p in params if p.ndim < 2]
     groups = [
-        dict(params=g2d, lr=base_lr, betas=(0.9, 0.95), eps=1e-8, weight_decay=0.1),
-        dict(params=geh, lr=base_lr, betas=(0.9, 0.95), eps=1e-8, weight_decay=0.1),
-        dict(params=gsc, lr=base_lr, betas=(0.9, 0.95), eps=1e-8, weight_decay=0.0),
+        dict(params=g2d, lr=base_lr, betas=(0.9, 0.95), eps=1e-8, weight_decay=0.1, fused=True),
+        dict(params=geh, lr=base_lr, betas=(0.9, 0.95), eps=1e-8, weight_decay=0.1, fused=True),
+        dict(params=gsc, lr=base_lr, betas=(0.9, 0.95), eps=1e-8, weight_decay=0.0, fused=True),
     ]
     return torch.optim.AdamW(groups)
+
+
+def build_dataloader(ds, batch_size, num_workers=2):
+    """DataLoader with worker processes so shard reads run off the GPU thread.
+
+    persistent_workers stays False (default): workers are forked fresh on each
+    iter(dl), so a curriculum rebuild (ds._build_stratified_order) is picked up.
+    """
+    return DataLoader(ds, batch_size=batch_size, collate_fn=collate_pretrain,
+                      shuffle=False, num_workers=num_workers, pin_memory=True,
+                      prefetch_factor=2)
+
+
+_save_lock = threading.Lock()
+
+
+def _to_cpu_deep(obj):
+    """Deep-copy nested state (tensors → CPU) so a background saver thread can
+    write the file without racing the training loop mutating GPU weights."""
+    if isinstance(obj, torch.Tensor):
+        return obj.detach().to("cpu")
+    if isinstance(obj, dict):
+        return {k: _to_cpu_deep(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return type(obj)(_to_cpu_deep(v) for v in obj)
+    return obj
+
+
+def save_checkpoint_async(state, is_best, logger, output_dir=None):
+    """Snapshot state to CPU on the calling thread, then write the ~6.2GB file
+    on a background thread so training doesn't stall on disk I/O.
+
+    Returns the thread (join it in tests). Serialized via save_checkpoint_robust
+    (NaN guard + atomic tmp→rename), so a torn write never corrupts latest.pt.
+    """
+    output_dir = output_dir or OUTPUT_DIR
+    cpu_state = _to_cpu_deep(state)
+
+    def _writer():
+        with _save_lock:
+            save_checkpoint_robust(cpu_state, output_dir, is_best, logger)
+
+    t = threading.Thread(target=_writer, daemon=True, name="ckpt-saver")
+    t.start()
+    return t
 
 
 def main():
@@ -140,8 +185,7 @@ def main():
     else:
         logger.info(f"Flat farm: {FARM_DIR}")
         ds = FlatFarmDataset(FARM_DIR, seq_len=args.max_seq_len, val_frac=0.01, is_val=False)
-    dl = DataLoader(ds, batch_size=args.batch_size, collate_fn=collate_pretrain,
-                    shuffle=False, num_workers=0, pin_memory=True)
+    dl = build_dataloader(ds, args.batch_size)
     data_iter = iter(dl)
 
     logger.info("Starting pure-GPU pretraining from scratch (bf16 AdamW, grad checkpointing)...")
@@ -230,7 +274,7 @@ def main():
                 "optimizer_state_dict": optimizer.state_dict(),
                 "config": args.__dict__,
             }
-            save_checkpoint_robust(state, OUTPUT_DIR, is_best, logger)
+            save_checkpoint_async(state, is_best, logger)
             last_save_time = time.time()
 
     logger.info("✅ Pure-GPU pretraining complete!")
