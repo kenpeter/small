@@ -115,6 +115,30 @@ def _compile_warmup(model, dl, device):
     model.zero_grad(set_to_none=True)
 
 
+def run_microbatches(model, data_iter, dl, device, args):
+    """One gradient-accumulation window (16 micro-batches). Returns the GPU
+    loss accumulator and the (possibly refreshed) data iterator."""
+    acc_loss = torch.zeros((), device=device, dtype=torch.float32)
+    for _ in range(args.grad_accum):
+        try:
+            batch = next(data_iter)
+        except StopIteration:
+            data_iter = iter(dl)
+            batch = next(data_iter)
+        input_ids = batch["input_ids"].to(device, non_blocking=True)
+        labels = batch["labels"].to(device, non_blocking=True)
+
+        # No attention_mask: collate's 4D mask is a pure causal tril(ones)
+        # (packed data, zero padding) — bitwise-identical to SDPA's is_causal,
+        # so shipping + processing the 8MB mask every micro-batch is pure waste.
+        out = model(input_ids=input_ids)
+        logits = out.logits  # bf16 [B, S, V] — no labels → HF skips its fp32 loss
+        loss = chunked_ce(logits, labels) / args.grad_accum
+        acc_loss = accumulate_loss(acc_loss, loss)
+        loss.backward()
+    return acc_loss, data_iter
+
+
 def build_model(dtype: torch.dtype) -> torch.nn.Module:
     hf_config = LlamaConfig(
         vocab_size=49152,
@@ -312,23 +336,20 @@ def main():
             g["lr"] = lr
 
         acc_loss = torch.zeros((), device=device, dtype=torch.float32)
-        for _ in range(args.grad_accum):
-            try:
-                batch = next(data_iter)
-            except StopIteration:
-                data_iter = iter(dl)
-                batch = next(data_iter)
-            input_ids = batch["input_ids"].to(device, non_blocking=True)
-            labels = batch["labels"].to(device, non_blocking=True)
-
-            # No attention_mask: collate's 4D mask is a pure causal tril(ones)
-            # (packed data, zero padding) — bitwise-identical to SDPA's is_causal,
-            # so shipping + processing the 8MB mask every micro-batch is pure waste.
-            out = model(input_ids=input_ids)
-            logits = out.logits  # bf16 [B, S, V] — no labels → HF skips its fp32 loss
-            loss = chunked_ce(logits, labels) / args.grad_accum
-            acc_loss = accumulate_loss(acc_loss, loss)
-            loss.backward()
+        try:
+            acc_loss, data_iter = run_microbatches(model, data_iter, dl, device, args)
+        except torch.OutOfMemoryError:
+            # #1 safety net: compiled mode can OOM mid-step even when the JIT
+            # warmup passed (graph capture holds intermediates → ~11.5GB peak).
+            # Drop compile once and retry the step eagerly.
+            if not args.compile:
+                raise
+            logger.warning("⚡ OOM in step — dropping torch.compile, retrying step eagerly")
+            model = _unwrap_compiled(model)
+            torch.cuda.empty_cache()
+            args.compile = False
+            optimizer.zero_grad(set_to_none=True)
+            acc_loss, data_iter = run_microbatches(model, data_iter, dl, device, args)
 
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()

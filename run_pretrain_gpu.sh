@@ -44,6 +44,5 @@ exec python3 pretrain_gpu.py \
   --lr 3e-4 \
   --curriculum \
   --liger \
-  --compile \
   --init-from /home/kenpeter/work/checkpoints/megatrain_latest.pt \
   >> /home/kenpeter/work/train_small.log 2>&1
