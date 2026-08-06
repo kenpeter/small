@@ -471,6 +471,107 @@ def test_async_save_writes_file():
     print("  PASS: async checkpoint written + loadable (CPU snapshot)")
 
 
+def test_resume_restores_full_state():
+    """apply_resume must restore model weights, optimizer state, step and best_loss.
+
+    Guard: a weights-only warm start would restart the LR schedule and set
+    best_loss=inf, making the first save clobber best.pt with a worse loss.
+    """
+    from pretrain_gpu import apply_resume
+    import torch.nn as nn
+
+    m = nn.Linear(8, 8)
+    opt = torch.optim.AdamW(m.parameters(), lr=3e-4)
+    opt.zero_grad()
+    m(torch.randn(2, 8)).sum().backward()
+    opt.step()  # populate exp_avg / exp_avg_sq state
+    opt_sd_before = opt.state_dict()["state"]
+
+    ckpt = {
+        "step": 4896,
+        "loss": 2.39,
+        "best_loss": 2.056,
+        "model_state_dict": m.state_dict(),
+        "optimizer_state_dict": opt.state_dict(),
+        "config": {"num_steps": 15000},
+    }
+    tmpdir = tempfile.mkdtemp()
+    try:
+        path = os.path.join(tmpdir, "resume.pt")
+        torch.save(ckpt, path)
+
+        m2 = nn.Linear(8, 8)
+        opt2 = torch.optim.AdamW(m2.parameters(), lr=3e-4)
+        start_step, best_loss = apply_resume(path, m2, opt2, pmt.logger)
+        assert start_step == 4896, f"{_test_name()}: start_step={start_step}"
+        assert best_loss == 2.056, f"{_test_name()}: best_loss={best_loss}"
+        # model weights actually restored
+        for (k1, v1), (k2, v2) in zip(m.state_dict().items(), m2.state_dict().items()):
+            assert torch.equal(v1, v2), f"{_test_name()}: weight {k1} not restored"
+        # optimizer moments actually restored (not a fresh AdamW)
+        opt2_sd = opt2.state_dict()["state"]
+        assert set(opt_sd_before.keys()) == set(opt2_sd.keys()), (
+            f"{_test_name()}: optimizer state keys differ"
+        )
+        for k in opt_sd_before:
+            for key in ("exp_avg", "exp_avg_sq"):
+                assert torch.equal(opt_sd_before[k][key], opt2_sd[k][key]), (
+                    f"{_test_name()}: optimizer {key}[{k}] not restored"
+                )
+    finally:
+        shutil.rmtree(tmpdir)
+    print("  PASS: resume restores weights + optimizer + step + best_loss")
+
+
+def test_resume_missing_optimizer_falls_back_gracefully():
+    """apply_resume must not crash when the checkpoint lacks optimizer state."""
+    from pretrain_gpu import apply_resume
+    import torch.nn as nn
+
+    m = nn.Linear(4, 4)
+    ckpt = {"step": 100, "loss": 2.0, "best_loss": 1.9, "model_state_dict": m.state_dict()}
+    tmpdir = tempfile.mkdtemp()
+    try:
+        path = os.path.join(tmpdir, "noopt.pt")
+        torch.save(ckpt, path)
+        m2 = nn.Linear(4, 4)
+        opt2 = torch.optim.AdamW(m2.parameters(), lr=3e-4)
+        start_step, best_loss = apply_resume(path, m2, opt2, pmt.logger)
+        assert start_step == 100
+        assert best_loss == 1.9
+        # optimizer must still be usable (fresh state, no exception)
+        opt2.zero_grad()
+        m2(torch.randn(2, 4)).sum().backward()
+        opt2.step()
+    finally:
+        shutil.rmtree(tmpdir)
+    print("  PASS: resume without optimizer state falls back to fresh optimizer")
+
+
+def test_resume_keeps_best_pt_until_better_loss():
+    """After resume, is_best must compare against the checkpoint's best_loss
+    (not inf), so best.pt is only overwritten by a genuinely better loss."""
+    from pretrain_gpu import apply_resume
+    import torch.nn as nn
+
+    m = nn.Linear(4, 4)
+    ckpt = {"step": 10, "loss": 2.5, "best_loss": 2.056, "model_state_dict": m.state_dict()}
+    tmpdir = tempfile.mkdtemp()
+    try:
+        path = os.path.join(tmpdir, "best.pt")
+        torch.save(ckpt, path)
+        m2 = nn.Linear(4, 4)
+        opt2 = torch.optim.AdamW(m2.parameters(), lr=3e-4)
+        _, best_loss = apply_resume(path, m2, opt2, pmt.logger)
+        worse = 2.4   # worse than 2.056
+        better = 1.9  # better than 2.056
+        assert not (worse < best_loss), f"{_test_name()}: worse loss flagged as best"
+        assert better < best_loss, f"{_test_name()}: better loss not flagged as best"
+    finally:
+        shutil.rmtree(tmpdir)
+    print("  PASS: best.pt protected until loss genuinely beats 2.056")
+
+
 # =============================================================================
 # 4. CPU Param Validation
 # =============================================================================

@@ -16,7 +16,9 @@ async checkpoints, optional Liger fused kernels (--liger) and torch.compile
 (--compile, with OOM→eager auto-fallback).
 
 Supports --init-from warm-start (checkpoint loaded on CPU, freed after
-load_state_dict — the OOM fix).
+load_state_dict — the OOM fix) and --resume-from true-resume (model +
+optimizer + step + best_loss restored, so the LR/curriculum schedule
+continues and best.pt is never clobbered by a fresh best_loss=inf).
 """
 import argparse, logging, os, threading, time
 from pathlib import Path
@@ -243,6 +245,35 @@ def save_checkpoint_async(state, is_best, logger, output_dir=None):
     return t
 
 
+def apply_resume(ckpt_path, model, optimizer, logger):
+    """True resume: restore model weights + optimizer state + step + best_loss.
+
+    Returns (start_step, best_loss). Unlike --init-from (weights-only warm
+    start), this continues the LR schedule, curriculum phase, and best-loss
+    guard from where the run left off — a fresh best_loss=inf would make the
+    first save unconditionally overwrite best.pt with a worse loss.
+    """
+    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    sd = ckpt["model_state_dict"]
+    missing, unexpected = model.load_state_dict(sd, strict=False)
+    if missing:
+        logger.warning(f"resume: missing keys ({len(missing)}): {missing[:5]}")
+    if unexpected:
+        logger.warning(f"resume: unexpected keys ({len(unexpected)}): {unexpected[:5]}")
+    if "optimizer_state_dict" in ckpt:
+        try:
+            optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+            logger.info("resume: optimizer state restored")
+        except (RuntimeError, ValueError) as e:
+            logger.warning(f"resume: optimizer state mismatch ({e}) — fresh optimizer")
+    start_step = ckpt.get("step", 0)
+    best_loss = ckpt.get("best_loss", float("inf"))
+    logger.info(f"🔁 Resumed from {ckpt_path} (step {start_step}, best_loss {best_loss:.4f})")
+    del ckpt, sd
+    torch.cuda.empty_cache()
+    return start_step, best_loss
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--batch-size", type=int, default=2)
@@ -260,6 +291,11 @@ def main():
     parser.add_argument("--init-from", type=str, default=None,
                         help="Optional checkpoint .pt to load MODEL WEIGHTS from "
                              "(warm start; optimizer starts fresh — bf16 family)")
+    parser.add_argument("--resume-from", type=str, default=None,
+                        help="Checkpoint .pt to FULLY resume from: model weights + "
+                             "optimizer state + step + best_loss. LR schedule and "
+                             "curriculum continue where they left off (unlike "
+                             "--init-from, which restarts the schedule at step 0).")
     parser.add_argument("--curriculum", action="store_true",
                         help="Enable G1-G4 curriculum (StratifiedShardDataset + "
                              "get_curriculum_ratios). Default: flat farm.")
@@ -277,7 +313,12 @@ def main():
 
     apply_liger_if_requested(args.liger)  # #2 — must precede model build
     model = build_model(torch.bfloat16).to(device)
-    if args.init_from and os.path.exists(args.init_from):
+    optimizer = make_optimizer(model, args.lr)
+    start_step = 0
+    best_loss = float("inf")
+    if args.resume_from and os.path.exists(args.resume_from):
+        start_step, best_loss = apply_resume(args.resume_from, model, optimizer, logger)
+    elif args.init_from and os.path.exists(args.init_from):
         ckpt = torch.load(args.init_from, map_location="cpu", weights_only=False)
         sd = ckpt["model_state_dict"]
         missing, unexpected = model.load_state_dict(sd, strict=False)
@@ -291,10 +332,9 @@ def main():
     if args.compile:
         logger.info("⚡ Compiling model with torch.compile (JIT warmup on first steps)...")
         model = torch.compile(model)
-    optimizer = make_optimizer(model, args.lr)
 
     if args.curriculum:
-        ratios0 = get_curriculum_ratios(0, args.num_steps)
+        ratios0 = get_curriculum_ratios(start_step, args.num_steps)
         logger.info(f"📚 G1-G4 curriculum ON — start ratios: {ratios0}")
         ds = StratifiedShardDataset(SHARD_DIRS, seq_len=args.max_seq_len,
                                     ratios=ratios0, dedup=False)
@@ -316,14 +356,14 @@ def main():
             args.compile = False
         data_iter = iter(dl)
 
-    logger.info("Starting pure-GPU pretraining from scratch (bf16 AdamW, grad checkpointing)...")
-    best_loss = float("inf")
-    global_step = 0
+    logger.info(f"Starting pure-GPU pretraining (bf16 AdamW, grad checkpointing)"
+                f"{' from scratch' if start_step == 0 else f' — resuming at step {start_step}'}...")
+    global_step = start_step
     running = torch.zeros((), device=device)
     t0 = time.time()
     last_save_time = time.time()
 
-    for step in range(args.num_steps):
+    for step in range(start_step, args.num_steps):
         # ── G1-G4 curriculum: rebuild tier ratios every CURRICULUM_UPDATE_INTERVAL ──
         # G1+G3: smooth easy→hard weights at t=step/total (no cliffs)
         # G2: cosine easy-review boost + renormalize (inside get_curriculum_ratios)
