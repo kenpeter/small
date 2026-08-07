@@ -36,7 +36,7 @@ echo ""
 exec python3 pretrain_gpu.py \
   --batch-size 2 \
   --grad-accum 16 \
-  --num-steps 15000 \
+  --num-steps 30000 \
   --log-interval 400 \
   --save-interval 1000 \
   --save-every-minutes 20 \
@@ -44,5 +44,5 @@ exec python3 pretrain_gpu.py \
   --lr 3e-4 \
   --curriculum \
   --liger \
-  --init-from /home/kenpeter/work/checkpoints/megatrain_latest.pt \
+  --resume-from /home/kenpeter/work/checkpoints/megatrain_latest.pt \
   >> /home/kenpeter/work/train_small.log 2>&1
