@@ -37,7 +37,7 @@ exec python3 pretrain_gpu.py \
   --batch-size 2 \
   --grad-accum 16 \
   --num-steps 30000 \
-  --log-interval 400 \
+  --log-interval 100 \
   --save-interval 1000 \
   --save-every-minutes 20 \
   --warmup-steps 400 \
