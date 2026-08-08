@@ -20,7 +20,7 @@ load_state_dict — the OOM fix) and --resume-from true-resume (model +
 optimizer + step + best_loss restored, so the LR/curriculum schedule
 continues and best.pt is never clobbered by a fresh best_loss=inf).
 """
-import argparse, logging, os, threading, time
+import argparse, logging, math, os, threading, time
 from pathlib import Path
 import numpy as np
 import torch
@@ -174,7 +174,67 @@ def build_model(dtype: torch.dtype) -> torch.nn.Module:
     return model
 
 
-def make_optimizer(model, base_lr: float):
+class CautiousAdamW(torch.optim.Optimizer):
+    """AdamW + cautious mask (arXiv:2411.16085, 'Cautious Optimizers').
+
+    Drop-in replacement for torch.optim.AdamW with IDENTICAL optimizer state
+    layout ({'step','exp_avg','exp_avg_sq'} per param) — a checkpoint saved by
+    plain AdamW resumes losslessly: m/v are kept, only the step function
+    changes. The mask is stateless: an update is applied only where it agrees
+    with the gradient's sign (update*g > 0), killing overshoot/oscillation.
+    Weight decay is applied unmasked (per the paper).
+
+    Intentionally NOT fused: the mask needs both grad and update, which a stock
+    fused kernel can't expose. Cost: ~+5-10% optimizer step time.
+    """
+    def __init__(self, params, lr=3e-4, betas=(0.9, 0.95), eps=1e-8, weight_decay=0.1):
+        defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay)
+        super().__init__(params, defaults)
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+        for group in self.param_groups:
+            beta1, beta2 = group["betas"]
+            lr = group["lr"]
+            eps = group["eps"]
+            wd = group["weight_decay"]
+            for p in group["params"]:
+                g = p.grad
+                if g is None:
+                    continue
+                if g.is_sparse:
+                    raise RuntimeError("CautiousAdamW does not support sparse gradients")
+                state = self.state[p]
+                if len(state) == 0:
+                    state["step"] = 0
+                    state["exp_avg"] = torch.zeros_like(p, memory_format=torch.preserve_format)
+                    state["exp_avg_sq"] = torch.zeros_like(p, memory_format=torch.preserve_format)
+                exp_avg, exp_avg_sq = state["exp_avg"], state["exp_avg_sq"]
+                step = state["step"]
+                if isinstance(step, torch.Tensor):
+                    step = step.item()
+                step += 1
+                state["step"] = step
+                # AdamW moments (bias-corrected)
+                exp_avg.mul_(beta1).add_(g, alpha=1 - beta1)
+                exp_avg_sq.mul_(beta2).addcmul_(g, g, value=1 - beta2)
+                bias_corr1 = 1 - beta1 ** step
+                bias_corr2 = 1 - beta2 ** step
+                denom = exp_avg_sq.sqrt().div_(math.sqrt(bias_corr2)).add_(eps)
+                step_size = lr / bias_corr1
+                update = exp_avg.div(denom)
+                # Cautious mask: move only where update agrees with gradient sign
+                update.mul_((update * g) > 0)
+                p.mul_(1 - lr * wd)          # weight decay (unmasked, per paper)
+                p.add_(update, alpha=-step_size)
+        return loss
+
+
+def make_optimizer(model, base_lr: float, cautious: bool = False):
     params = list(model.parameters())
     vocab_embed_numel = 49152 * 1536
     g2d = [p for p in params if p.ndim >= 2 and p.numel() != vocab_embed_numel]
@@ -185,6 +245,8 @@ def make_optimizer(model, base_lr: float):
         dict(params=geh, lr=base_lr, betas=(0.9, 0.95), eps=1e-8, weight_decay=0.1, fused=True),
         dict(params=gsc, lr=base_lr, betas=(0.9, 0.95), eps=1e-8, weight_decay=0.0, fused=True),
     ]
+    if cautious:
+        return CautiousAdamW(groups)
     return torch.optim.AdamW(groups)
 
 
@@ -306,6 +368,9 @@ def main():
     parser.add_argument("--liger", action="store_true",
                         help="Swap RMSNorm/SwiGLU/RoPE for Liger fused Triton kernels "
                              "before building the model.")
+    parser.add_argument("--cautious", action="store_true",
+                        help="Use CautiousAdamW (arXiv:2411.16085) instead of fused AdamW. "
+                             "Same m/v state layout — resumes AdamW checkpoints losslessly.")
     args = parser.parse_args()
 
     torch.manual_seed(42)
@@ -313,7 +378,7 @@ def main():
 
     apply_liger_if_requested(args.liger)  # #2 — must precede model build
     model = build_model(torch.bfloat16).to(device)
-    optimizer = make_optimizer(model, args.lr)
+    optimizer = make_optimizer(model, args.lr, cautious=args.cautious)
     start_step = 0
     best_loss = float("inf")
     if args.resume_from and os.path.exists(args.resume_from):

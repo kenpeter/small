@@ -425,6 +425,122 @@ def test_optimizer_groups_fused():
     print("  PASS: AdamW fused=True on all 3 groups")
 
 
+def test_cautious_masks_disagreeing_updates():
+    """Cautious mask must zero the update where momentum and gradient disagree."""
+    from pretrain_gpu import CautiousAdamW
+
+    # Disagree: momentum +0.05, gradient -0.1 → post-mix exp_avg=0.035, update>0,
+    # mask=(update*g)>0 → False → no move (wd=0)
+    p = torch.nn.Parameter(torch.tensor([1.0]))
+    opt = CautiousAdamW([p], lr=0.1, weight_decay=0.0)
+    st = opt.state[p]
+    st["step"] = 0
+    st["exp_avg"] = torch.tensor([0.05])
+    st["exp_avg_sq"] = torch.tensor([0.01])
+    p.grad = torch.tensor([-0.1])
+    opt.step()
+    assert p.item() == 1.0, f"{_test_name()}: masked update moved weight to {p.item()}"
+
+    # Agree: momentum +0.05, gradient +0.1 → exp_avg=0.055, update=0.12298,
+    # step_size=lr/(1-β1)=1.0 → p -= 0.12298
+    p2 = torch.nn.Parameter(torch.tensor([1.0]))
+    opt2 = CautiousAdamW([p2], lr=0.1, weight_decay=0.0)
+    st2 = opt2.state[p2]
+    st2["step"] = 0
+    st2["exp_avg"] = torch.tensor([0.05])
+    st2["exp_avg_sq"] = torch.tensor([0.01])
+    p2.grad = torch.tensor([0.1])
+    opt2.step()
+    expected = 1.0 - (0.1 / (1 - 0.9)) * (0.055 / ((0.01 ** 0.5) / ((1 - 0.95) ** 0.5) + 1e-8))
+    assert abs(p2.item() - expected) < 1e-4, f"{_test_name()}: {p2.item()} != {expected}"
+    print("  PASS: cautious mask zeroes disagreement, keeps agreement")
+
+
+def test_cautious_state_roundtrip():
+    """CautiousAdamW state must survive save/load (m/v preserved → resume-safe)."""
+    from pretrain_gpu import CautiousAdamW
+    import copy
+
+    torch.manual_seed(1)
+    p = torch.nn.Parameter(torch.randn(8))
+    opt = CautiousAdamW([p], lr=0.01, weight_decay=0.01)
+    for _ in range(5):
+        p.grad = torch.randn(8)
+        opt.step()
+    # simulate a real checkpoint file: deep-copy state (state_dict aliases live tensors)
+    sd = copy.deepcopy(opt.state_dict())
+
+    p2 = p.clone().detach().requires_grad_(True)
+    opt2 = CautiousAdamW([p2], lr=0.01, weight_decay=0.01)
+    opt2.load_state_dict(sd)
+    g = torch.randn(8)
+    p.grad = g.clone()
+    p2.grad = g.clone()
+    opt.step()
+    opt2.step()
+    assert torch.allclose(p, p2), f"{_test_name()}: resumed optimizer diverged"
+    print("  PASS: cautious optimizer state round-trips losslessly")
+
+
+def test_cautious_accepts_adamw_state_dict():
+    """A plain torch AdamW checkpoint must load into CautiousAdamW (mid-run switch)."""
+    from pretrain_gpu import CautiousAdamW
+
+    torch.manual_seed(2)
+    p = torch.nn.Parameter(torch.randn(8))
+    opt_adamw = torch.optim.AdamW([p], lr=0.01, betas=(0.9, 0.95), weight_decay=0.01)
+    for _ in range(3):
+        p.grad = torch.randn(8)
+        opt_adamw.step()
+    sd = opt_adamw.state_dict()
+
+    p2 = p.clone().detach().requires_grad_(True)
+    opt_c = CautiousAdamW([p2], lr=0.01, weight_decay=0.01)
+    opt_c.load_state_dict(sd)  # must not raise
+    assert "exp_avg" in opt_c.state[p2] and "exp_avg_sq" in opt_c.state[p2], (
+        f"{_test_name()}: m/v not carried over after AdamW→Cautious load"
+    )
+    src = sd["state"][next(iter(sd["state"]))]
+    assert torch.allclose(opt_c.state[p2]["exp_avg"], src["exp_avg"]), (
+        f"{_test_name()}: exp_avg not preserved"
+    )
+    print("  PASS: AdamW checkpoint state loads into CautiousAdamW (m/v kept)")
+
+
+def test_cautious_converges_on_toy():
+    """CautiousAdamW must decrease loss on a tiny regression (sanity check)."""
+    from pretrain_gpu import CautiousAdamW
+
+    torch.manual_seed(3)
+    w = torch.nn.Parameter(torch.zeros(4))
+    opt = CautiousAdamW([w], lr=0.05, weight_decay=0.0)
+    x = torch.randn(64, 4)
+    y = x @ torch.tensor([1.0, -2.0, 3.0, -4.0])
+    losses = []
+    for _ in range(100):
+        opt.zero_grad()
+        loss = ((x @ w - y) ** 2).mean()
+        loss.backward()
+        opt.step()
+        losses.append(loss.item())
+    assert losses[-1] < losses[0] * 0.15, (
+        f"{_test_name()}: loss must drop: {losses[0]:.4f} → {losses[-1]:.4f}"
+    )
+    print(f"  PASS: cautious converges {losses[0]:.4f} → {losses[-1]:.4f}")
+
+
+def test_make_optimizer_cautious_flag():
+    """make_optimizer(cautious=True) must return CautiousAdamW with 3 groups."""
+    from pretrain_gpu import make_optimizer, CautiousAdamW
+    import torch.nn as nn
+
+    m = nn.Sequential(nn.Linear(16, 16), nn.LayerNorm(16))
+    opt = make_optimizer(m, 3e-4, cautious=True)
+    assert isinstance(opt, CautiousAdamW), f"{_test_name()}: wrong optimizer type"
+    assert len(opt.param_groups) == 3, f"{_test_name()}: expected 3 param groups"
+    print("  PASS: --cautious builds CautiousAdamW with 3 groups")
+
+
 def test_build_dataloader_workers():
     """build_dataloader must use worker processes (off-GPU-thread shard reads)."""
     from pretrain_gpu import build_dataloader
@@ -1210,6 +1326,11 @@ TESTS = [
     test_save_trigger_either_wins,
     test_torch_compile_smoke,
     test_optimizer_groups_fused,
+    test_cautious_masks_disagreeing_updates,
+    test_cautious_state_roundtrip,
+    test_cautious_accepts_adamw_state_dict,
+    test_cautious_converges_on_toy,
+    test_make_optimizer_cautious_flag,
     test_build_dataloader_workers,
     test_async_save_writes_file,
 ]
