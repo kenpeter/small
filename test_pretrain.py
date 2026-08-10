@@ -1276,6 +1276,23 @@ def test_g1234_together_full_run():
     print("  PASS: G1-G4 together — valid ratios all run, fold peak mid-run, rebuild enforces end-state")
 
 
+def test_fused_ce_matches_chunked_ce():
+    """Liger fused linear+CE must match chunked_ce (same shift, same mean)."""
+    if not torch.cuda.is_available():
+        return
+    from pretrain_gpu import chunked_ce, fused_ce
+    torch.manual_seed(0)
+    B, S, H, V = 2, 64, 128, 256
+    hidden = torch.randn(B, S, H, device="cuda", dtype=torch.bfloat16)
+    w = torch.randn(V, H, device="cuda", dtype=torch.bfloat16) * 0.1
+    labels = torch.randint(0, V, (B, S), device="cuda")
+    logits = hidden @ w.t()
+    ref = chunked_ce(logits, labels)
+    got = fused_ce(hidden, w, labels)
+    assert torch.allclose(got, ref, atol=1e-2), \
+        f"fused {got.item():.4f} vs chunked {ref.item():.4f}"
+
+
 TESTS = [
     test_module_imports_cleanly,
     test_lr_warmup_rises_linearly,
@@ -1288,6 +1305,7 @@ TESTS = [
     test_collate_mask_is_pure_causal_no_padding,
     test_accumulate_loss_detached_and_exact,
     test_chunked_ce_matches_full_ce,
+    test_fused_ce_matches_chunked_ce,
     test_warmup_default_400,
     test_liger_replaces_modules,
     test_compile_oom_fallback,

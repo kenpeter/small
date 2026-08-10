@@ -78,6 +78,41 @@ def chunked_ce(logits, labels, chunk_size=CE_CHUNK):
     return loss / n_tok
 
 
+_fused_ce_fn = None
+
+
+def get_fused_ce_fn():
+    """Lazy singleton for the Liger fused linear+CE loss (needs CUDA)."""
+    global _fused_ce_fn
+    if _fused_ce_fn is None:
+        from liger_kernel.transformers.fused_linear_cross_entropy import (
+            LigerFusedLinearCrossEntropyLoss,
+        )
+        _fused_ce_fn = LigerFusedLinearCrossEntropyLoss(
+            ignore_index=-100, reduction="sum"
+        )
+    return _fused_ce_fn
+
+
+def fused_ce(hidden_states, lm_head_weight, labels):
+    """Liger fused linear+CE — the loss WITHOUT materializing the [B,S,V]
+    logits tensor (~805MB at batch 4) or fp32 chunk slices (~201MB each).
+
+    This is what unlocks --batch-size 4 on the 12GB card: the ~1.2GB the
+    chunked path holds as logits+chunk transients is freed for activations.
+
+    Shift semantics are IDENTICAL to chunked_ce: predict the next token
+    (hidden[t] against labels[t+1]), mean over ALL tokens (incl. ignored,
+    matching chunked_ce's sum/n_tok — no padding in packed data anyway).
+    Liger's kernel wants flat inputs: hidden [B*S, H], labels [B*S].
+    """
+    fn = get_fused_ce_fn()
+    B, S, H = hidden_states.shape
+    h = hidden_states[:, :-1].reshape(-1, H).contiguous()
+    tgt = labels[:, 1:].reshape(-1).contiguous()
+    return fn(lm_head_weight, h, tgt) / tgt.numel()
+
+
 def apply_liger_if_requested(enable: bool):
     """#2 — swap Llama's RMSNorm/MLP/RoPE for Liger fused Triton kernels.
 
@@ -136,9 +171,17 @@ def run_microbatches(model, data_iter, dl, device, args):
         # No attention_mask: collate's 4D mask is a pure causal tril(ones)
         # (packed data, zero padding) — bitwise-identical to SDPA's is_causal,
         # so shipping + processing the 8MB mask every micro-batch is pure waste.
-        out = model(input_ids=input_ids)
-        logits = out.logits  # bf16 [B, S, V] — no labels → HF skips its fp32 loss
-        loss = chunked_ce(logits, labels) / args.grad_accum
+        if getattr(args, "fused_ce", False):
+            # Liger fused linear+CE: skip lm_head entirely — no [B,S,V] logits
+            # tensor (~805MB at batch 4) and no fp32 chunk transients. This is
+            # what makes --batch-size 4 fit in 12GB.
+            out = model.model(input_ids=input_ids)
+            hidden = model.model.norm(out.last_hidden_state)
+            loss = fused_ce(hidden, model.lm_head.weight, labels) / args.grad_accum
+        else:
+            out = model(input_ids=input_ids)
+            logits = out.logits  # bf16 [B, S, V] — no labels → HF skips its fp32 loss
+            loss = chunked_ce(logits, labels) / args.grad_accum
         acc_loss = accumulate_loss(acc_loss, loss)
         loss.backward()
     return acc_loss, data_iter
@@ -384,6 +427,10 @@ def main():
     parser.add_argument("--cautious", action="store_true",
                         help="Use CautiousAdamW (arXiv:2411.16085) instead of fused AdamW. "
                              "Same m/v state layout — resumes AdamW checkpoints losslessly.")
+    parser.add_argument("--fused-ce", action="store_true",
+                        help="Liger fused linear+CE (no [B,S,V] logits materialization — "
+                             "frees ~1.2GB, unlocks --batch-size 4 on 12GB). Same "
+                             "next-token shift + mean semantics as chunked CE.")
     args = parser.parse_args()
 
     torch.manual_seed(42)

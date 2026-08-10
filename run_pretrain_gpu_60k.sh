@@ -38,8 +38,8 @@ echo "Starting 60K warm-restart extension at $(date)"
 echo ""
 
 exec python3 pretrain_gpu.py \
-  --batch-size 3 \
-  --grad-accum 11 \
+  --batch-size 4 \
+  --grad-accum 8 \
   --num-steps 60000 \
   --log-interval 100 \
   --save-interval 1000 \
@@ -49,5 +49,6 @@ exec python3 pretrain_gpu.py \
   --curriculum \
   --liger \
   --cautious \
+  --fused-ce \
   --resume-from /home/kenpeter/work/checkpoints/megatrain_latest.pt \
   >> /home/kenpeter/work/train_small.log 2>&1
