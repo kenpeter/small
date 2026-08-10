@@ -1,5 +1,9 @@
 #!/bin/bash
-# Pure-GPU 1B pretraining (replaces CPUMaster offload — 2.1x faster)
+# Warm-restart extension: 30K → 60K (plateau breaker #1)
+# Usage: fire at step 30,000 (after the G1 easy-tail finishes).
+# LR warm-restart is automatic: cosine over 60K steps → at resume t=0.5 → LR ≈ 1.5e-4.
+# Curriculum auto-replays fold 1 (hard-heavy at resume — expected, 2-fold mirror design).
+set -e
 unset ENABLE_CUDA_GRAPH
 unset ENABLE_HYDRA_PIKIA
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
@@ -9,7 +13,7 @@ cd /home/kenpeter/work/small
 echo "GPU status before start:"
 nvidia-smi --query-gpu=name,temperature.gpu,power.draw,power.limit --format=csv,noheader
 
-# ── Preflight checks (abort on any failure — prevents double-launch OOM, etc.) ──
+# ── Preflight checks (same as run_pretrain_gpu.sh) ──
 if pgrep -f "pretrain_gpu.py" > /dev/null; then
   echo "🔴 ABORT: pretrain_gpu.py already running — refusing to double-launch (would OOM)."
   exit 1
@@ -30,13 +34,13 @@ if [ ! -f /home/kenpeter/work/checkpoints/megatrain_latest.pt ]; then
 fi
 echo "✅ Preflight passed (free VRAM ${FREE_MB}MiB, disk ${FREE_DISK_GB}GB)"
 
-echo "Starting pure-GPU pretrain at $(date)"
+echo "Starting 60K warm-restart extension at $(date)"
 echo ""
 
 exec python3 pretrain_gpu.py \
   --batch-size 3 \
   --grad-accum 11 \
-  --num-steps 30000 \
+  --num-steps 60000 \
   --log-interval 100 \
   --save-interval 1000 \
   --save-every-minutes 20 \

@@ -184,8 +184,13 @@ class CautiousAdamW(torch.optim.Optimizer):
     with the gradient's sign (update*g > 0), killing overshoot/oscillation.
     Weight decay is applied unmasked (per the paper).
 
-    Intentionally NOT fused: the mask needs both grad and update, which a stock
-    fused kernel can't expose. Cost: ~+5-10% optimizer step time.
+    Partially fused: the AdamW moments use torch._foreach_* multi-tensor
+    kernels (one launch per op instead of one per param — ~100x fewer
+    launches, pure in-place, bitwise-identical math). The per-param update
+    tail (denom/update/mask) stays elementwise because materializing all
+    fp32 temps as lists would cost ~4-8GB extra VRAM on top of the ~10.3GB
+    weights+m/v — instant OOM on a 12GB card. Temps stay per-param, so peak
+    VRAM is unchanged.
     """
     def __init__(self, params, lr=3e-4, betas=(0.9, 0.95), eps=1e-8, weight_decay=0.1):
         defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay)
@@ -202,26 +207,34 @@ class CautiousAdamW(torch.optim.Optimizer):
             lr = group["lr"]
             eps = group["eps"]
             wd = group["weight_decay"]
-            for p in group["params"]:
-                g = p.grad
-                if g is None:
-                    continue
-                if g.is_sparse:
-                    raise RuntimeError("CautiousAdamW does not support sparse gradients")
-                state = self.state[p]
-                if len(state) == 0:
-                    state["step"] = 0
-                    state["exp_avg"] = torch.zeros_like(p, memory_format=torch.preserve_format)
-                    state["exp_avg_sq"] = torch.zeros_like(p, memory_format=torch.preserve_format)
-                exp_avg, exp_avg_sq = state["exp_avg"], state["exp_avg_sq"]
-                step = state["step"]
+            params = [p for p in group["params"] if p.grad is not None]
+            if not params:
+                continue
+            grads = [p.grad for p in params]
+            if any(g.is_sparse for g in grads):
+                raise RuntimeError("CautiousAdamW does not support sparse gradients")
+            states = [self.state[p] for p in params]
+            exp_avgs, exp_avg_sqs = [], []
+            for p, s in zip(params, states):
+                if len(s) == 0:
+                    s["step"] = 0
+                    s["exp_avg"] = torch.zeros_like(p, memory_format=torch.preserve_format)
+                    s["exp_avg_sq"] = torch.zeros_like(p, memory_format=torch.preserve_format)
+                step = s["step"]
                 if isinstance(step, torch.Tensor):
                     step = step.item()
-                step += 1
-                state["step"] = step
-                # AdamW moments (bias-corrected)
-                exp_avg.mul_(beta1).add_(g, alpha=1 - beta1)
-                exp_avg_sq.mul_(beta2).addcmul_(g, g, value=1 - beta2)
+                s["step"] = step + 1
+                exp_avgs.append(s["exp_avg"])
+                exp_avg_sqs.append(s["exp_avg_sq"])
+            # ── Pass 1: AdamW moments — fused multi-tensor kernels ──
+            torch._foreach_mul_(exp_avgs, beta1)
+            torch._foreach_add_(exp_avgs, grads, alpha=1 - beta1)
+            torch._foreach_mul_(exp_avg_sqs, beta2)
+            torch._foreach_addcmul_(exp_avg_sqs, grads, grads, value=1 - beta2)
+            # ── Pass 2: per-param update tail (per-param temps → VRAM-safe) ──
+            for p, g, s in zip(params, grads, states):
+                exp_avg, exp_avg_sq = s["exp_avg"], s["exp_avg_sq"]
+                step = s["step"]
                 bias_corr1 = 1 - beta1 ** step
                 bias_corr2 = 1 - beta2 ** step
                 denom = exp_avg_sq.sqrt().div_(math.sqrt(bias_corr2)).add_(eps)
