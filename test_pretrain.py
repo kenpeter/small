@@ -1376,6 +1376,25 @@ def test_swa_average_matches_mean():
     print("  PASS: swa average equals exact mean of snapshots")
 
 
+def test_log_stats_uses_true_step_count():
+    """First post-resume log line divides by ACTUAL steps (14), not log_interval (100).
+
+    Regression: after resume at 36,586 the first log fired at 36,600 (14 steps)
+    but divided by 100 → fake Loss 0.27 / 1.94s/step instead of real ~1.98 / 13.9s.
+    """
+    from pretrain_gpu import compute_log_stats
+    # resume case: 14 steps × 2.0 loss, 194s real wall time
+    avg, tps, s_step = compute_log_stats(torch.tensor(28.0), 14, 194.0, 4, 2048, 8)
+    assert abs(avg - 2.0) < 1e-6, f"{_test_name()}: avg = {avg}"
+    assert abs(s_step - 194.0 / 14) < 1e-6, f"{_test_name()}: s/step = {s_step}"
+    assert abs(tps - 4 * 2048 * 8 * 14 / 194.0) < 1e-3
+    # normal case: full interval, unchanged math
+    avg2, _, s2 = compute_log_stats(torch.tensor(200.0), 100, 1436.0, 4, 2048, 8)
+    assert abs(avg2 - 2.0) < 1e-6
+    assert abs(s2 - 14.36) < 1e-6
+    print("  PASS: log stats divide by true step count (resume line honest)")
+
+
 def test_resume_defaults_to_latest():
     """resolve_resume_path: explicit wins; else latest if present; else None."""
     from pretrain_gpu import resolve_resume_path
@@ -1455,6 +1474,7 @@ TESTS = [
     test_async_save_writes_swa_snapshot,
     test_swa_average_matches_mean,
     test_resume_defaults_to_latest,
+    test_log_stats_uses_true_step_count,
 ]
 
 if __name__ == "__main__":

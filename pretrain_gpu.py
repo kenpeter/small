@@ -344,6 +344,19 @@ def _to_cpu_deep(obj):
     return obj
 
 
+def compute_log_stats(running, n_steps, dt, batch_size, seq_len, grad_accum):
+    """Mean loss + throughput for the last n_steps.
+
+    n_steps = log_interval normally, but FEWER right after a resume (first
+    log line fires before a full interval has elapsed). Dividing by the true
+    count keeps that first post-resume line honest — the old bug printed
+    loss×14/100 ≈ 0.27 instead of the real ~1.98.
+    """
+    avg = (running / n_steps).item()
+    tps = batch_size * seq_len * grad_accum * n_steps / dt
+    return avg, tps, dt / n_steps
+
+
 def save_swa_snapshot_robust(step, cpu_model_sd, window, output_dir, logger):
     """Lean model-only snapshot (bf16 weights, ~2.1GB) for end-of-run SWA.
 
@@ -551,6 +564,7 @@ def main():
     running = torch.zeros((), device=device)
     t0 = time.time()
     last_save_time = time.time()
+    last_log_step = start_step  # first log after resume has < log_interval steps
 
     for step in range(start_step, args.num_steps):
         # ── G1-G4 curriculum: rebuild tier ratios every CURRICULUM_UPDATE_INTERVAL ──
@@ -592,13 +606,15 @@ def main():
         if (step + 1) % args.log_interval == 0:
             dt = time.time() - t0
             t0 = time.time()
-            avg = (running / args.log_interval).item()
+            n_log = (step + 1) - last_log_step
+            last_log_step = step + 1
+            avg, tps, s_step = compute_log_stats(
+                running, n_log, dt, args.batch_size, args.max_seq_len, args.grad_accum)
             running = torch.zeros((), device=device)
-            tps = args.batch_size * args.max_seq_len * args.grad_accum * args.log_interval / dt
             mem = torch.cuda.max_memory_allocated(device) / 1024**3
             logger.info(
                 f"Step {step+1}/{args.num_steps} | Loss {avg:.4f} | LR {lr:.2e} | "
-                f"{dt/args.log_interval:.2f}s/step | {tps:.0f} tok/s | GPU {mem:.2f}GB"
+                f"{s_step:.2f}s/step | {tps:.0f} tok/s | GPU {mem:.2f}GB"
             )
 
         step_save = (step + 1) % args.save_interval == 0 or step + 1 == args.num_steps
