@@ -1,10 +1,17 @@
-"""Quick eval of pretrain checkpoint — load megatrain_latest.pt into HF LlamaForCausalLM, generate + PPL."""
+"""Quick eval of a pretrain checkpoint — load into HF LlamaForCausalLM, generate + PPL.
+
+Usage: python3 quick_eval_pretrain.py [--ckpt PATH]   (default: megatrain_latest.pt)
+"""
+import argparse
 import torch
 import torch.nn.functional as F
 from transformers import AutoTokenizer, LlamaConfig, LlamaForCausalLM
 from pathlib import Path
 
-CKPT = "/home/kenpeter/work/checkpoints/megatrain_latest.pt"
+_ap = argparse.ArgumentParser()
+_ap.add_argument("--ckpt", default="/home/kenpeter/work/checkpoints/megatrain_latest.pt",
+                 help="Checkpoint .pt to evaluate (default: megatrain_latest.pt)")
+CKPT = _ap.parse_args().ckpt
 DEV = "cuda" if torch.cuda.is_available() else "cpu"
 
 print(f"Loading {CKPT}...")

@@ -230,10 +230,10 @@ Mon          Wed         ★Thu         Fri          Sun
 | Sequence length | 2048 tokens |
 | Tokenizer | `HuggingFaceTB/SmolLM2-135M` (BPE, uint16 output) |
 | Shard format | `.bin` uint16 arrays, per tier (see Data Inventory) |
-| Batch size | 2 × grad-accum 16 = effective 32 (65,536 tok/step) |
+| Batch size | 4 × grad-accum 8 = effective 32 (65,536 tok/step) — batch 4 fits only with fused CE (~9.9 GB peak) |
 | Precision | `bfloat16` |
-| Optimizer | **AdamW** (3e-4 → cosine → 1e-6); MuonClip was removed after plateauing at loss ~5.0 |
-| AdamW betas | (0.9, 0.95) |
+| Optimizer | **CautiousAdamW** (`--cautious`, arXiv:2411.16085) — fused `torch._foreach_*` moments; AdamW-compatible state (resumes old checkpoints losslessly, hot-swappable mid-run). LR 3e-4 → cosine → 1e-6. MuonClip was removed after plateauing at loss ~5.0 |
+| Betas | (0.9, 0.95) |
 | Weight decay | 0.1 |
 | Gradient clipping | max_norm = 1.0 |
 | Compilation | Disabled (`torch.compile = False`) |
@@ -241,18 +241,22 @@ Mon          Wed         ★Thu         Fri          Sun
 | CPU offloading | Disabled — **pure GPU** (bf16 weights + bf16 AdamW states on GPU). CPUMasterModel offload was the previous approach. |
 | Attention | Flash Attention via `F.scaled_dot_product_attention` |
 | Memory config | `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` (kills fragmentation) |
-| Checkpointing | Every 1000 steps → `megatrain_latest.pt` + `megatrain_best.pt` (pure-GPU run) |
+| Checkpointing | Every 1000 steps (or 20 min) → `megatrain_latest.pt` + `megatrain_best.pt`; plus lean SWA snapshots (`swa_tail/swa_<step>.pt`, model-only bf16 ~2.1 GB each, last 24 kept via `--swa-window 24`) |
+| Resume rule | **ALWAYS `megatrain_latest.pt`, NEVER best** — auto-default in code since 2026-08-11 (explicit `--resume-from` still wins; `--init-from` = intentional weights-only warm start) |
+| Fused kernels | Liger (`--liger`: RMSNorm/SwiGLU/RoPE) + fused linear+CE (`--fused-ce`: no [B,S,V] logits materialization, frees ~1.9 GB) |
+| Power limit | 100W (user live-tunes 200W→180W→100W; ~14 s/step @ 100W vs 9.5 s @ 180W, cooler) |
 
 ### Pretraining Scripts
 
 ```bash
 cd /home/kenpeter/work/small
 source venv/bin/activate
-bash run_pretrain_gpu.sh          # current: pure-GPU (2.1× faster)
-# bash run_pretrain.sh            # legacy: CPUMaster offload (kept for reference)
+bash run_pretrain_gpu_60k.sh     # CURRENT: 60K warm-restart cycle (batch 4 × accum 8, --curriculum --liger --cautious --fused-ce --swa-window 24)
+bash run_pretrain_gpu.sh         # original 30K pure-GPU entry (kept for reference)
+# bash run_pretrain.sh           # legacy: CPUMaster offload (kept for reference)
 ```
 
-**Current training state:** ⏸️ **PAUSED 2026-08-04 23:15** — warm-started from `megatrain_latest.pt` (step 9,000, loss 2.25-era weights) → reached **~step 1,890 / 15,000** (loss 2.8704 @ step 1600, logged 22:00) → frozen via SIGSTOP. See **Pause & Resume** section below.
+**Current training state:** ▶️ **RUNNING 60K cycle** — resumed 2026-08-11 21:39 from `megatrain_latest.pt` at **step 36,586/60,000**, best loss **1.7101**, 100W, ~14 s/step (~4,560 tok/s), ~9.9 GB VRAM. First SWA snapshot lands at step 37,000. ETA ~Aug 12 ~10:25.
 
 ---
 
@@ -339,15 +343,17 @@ Not yet started. DPO data was cleaned up — will need fresh preparation when re
 | `pretrain_megatrain.py` | Legacy pretraining script (CPUMaster CPU-offload + AdamW) — replaced by pretrain_gpu.py |
 | `run_pretrain.sh` | Legacy wrapper for pretrain_megatrain.py (CPUMaster) |
 | `pretrain_gpu.py` | **Current** pure-GPU 1B trainer: bf16 AdamW on GPU, grad checkpointing, CPU-side checkpoint load, warm-start support |
-| `run_pretrain_gpu.sh` | **Current** wrapper: batch 2 × accum 16, 15K steps, warm-start from megatrain_latest.pt → train_small.log |
+| `run_pretrain_gpu.sh` | Pure-GPU 30K wrapper (kept for reference): batch 2 × accum 16, warm-start from megatrain_latest.pt → train_small.log |
+| `run_pretrain_gpu_60k.sh` | **Current** wrapper: 60K warm-restart (batch 4 × accum 8, `--curriculum --liger --cautious --fused-ce --swa-window 24`), resumes from megatrain_latest.pt |
+| `swa_average.py` | SWA finalizer: averages `swa_tail/` lean snapshots → `megatrain_swa.pt` (flat-basin weights, zero training cost) |
 | `download_3workers_direct.py` | 3-worker wget downloader with resume for raw datasets |
 | `download_qrp_par.py` | Adaptive parallel wget downloader for QuRatedPajama (resumable) |
 | `tokenize_domain_parallel.py` | Generic tiered tokenizer (math/code/synth/web → easy/medium/hard .bin shards) |
 | `tokenize_reformat.py` | Tokenizer for reformatted textbook+QA JSONL → reformat_easy shards |
 | `reformat_data.py` | Kimi K2-style data reformatting via vLLM chat API |
-| `quick_eval_pretrain.py` | Quick eval of 1B checkpoint (generation + perplexity) |
+| `quick_eval_pretrain.py` | Quick eval of ANY 1B checkpoint (generation + perplexity) — `--ckpt PATH` (default megatrain_latest.pt) |
 | `check_status.sh` | Combined status report: training + downloads + disk |
-| `test_pretrain.py` | Test suite for pretrain_megatrain.py |
+| `test_pretrain.py` | Test suite (63 tests — run `./venv/bin/python test_pretrain.py`; MUST pass before any training change) |
 | `abstraction.md` | This document — full pipeline roadmap |
 
 ---
@@ -466,9 +472,26 @@ Re-enable with `cronjob action=resume` on both IDs.
 
 ---
 
+## Current State (2026-08-11)
+
+- **Training:** ▶️ RUNNING 60K cycle @ **100W** (user live-tunes: 200W→180W→100W — cooler, slower OK). Resumed 21:39 from `megatrain_latest.pt` → **step 36,586/60,000**, best loss **1.7101** (Aug 9 01:47). Batch 4 × accum 8 (eff 32), seq 2048, LR 3e-4→1e-6 cosine, `--curriculum --liger --cautious --fused-ce --swa-window 24`. ~14 s/step, ~9.9 GB VRAM.
+- **Curriculum:** fold 2 (hard→easy mirror) active since step 30K; ratios re-glide every 2000 steps (G1–G4).
+- **SWA tail collection LIVE:** lean model-only snapshots (bf16, ~2.1 GB) in `checkpoints/swa_tail/` every 1000 steps, window 24 ≈ 50 GB (disk 221 GB free). At run end: `swa_average.py` → `megatrain_swa.pt`, then quick-eval vs `megatrain_best.pt` (auto-finalize wired into the 30-min training-progress cron).
+- **Resume rule:** ALWAYS `megatrain_latest.pt`, NEVER best — auto-default in code (explicit path wins).
+- **Power-limit footgun:** resets to 285W after reboot/GPU idle — re-apply `sudo nvidia-smi -pl 100` (sudo pwd in short_term.md).
+- **x-small 135M:** parked (stopped at step 45,200; watchdog paused).
+
+### Recent History (August 2026)
+
+- **Aug 10 — speed session (3 changes, 57/57 tests):** fused CautiousAdamW moments via `torch._foreach_*` (400→4 launches, bitwise-identical, VRAM-safe); Liger fused CE `--fused-ce` (bitwise-identical to chunked CE, frees ~1.9 GB → batch 4 fits at 9,865 MiB); batch 2→4 × accum 8 (eff 32). Commits cc0ce82 + bdcaae3.
+- **Aug 11 — SWA + resume hardening (63/63 tests):** `--swa-window N` lean tail snapshots + `swa_average.py`; auto-resume-latest default (`resolve_resume_path`); post-resume log-stats fix (`compute_log_stats` — first line after resume divided by 100 instead of true step count → fake Loss 0.27, real ~1.98); `quick_eval_pretrain.py --ckpt`. Commits ec8ae4d → 47b5828.
+- **Aug 11 — machine powered off 06:44 AEST, back ~21:16** (clean shutdown, not a crash; killed a resume that had run 4 min). Power limit had reset to 285W. Training resumed from latest with zero step loss (05:51 checkpoint untouched).
+
+---
+
 ## Summary
 
 - **Tokens ready:** ~78 GB across 5 domains (math, web, code, synth, reformat), tiered easy/medium/hard
-- **Training:** 1B pretraining, pure-GPU (2.1× faster), warm-started from step 9,000 → target 15,000; **⏸️ PAUSED 2026-08-04 23:15 at ~step 1,890** (frozen via SIGSTOP, zero loss — resume with `kill -CONT 980795`; see **Pause & Resume**)
-- **SFT assets ready:** 25.76 GB
-- **Next action:** resume training → reach loss 2.7 → SFT → DPO.
+- **Training:** ▶️ RUNNING 60K cycle @ 100W — step 36,586/60,000 (resumed Aug 11 21:39), best loss 1.7101, batch 4 × accum 8, CautiousAdamW + Liger fused CE, ~14 s/step, ~9.9 GB VRAM. SWA tail collection live (window 24).
+- **SFT assets ready:** 25.76 GB (`_sft_final_shards/`)
+- **Next action:** finish 60K → SWA average → eval `megatrain_swa.pt` vs `megatrain_best.pt` → pick final base → SFT → DPO.
