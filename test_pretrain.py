@@ -1293,6 +1293,105 @@ def test_fused_ce_matches_chunked_ce():
         f"fused {got.item():.4f} vs chunked {ref.item():.4f}"
 
 
+# =============================================================================
+# 3b. SWA lean snapshots + averaging
+# =============================================================================
+def test_swa_snapshot_prunes_to_window():
+    """swa_tail keeps only the last `window` snapshots (oldest pruned)."""
+    import pretrain_gpu as pmt
+    from pathlib import Path
+    tmpdir = tempfile.mkdtemp()
+    try:
+        sd = {"w": torch.randn(4, 4)}
+        for step in (100, 200, 300, 400, 500):
+            pmt.save_swa_snapshot_robust(step, sd, 3, tmpdir, pmt.logger)
+        snaps = sorted(p.name for p in Path(tmpdir, "swa_tail").glob("swa_*.pt"))
+        assert snaps == ["swa_000300.pt", "swa_000400.pt", "swa_000500.pt"], snaps
+        # window=0 (off) must never prune
+        pmt.save_swa_snapshot_robust(600, sd, 0, tmpdir, pmt.logger)
+        assert len(list(Path(tmpdir, "swa_tail").glob("swa_*.pt"))) == 4
+    finally:
+        shutil.rmtree(tmpdir)
+    print("  PASS: swa window prunes oldest snapshots, 0 = keep all")
+
+
+def test_swa_snapshot_roundtrip():
+    """Snapshot loads back with step + bf16 model weights (lean, no optimizer)."""
+    import pretrain_gpu as pmt
+    tmpdir = tempfile.mkdtemp()
+    try:
+        sd = {"w": torch.randn(4, 4, dtype=torch.bfloat16)}
+        pmt.save_swa_snapshot_robust(777, sd, 0, tmpdir, pmt.logger)
+        ck = torch.load(os.path.join(tmpdir, "swa_tail", "swa_000777.pt"),
+                        map_location="cpu", weights_only=False)
+        assert ck["step"] == 777, f"{_test_name()}: step = {ck['step']}"
+        assert "optimizer_state_dict" not in ck
+        assert ck["model_state_dict"]["w"].dtype == torch.bfloat16
+    finally:
+        shutil.rmtree(tmpdir)
+    print("  PASS: swa snapshot roundtrips (lean model-only)")
+
+
+def test_async_save_writes_swa_snapshot():
+    """save_checkpoint_async with swa_window writes latest.pt AND lean snapshot."""
+    import pretrain_gpu as pmt
+    tmpdir = tempfile.mkdtemp()
+    try:
+        state = {"step": 42, "loss": 2.0, "best_loss": 2.0,
+                 "model_state_dict": {"w": torch.randn(4, 4)},
+                 "optimizer_state_dict": {"state": {}, "param_groups": []},
+                 "config": {}}
+        t = pmt.save_checkpoint_async(state, False, pmt.logger, output_dir=tmpdir,
+                                      swa_window=5, swa_step=42)
+        t.join(timeout=120)
+        assert not t.is_alive(), f"{_test_name()}: saver thread did not finish"
+        assert os.path.exists(os.path.join(tmpdir, "megatrain_latest.pt"))
+        assert os.path.exists(os.path.join(tmpdir, "swa_tail", "swa_000042.pt"))
+    finally:
+        shutil.rmtree(tmpdir)
+    print("  PASS: async save also emits swa snapshot")
+
+
+def test_swa_average_matches_mean():
+    """average_swa over known weights = exact arithmetic mean."""
+    import swa_average
+    tmpdir = tempfile.mkdtemp()
+    try:
+        swa_dir = os.path.join(tmpdir, "swa_tail")
+        os.makedirs(swa_dir)
+        w1 = torch.tensor([[1.0, 2.0], [3.0, 4.0]], dtype=torch.bfloat16)
+        w2 = torch.tensor([[5.0, 6.0], [7.0, 8.0]], dtype=torch.bfloat16)
+        torch.save({"step": 10, "model_state_dict": {"w": w1}},
+                   os.path.join(swa_dir, "swa_000010.pt"))
+        torch.save({"step": 20, "model_state_dict": {"w": w2}},
+                   os.path.join(swa_dir, "swa_000020.pt"))
+        out = os.path.join(tmpdir, "megatrain_swa.pt")
+        steps = swa_average.average_swa(swa_dir, out)
+        assert steps == [10, 20], f"{_test_name()}: steps = {steps}"
+        ck = torch.load(out, map_location="cpu", weights_only=False)
+        want = (w1.float() + w2.float()) / 2
+        assert torch.allclose(ck["model_state_dict"]["w"].float(), want, atol=1e-2)
+    finally:
+        shutil.rmtree(tmpdir)
+    print("  PASS: swa average equals exact mean of snapshots")
+
+
+def test_resume_defaults_to_latest():
+    """resolve_resume_path: explicit wins; else latest if present; else None."""
+    from pretrain_gpu import resolve_resume_path
+    tmpdir = tempfile.mkdtemp()
+    try:
+        latest = os.path.join(tmpdir, "megatrain_latest.pt")
+        assert resolve_resume_path(None, latest) is None          # no latest yet
+        open(latest, "w").close()
+        assert resolve_resume_path(None, latest) == latest        # latest exists
+        other = os.path.join(tmpdir, "other.pt")
+        assert resolve_resume_path(other, latest) == other        # explicit wins
+    finally:
+        shutil.rmtree(tmpdir)
+    print("  PASS: resume resolves to latest by default (explicit wins)")
+
+
 TESTS = [
     test_module_imports_cleanly,
     test_lr_warmup_rises_linearly,
@@ -1351,6 +1450,11 @@ TESTS = [
     test_make_optimizer_cautious_flag,
     test_build_dataloader_workers,
     test_async_save_writes_file,
+    test_swa_snapshot_prunes_to_window,
+    test_swa_snapshot_roundtrip,
+    test_async_save_writes_swa_snapshot,
+    test_swa_average_matches_mean,
+    test_resume_defaults_to_latest,
 ]
 
 if __name__ == "__main__":

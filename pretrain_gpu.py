@@ -344,12 +344,47 @@ def _to_cpu_deep(obj):
     return obj
 
 
-def save_checkpoint_async(state, is_best, logger, output_dir=None):
+def save_swa_snapshot_robust(step, cpu_model_sd, window, output_dir, logger):
+    """Lean model-only snapshot (bf16 weights, ~2.1GB) for end-of-run SWA.
+
+    Written alongside step-interval saves only (never time-based — those
+    would flood the window). Prunes to the last `window` snapshots so the
+    tail stays bounded (window × ~2.1GB ≈ 50GB for 24 — fits the 221GB free).
+    Averaged at run end via swa_average.py → flat-basin final weights.
+    """
+    swa_dir = Path(output_dir) / "swa_tail"
+    swa_dir.mkdir(parents=True, exist_ok=True)
+    path = swa_dir / f"swa_{step:06d}.pt"
+    tmp = swa_dir / f"swa_{step:06d}.tmp"
+    try:
+        torch.save({"step": int(step), "model_state_dict": cpu_model_sd}, tmp)
+        os.replace(tmp, path)
+    except Exception as e:
+        logger.warning(f"swa snapshot step {step} failed: {e}")
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return
+    if window and window > 0:
+        snaps = sorted(swa_dir.glob("swa_*.pt"))
+        for old in snaps[:-window]:
+            try:
+                old.unlink()
+            except OSError:
+                pass
+
+
+def save_checkpoint_async(state, is_best, logger, output_dir=None,
+                          swa_window=0, swa_step=None):
     """Snapshot state to CPU on the calling thread, then write the ~6.2GB file
     on a background thread so training doesn't stall on disk I/O.
 
     Returns the thread (join it in tests). Serialized via save_checkpoint_robust
     (NaN guard + atomic tmp→rename), so a torn write never corrupts latest.pt.
+    When swa_window>0, a lean model-only snapshot (swa_tail/swa_<step>.pt) is
+    written in the same writer under the same lock — reuses the CPU copy, so no
+    extra RAM is needed.
     """
     output_dir = output_dir or OUTPUT_DIR
     cpu_state = _to_cpu_deep(state)
@@ -357,10 +392,27 @@ def save_checkpoint_async(state, is_best, logger, output_dir=None):
     def _writer():
         with _save_lock:
             save_checkpoint_robust(cpu_state, output_dir, is_best, logger)
+            if swa_window and swa_window > 0 and swa_step is not None:
+                save_swa_snapshot_robust(swa_step, cpu_state["model_state_dict"],
+                                         swa_window, output_dir, logger)
 
     t = threading.Thread(target=_writer, daemon=True, name="ckpt-saver")
     t.start()
     return t
+
+
+def resolve_resume_path(explicit, latest_path):
+    """User rule: ALWAYS resume from the latest checkpoint, never best.
+
+    An explicit --resume-from wins; otherwise default to latest.pt if it
+    exists; otherwise None (fresh start). --init-from callers skip the
+    auto-default (weights-only warm start is intentional there).
+    """
+    if explicit:
+        return explicit
+    if latest_path and os.path.exists(latest_path):
+        return latest_path
+    return None
 
 
 def apply_resume(ckpt_path, model, optimizer, logger):
@@ -431,7 +483,19 @@ def main():
                         help="Liger fused linear+CE (no [B,S,V] logits materialization — "
                              "frees ~1.2GB, unlocks --batch-size 4 on 12GB). Same "
                              "next-token shift + mean semantics as chunked CE.")
+    parser.add_argument("--swa-window", type=int, default=0,
+                        help="Keep the last N lean model-only snapshots in "
+                             "swa_tail/ on step-interval saves (each ~2.1GB bf16). "
+                             "0 = off. Averaged at run end via swa_average.py → "
+                             "flat-basin final weights (SWA).")
     args = parser.parse_args()
+
+    # User rule: ALWAYS resume from latest, never best. Only auto-default when
+    # no explicit resume AND no intentional weights-only warm start.
+    if args.resume_from is None and args.init_from is None:
+        args.resume_from = resolve_resume_path(None, str(LATEST))
+        if args.resume_from:
+            logger.info(f"🔁 No --resume-from given — auto-resumed from LATEST: {args.resume_from}")
 
     torch.manual_seed(42)
     device = "cuda"
@@ -537,6 +601,7 @@ def main():
                 f"{dt/args.log_interval:.2f}s/step | {tps:.0f} tok/s | GPU {mem:.2f}GB"
             )
 
+        step_save = (step + 1) % args.save_interval == 0 or step + 1 == args.num_steps
         if should_save_checkpoint(step + 1, args.save_interval, last_save_time,
                                   time.time(), args.save_every_minutes) or step + 1 == args.num_steps:
             acc_loss_f = acc_loss.item()  # ONE sync per save, not 16 per step
@@ -551,7 +616,9 @@ def main():
                 "optimizer_state_dict": optimizer.state_dict(),
                 "config": args.__dict__,
             }
-            save_checkpoint_async(state, is_best, logger)
+            save_checkpoint_async(state, is_best, logger,
+                                  swa_window=args.swa_window if step_save else 0,
+                                  swa_step=step + 1)
             last_save_time = time.time()
 
     logger.info("✅ Pure-GPU pretraining complete!")
