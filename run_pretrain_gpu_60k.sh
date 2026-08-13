@@ -34,9 +34,9 @@ if [ ! -f /home/kenpeter/work/checkpoints/megatrain_latest.pt ]; then
 fi
 echo "✅ Preflight passed (free VRAM ${FREE_MB}MiB, disk ${FREE_DISK_GB}GB)"
 
-# ── Power cap: 150W (user-tuned; 200W = 9.1 s/step speed ceiling, 150W ≈ 10.3 s/step, 120W = 11.5 s/step) — non-fatal if sudo fails ──
-echo 'Kenpeter1234!' | sudo -S nvidia-smi -pl 150 > /dev/null 2>&1 \
-  || echo "⚠️  Could not set power limit 150W (non-fatal, continuing)"
+# ── Power cap: 200W (user-tuned — speed ceiling; 285W = zero gain, 150W ≈ 10.3 s/step, 120W = 11.5 s/step) — non-fatal if sudo fails ──
+echo 'Kenpeter1234!' | sudo -S nvidia-smi -pl 200 > /dev/null 2>&1 \
+  || echo "⚠️  Could not set power limit 200W (non-fatal, continuing)"
 
 echo "Starting 60K warm-restart extension at $(date)"
 echo ""
