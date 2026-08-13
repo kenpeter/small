@@ -50,6 +50,7 @@ exec python3 pretrain_gpu.py \
   --liger \
   --cautious \
   --fused-ce \
+  --compile \
   --swa-window 24 \
   --resume-from /home/kenpeter/work/checkpoints/megatrain_latest.pt \
   >> /home/kenpeter/work/train_small.log 2>&1
