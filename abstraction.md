@@ -236,27 +236,27 @@ Mon          Wed         ★Thu         Fri          Sun
 | Betas | (0.9, 0.95) |
 | Weight decay | 0.1 |
 | Gradient clipping | max_norm = 1.0 |
-| Compilation | **torch.compile ENABLED** (`--compile`, Aug 13) — inductor graph fusion over the Liger pipeline; OOM→eager auto-fallback built in (unwraps `_orig_mod`, retries step); one-time JIT ~12–16 min at launch; checkpoints fully compatible. Previously disabled (OOM'd at 11.5 GB pre-fused-CE; fused CE freed 1.9 GB → now fits at ~9.9 GB with ~2 GB headroom) |
+| Compilation | **torch.compile — OOM in prod, always eager fallback (Aug 13)**: `--compile` (reduce-overhead → CUDA graphs) OOMs during JIT warmup on EVERY launch (needs 768 MiB staging, only ~480 MiB free — run holds ~11.2 GB of 12 GB). Both reduce-overhead AND default modes fail; the auto-fallback chain reduce-overhead → default → eager works flawlessly (run never dies, verified 4×). Production runs **eager**: 9.10 s/step @200W. The hoped ~7.6–8 s/step was NOT achieved on this card. Untried path: compile only the 24 transformer blocks (smaller inductor graph, may fit in ~480 MiB). Cost of the failed attempt: ~75 s wasted per launch |
 | Gradient checkpointing | **INERT (verified Aug 13)** — transformers 5.5.3 Llama has no gc dispatch (0 `checkpoint()` calls measured); the run trains **recompute-free**, VRAM fits via Liger fused CE + SDPA + bf16. Pinned by SDLC test `test_gradient_checkpointing_inert_in_transformers` |
 | CPU offloading | Disabled — **pure GPU** (bf16 weights + bf16 AdamW states on GPU). CPUMasterModel offload was the previous approach. |
 | Attention | Flash Attention via `F.scaled_dot_product_attention` |
 | Memory config | `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` (kills fragmentation) |
 | Checkpointing | Every 1000 steps (or 20 min) → `megatrain_latest.pt` + `megatrain_best.pt`; plus lean SWA snapshots (`swa_tail/swa_<step>.pt`, model-only bf16 ~2.1 GB each, last 24 kept via `--swa-window 24`) |
 | Resume rule | **ALWAYS `megatrain_latest.pt`, NEVER best** — auto-default in code since 2026-08-11 (explicit `--resume-from` still wins; `--init-from` = intentional weights-only warm start) |
-| Fused kernels | Liger (`--liger`: RMSNorm/SwiGLU/RoPE) + fused linear+CE (`--fused-ce`: no [B,S,V] logits materialization, frees ~1.9 GB) + **Triton CautiousAdamW tail** (`_cautious_tail_{wd,wd_f64,apply}_kernel`: 2 launches/param vs ~9; bitwise on bf16, ≤1e-6 on fp32; temp-free) |
-| Power limit | **200W — verified ceiling (Aug 13)**: 285W = ZERO gain (SM clocks 2640–2715 MHz either way, 87–88°C thermal throttle wall; extra watts = heat only). 100W = 14.15 s/step / 4,632 tok/s; 200W = 9.12 s/step / 7,183 tok/s (+54%), ~80°C. Re-apply after reboot/GPU-idle events |
+| Fused kernels | Liger (`--liger`: RMSNorm/SwiGLU/RoPE) + fused linear+CE (`--fused-ce`: no [B,S,V] logits materialization, frees ~1.9 GB) + **Triton CautiousAdamW tail** (`_cautious_tail_{wd,wd_f64,apply}_kernel`: 2 launches/param vs ~9; temp-free). **Prod crash → fixed (6c440d8)**: first launch died at optimizer.step — `tl.math.sqrt` got a bf16 scalar (Triton dtype check); fix = scalars precomputed as np.float64 outside the kernel + `.to(fp32)` inside. Loss-continuity verified across the crash (2.05→2.02, no corruption) |
+| Power limit | **120W — user-tuned (Aug 13), auto-applied at launch by `run_pretrain_gpu_60k.sh`** (commit 4171d49; non-fatal if sudo unavailable). Context: 285W = ZERO gain (thermal throttle wall, 87–88°C); 200W = verified speed ceiling (9.12 s/step / 7,183 tok/s, ~80°C); 100W floor = 14.15 s/step / 4,632 tok/s. **120W: 11.49 s/step / 5,701 tok/s, 69°C** (−26% vs 200W for −11°C). No longer needs manual re-apply after reboot — the script does it |
 
 ### Pretraining Scripts
 
 ```bash
 cd /home/kenpeter/work/small
 source venv/bin/activate
-bash run_pretrain_gpu_60k.sh     # CURRENT: 60K warm-restart cycle (batch 4 × accum 8, --curriculum --liger --cautious --fused-ce --compile --swa-window 24)
+bash run_pretrain_gpu_60k.sh     # CURRENT: 60K warm-restart cycle (batch 4 × accum 8, --curriculum --liger --cautious --fused-ce --compile --swa-window 24; sets 120W power cap at launch)
 bash run_pretrain_gpu.sh         # original 30K pure-GPU entry (kept for reference)
 # bash run_pretrain.sh           # legacy: CPUMaster offload (kept for reference)
 ```
 
-**Current training state:** ▶️ **RUNNING 60K cycle (compile-enabled)** — relaunched 2026-08-13 ~12:20 from `megatrain_latest.pt` at **step ~46,650/60,000**, best loss **1.6993** (Aug 11 23:18), 200W, 9.12 s/step (~7,183 tok/s) pre-compile → **~7.6–8 s/step (~8,500+ tok/s) expected** post-JIT. ~9.9 GB VRAM. SWA tail: 10 snapshots. ETA ~Aug 14 ~16:30 @ compiled speed. Tokens: 3.05B seen, 3.93B by step 60K.
+**Current training state:** ▶️ **RUNNING 60K cycle (eager — compile OOMs on this card, see Compilation row)** — relaunched 2026-08-13 13:39 from `megatrain_latest.pt` at **step 46,821/60,000**, best loss **1.6993** (Aug 11 23:18, step ~37K; loss has since risen to and oscillated at ~2.0 since step ~39K — pre-existing warm-restart/curriculum trend, NOT a regression from Aug 13 changes). **120W** → 11.49 s/step / 5,701 tok/s, 69°C, 11.16 GB VRAM. SWA tail: 10+ snapshots. ETA: ~12,900 steps × 11.5 s ≈ 41 h → **~Aug 15 ~07:30 AEST**. Tokens: ~3.1B seen, 3.93B by step 60K.
 
 ---
 
@@ -353,7 +353,7 @@ Not yet started. DPO data was cleaned up — will need fresh preparation when re
 | `reformat_data.py` | Kimi K2-style data reformatting via vLLM chat API |
 | `quick_eval_pretrain.py` | Quick eval of ANY 1B checkpoint (generation + perplexity) — `--ckpt PATH` (default megatrain_latest.pt) |
 | `check_status.sh` | Combined status report: training + downloads + disk |
-| `test_pretrain.py` | Test suite (63 tests — run `./venv/bin/python test_pretrain.py`; MUST pass before any training change) |
+| `test_pretrain.py` | Test suite (66 tests — run `./venv/bin/python test_pretrain.py`; MUST pass before any training change) |
 | `abstraction.md` | This document — full pipeline roadmap |
 
 ---
@@ -474,11 +474,12 @@ Re-enable with `cronjob action=resume` on both IDs.
 
 ## Current State (2026-08-13)
 
-- **Training:** ▶️ RUNNING 60K cycle (compile + Triton-tail enabled) — relaunched Aug 13 ~12:20 from `megatrain_latest.pt` → **step ~46,650/60,000**, best loss **1.6993** (Aug 11 23:18). Batch 4 × accum 8 (eff 32), seq 2048, LR 3e-4→1e-6 cosine, `--curriculum --liger --cautious --fused-ce --compile --swa-window 24`. **200W** (verified ceiling), 9.12 s/step pre-compile → ~7.6–8 s/step expected. ~9.9 GB VRAM. ETA ~Aug 14 ~16:30. 3.05B tokens seen → 3.93B by 60K.
+- **Training:** ▶️ RUNNING 60K cycle — relaunched Aug 13 **13:39** (3rd launch of the day) from `megatrain_latest.pt` → **step 47,100/60,000** @14:31, loss **~2.02** (oscillating since step ~39K; best 1.6993 @ step ~37K), LR 3.43e-05, batch 4 × accum 8 (eff 32), seq 2048, `--curriculum --liger --cautious --fused-ce --compile --swa-window 24`. **EAGER mode** (compile OOMs every launch → auto-fallback, see Compilation row). **120W** (script-applied) → **11.49 s/step / 5,701 tok/s**, 69°C, 11.16 GB VRAM. ETA ~Aug 15 ~07:30 AEST. 3.1B tokens seen → 3.93B by 60K.
+- **Aug 13 launch saga (crash → fix → SIGTERM → clean run):** ① 13:08 launch died at first optimizer.step — Triton tail bf16-scalar bug (`tl.math.sqrt` dtype check), fixed+committed 13:23 (`6c440d8`); ② 13:27 launch ran the fix but was SIGTERM'd (exit 143, session interruption cleanup — not a crash); ③ 13:39 launch = current, clean, loss-continuous across all of it (2.05 → 2.02, zero corruption). Step count unchanged by all launches: resume is always `megatrain_latest.pt` (12:39 save, step 46,821).
 - **Curriculum:** fold 2 (hard→easy mirror) active since step 30K; ratios re-glide every 2000 steps (G1–G4).
 - **SWA tail collection LIVE:** lean model-only snapshots (bf16, ~2.1 GB) in `checkpoints/swa_tail/` every 1000 steps, window 24 ≈ 50 GB (disk 221 GB free). At run end: `swa_average.py` → `megatrain_swa.pt`, then quick-eval vs `megatrain_best.pt` (auto-finalize wired into the 30-min training-progress cron).
 - **Resume rule:** ALWAYS `megatrain_latest.pt`, NEVER best — auto-default in code (explicit path wins).
-- **Power-limit footgun:** resets to 285W after reboot/GPU idle — re-apply `sudo nvidia-smi -pl 200` (sudo pwd in short_term.md). 285W = zero gain (thermal ceiling); 100W = −54% speed.
+- **Power-limit footgun FIXED (Aug 13):** script now applies 120W itself at every launch (`4171d49`, non-fatal if sudo fails) — no more manual re-apply after reboot/GPU-idle. 120W = 11.49 s/step, 69°C; 200W = 9.12 s/step, ~80°C (speed ceiling); 285W = zero gain (thermal wall).
 - **x-small 135M:** parked (stopped at step 45,200; watchdog paused).
 
 ### Recent History (August 2026)
@@ -486,13 +487,14 @@ Re-enable with `cronjob action=resume` on both IDs.
 - **Aug 10 — speed session (3 changes, 57/57 tests):** fused CautiousAdamW moments via `torch._foreach_*` (400→4 launches, bitwise-identical, VRAM-safe); Liger fused CE `--fused-ce` (bitwise-identical to chunked CE, frees ~1.9 GB → batch 4 fits at 9,865 MiB); batch 2→4 × accum 8 (eff 32). Commits cc0ce82 + bdcaae3.
 - **Aug 11 — SWA + resume hardening (63/63 tests):** `--swa-window N` lean tail snapshots + `swa_average.py`; auto-resume-latest default (`resolve_resume_path`); post-resume log-stats fix (`compute_log_stats` — first line after resume divided by 100 instead of true step count → fake Loss 0.27, real ~1.98); `quick_eval_pretrain.py --ckpt`. Commits ec8ae4d → 47b5828.
 - **Aug 11 — machine powered off 06:44 AEST, back ~21:16** (clean shutdown, not a crash; killed a resume that had run 4 min). Power limit had reset to 285W. Training resumed from latest with zero step loss (05:51 checkpoint untouched).
-- **Aug 13 — power ceiling + compile + Triton tail (66/66 tests):** (1) 285W tested = ZERO gain (SM clocks 2640–2715 MHz either way, 87–88°C throttle wall) → **200W is the ceiling** (+54% vs 100W: 14.15 → 9.12 s/step). (2) **torch.compile enabled** with `mode="reduce-overhead"` (CUDA graphs) + fallback chain reduce-overhead → default → eager; fused CE's 1.9 GB headroom made it fit (OOM'd pre-fused-CE). (3) **Gradient-checkpointing discovery:** inert in transformers 5.5.3 (0 `checkpoint()` calls) — run is recompute-free. (4) **Triton CautiousAdamW tail** (2 fused kernels/param, temp-free; bitwise on bf16 — sqrt/div use `_rn` variants + fp64 scalar emulation + explicit fma). Checkpoints backed up to `checkpoints_backup_precompile/`. Commits c5a628e + (this).
+- **Aug 13 — power ceiling + compile + Triton tail (66/66 tests):** (1) 285W tested = ZERO gain (SM clocks 2640–2715 MHz either way, 87–88°C throttle wall) → **200W is the speed ceiling** (+54% vs 100W: 14.15 → 9.12 s/step). (2) **torch.compile enabled** with `mode="reduce-overhead"` (CUDA graphs) + fallback chain reduce-overhead → default → eager. (3) **Gradient-checkpointing discovery:** inert in transformers 5.5.3 (0 `checkpoint()` calls) — run is recompute-free. (4) **Triton CautiousAdamW tail** (2 fused kernels/param, temp-free; bitwise on bf16 — sqrt/div use `_rn` variants + fp64 scalar emulation + explicit fma). Commits c5a628e + 6af89d6.
+- **Aug 13 — production reality check (the hard way):** ① **compile OOMs on this card, every launch** — 768 MiB staging vs ~480 MiB free (run holds ~11.2 GB of 12 GB); reduce-overhead AND default both fail → eager fallback every time (verified 4×: 12:19 / 13:09 / 13:28 / 13:39). The hoped 7.6–8 s/step never materialized; eager 9.10 s/step @200W is the real speed. ② **Triton tail crashed in prod at first optimizer.step** (`tl.math.sqrt` on bf16 scalar — Triton dtype check; suite had passed — gap: suite didn't cover the exact production scalar path). Fixed `6c440d8`: bias-corr scalars precomputed as np.float64 OUTSIDE the kernel, `sqrt` outside, `.to(fp32)` inside — bitwise re-verified. ③ 13:27 relaunch SIGTERM'd by session-interruption cleanup (exit 143, not a crash) → ④ **13:39 relaunch = current clean run.** Loss continuity across the whole saga (2.05 → 2.02) proves zero corruption. ⑤ **Power: 200W → 120W** (user's choice, thermals): 11.49 s/step / 5,701 tok/s @ 69°C vs 9.12 / 7,183 @ ~80°C; **persisted in launch script** (`4171d49`) so it survives reboots. Checkpoints backed up to `checkpoints_backup_precompile/`.
 
 ---
 
 ## Summary
 
 - **Tokens ready:** ~78 GB across 5 domains (math, web, code, synth, reformat), tiered easy/medium/hard
-- **Training:** ▶️ RUNNING 60K cycle @ 100W — step 36,586/60,000 (resumed Aug 11 21:39), best loss 1.7101, batch 4 × accum 8, CautiousAdamW + Liger fused CE, ~14 s/step, ~9.9 GB VRAM. SWA tail collection live (window 24).
+- **Training:** ▶️ RUNNING 60K cycle @ **120W** — step 47,100/60,000 (relaunched Aug 13 13:39), loss ~2.02 (best 1.6993 @ step ~37K), batch 4 × accum 8, CautiousAdamW + Liger fused CE + Triton tail, **eager mode** (compile OOMs → fallback), 11.49 s/step / 5,701 tok/s, ~11.2 GB VRAM. SWA tail collection live (window 24). ETA ~Aug 15 ~07:30 AEST.
 - **SFT assets ready:** 25.76 GB (`_sft_final_shards/`)
 - **Next action:** finish 60K → SWA average → eval `megatrain_swa.pt` vs `megatrain_best.pt` → pick final base → SFT → DPO.
