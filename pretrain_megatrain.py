@@ -441,7 +441,10 @@ class StratifiedShardDataset(Dataset):
 
     def __getitem__(self, idx):
         global_idx = self.epoch_order[idx]
-        return self._fetch_tokens(global_idx)
+        # Dict form carries the per-sample domain for DoReMi-lite per-domain
+        # loss tracking (collate_pretrain branches on dict vs tensor).
+        return {"input_ids": self._fetch_tokens(global_idx),
+                "domain": self.index[global_idx][1]}
 
 
 # Backwards compat alias
@@ -500,12 +503,22 @@ class FlatFarmDataset(Dataset):
 
 
 def collate_pretrain(batch):
-    input_ids = torch.stack(batch)
+    # StratifiedShardDataset yields {"input_ids", "domain"} dicts (DoReMi-lite);
+    # FlatFarmDataset yields raw tensors — both paths stay supported.
+    if isinstance(batch[0], dict):
+        input_ids = torch.stack([b["input_ids"] for b in batch])
+        domains = [b["domain"] for b in batch]
+    else:
+        input_ids = torch.stack(batch)
+        domains = None
     B, T = input_ids.shape
     if FlatFarmDataset._causal_mask_4d is None or FlatFarmDataset._causal_mask_4d.shape[-1] != T:
         FlatFarmDataset._causal_mask_4d = torch.tril(torch.ones((1, 1, T, T), dtype=torch.bool))
     labels = input_ids.clone()
-    return {"input_ids": input_ids, "attention_mask": FlatFarmDataset._causal_mask_4d.expand(B, -1, -1, -1).contiguous(), "labels": labels}
+    out = {"input_ids": input_ids, "attention_mask": FlatFarmDataset._causal_mask_4d.expand(B, -1, -1, -1).contiguous(), "labels": labels}
+    if domains is not None:
+        out["domain"] = domains
+    return out
 
 
 def validate_cpu_params(model, logger):

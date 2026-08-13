@@ -163,9 +163,11 @@ def _compile_warmup(model, dl, device):
     model.zero_grad(set_to_none=True)
 
 
-def run_microbatches(model, data_iter, dl, device, args):
+def run_microbatches(model, data_iter, dl, device, args, tracker=None):
     """One gradient-accumulation window (16 micro-batches). Returns the GPU
-    loss accumulator and the (possibly refreshed) data iterator."""
+    loss accumulator and the (possibly refreshed) data iterator.
+    tracker (DomainLossTracker): optional per-domain loss accumulator for
+    DoReMi-lite reweighting (batch dict must carry a 'domain' key)."""
     acc_loss = torch.zeros((), device=device, dtype=torch.float32)
     for _ in range(args.grad_accum):
         try:
@@ -173,6 +175,14 @@ def run_microbatches(model, data_iter, dl, device, args):
         except StopIteration:
             data_iter = iter(dl)
             batch = next(data_iter)
+        if tracker is not None:
+            doms = batch.get("domain")
+            if doms:
+                _pending_domain = doms[0]
+            else:
+                _pending_domain = None
+        else:
+            _pending_domain = None
         input_ids = batch["input_ids"].to(device, non_blocking=True)
         labels = batch["labels"].to(device, non_blocking=True)
 
@@ -190,6 +200,9 @@ def run_microbatches(model, data_iter, dl, device, args):
             out = model(input_ids=input_ids)
             logits = out.logits  # bf16 [B, S, V] — no labels → HF skips its fp32 loss
             loss = chunked_ce(logits, labels) / args.grad_accum
+        if tracker is not None and _pending_domain is not None:
+            # true micro-batch loss (pre grad_accum division) for per-domain stats
+            tracker.update(_pending_domain, loss.item() * args.grad_accum)
         acc_loss = accumulate_loss(acc_loss, loss)
         loss.backward()
     return acc_loss, data_iter
@@ -536,6 +549,67 @@ def smoothed_loss_at_save(running, n_log, last_logged_avg):
     return last_logged_avg
 
 
+class DomainLossTracker:
+    """Per-domain mean loss accumulator for DoReMi-lite reweighting.
+
+    update() is called once per micro-batch with the domain of that batch
+    and its TRUE loss (pre grad_accum division). means() gives each domain's
+    average loss over the accumulation window; reset() clears the window
+    (called at each curriculum re-glide so the stats match the reweight
+    cadence).
+    """
+
+    def __init__(self):
+        self.sums = {}
+        self.counts = {}
+
+    def update(self, domain, loss_value):
+        self.sums[domain] = self.sums.get(domain, 0.0) + float(loss_value)
+        self.counts[domain] = self.counts.get(domain, 0) + 1
+
+    def means(self):
+        return {d: self.sums[d] / self.counts[d] for d in self.sums}
+
+    def reset(self):
+        self.sums.clear()
+        self.counts.clear()
+
+
+def doremi_adjust(ratios, current, ref, eps=0.3):
+    """DoReMi-style domain reweighting (lite, arXiv 2305.10429).
+
+    Domains whose CURRENT mean loss exceeds their reference baseline
+    (i.e. stuck / not improving) get upweighted; improved domains get
+    downweighted: w_d = ratio_d * exp(eps * (cur_d - ref_d) / ref_d),
+    then renormalized PER TIER (easy/medium/hard) so each tier's total
+    weight is preserved and the G1-G4 tier structure stays intact.
+
+    ratios/current/ref: dicts {domain: value}. Domains missing from
+    current or ref keep their base ratio (excess = 0).
+    """
+    import math as _m
+    out = {}
+    tier_raw = {"_easy": 0.0, "_medium": 0.0, "_hard": 0.0}
+    tier_base = {"_easy": 0.0, "_medium": 0.0, "_hard": 0.0}
+    for d, r in ratios.items():
+        cur_d = current.get(d)
+        ref_d = ref.get(d)
+        if cur_d is not None and ref_d and ref_d > 0:
+            excess = (cur_d - ref_d) / ref_d
+        else:
+            excess = 0.0
+        out[d] = r * _m.exp(eps * excess)
+        for suffix in tier_raw:
+            if d.endswith(suffix):
+                tier_raw[suffix] += out[d]
+                tier_base[suffix] += r
+    for d in out:
+        for suffix in tier_raw:
+            if d.endswith(suffix) and tier_raw[suffix] > 0:
+                out[d] *= tier_base[suffix] / tier_raw[suffix]
+    return {k: round(v, 4) for k, v in out.items() if v > 0}
+
+
 def save_checkpoint_async(state, is_best, logger, output_dir=None,
                           swa_window=0, swa_step=None):
     """Snapshot state to CPU on the calling thread, then write the ~6.2GB file
@@ -629,6 +703,17 @@ def main():
                              "the remaining steps). Without it get_lr uses the absolute step, "
                              "so a late resume lands in the cosine tail (LR ~1e-5) and the "
                              "'warm restart' does nothing.")
+    parser.add_argument("--doremi-lite", action="store_true",
+                        help="DoReMi-lite (arXiv 2305.10429): at each curriculum re-glide, "
+                             "reweight domains by exp(eps * excess) where excess = "
+                             "(current per-domain loss - reference loss) / reference loss. "
+                             "Stuck domains get MORE tokens. Requires --doremi-ref.")
+    parser.add_argument("--doremi-eps", type=float, default=0.3,
+                        help="DoReMi-lite reweight strength (default 0.3; paper uses 1.0 "
+                             "with averaging — smaller is smoother).")
+    parser.add_argument("--doremi-ref", type=str, default="",
+                        help="Path to refs.json (per-domain reference losses from "
+                             "per_domain_ref.py) — the 'before restart' baseline.")
     parser.add_argument("--init-from", type=str, default=None,
                         help="Optional checkpoint .pt to load MODEL WEIGHTS from "
                              "(warm start; optimizer starts fresh — bf16 family)")
@@ -696,6 +781,18 @@ def main():
         logger.info(f"🔥 Warm-started from {args.init_from} (step {ckpt.get('step', '?')})")
         del ckpt, sd
         torch.cuda.empty_cache()
+
+    # ── DoReMi-lite: per-domain loss tracking + reweighting ──
+    doremi_refs = None
+    if args.doremi_lite:
+        if not args.doremi_ref or not os.path.exists(args.doremi_ref):
+            raise ValueError("--doremi-lite requires --doremi-ref refs.json (see per_domain_ref.py)")
+        import json
+        with open(args.doremi_ref) as f:
+            doremi_refs = json.load(f)
+        logger.info(f"🎼 DoReMi-lite ON — {len(doremi_refs)} reference domains, eps={args.doremi_eps}")
+    domain_tracker = DomainLossTracker()
+
     if args.compile:
         logger.info("⚡ Compiling model with torch.compile (mode=reduce-overhead → CUDA graphs; JIT on first steps)...")
         model = torch.compile(model, mode="reduce-overhead")
@@ -755,9 +852,15 @@ def main():
         # G4: windowed JIT shuffle (inside _build_stratified_order)
         if args.curriculum and step > 0 and step % CURRICULUM_UPDATE_INTERVAL == 0:
             new_ratios = get_curriculum_ratios(step, args.num_steps)
+            if doremi_refs is not None:
+                cur_means = domain_tracker.means()
+                new_ratios = doremi_adjust(new_ratios, cur_means, doremi_refs, eps=args.doremi_eps)
+                logger.info(f"🎼 DoReMi per-domain loss: "
+                            f"{ {d: round(v, 3) for d, v in sorted(cur_means.items())} }")
             ds.ratios = new_ratios
             ds._build_stratified_order()
             data_iter = iter(dl)
+            domain_tracker.reset()
             logger.info(f"📚 G1-G4 curriculum @ step {step}: {new_ratios}")
         if args.restart_lr:
             sched_step = (step + 1) - start_step          # local step since resume
@@ -770,7 +873,8 @@ def main():
 
         acc_loss = torch.zeros((), device=device, dtype=torch.float32)
         try:
-            acc_loss, data_iter = run_microbatches(model, data_iter, dl, device, args)
+            acc_loss, data_iter = run_microbatches(model, data_iter, dl, device, args,
+                                                   tracker=domain_tracker)
         except torch.OutOfMemoryError:
             # #1 safety net: compiled mode can OOM mid-step even when the JIT
             # warmup passed (graph capture holds intermediates → ~11.5GB peak).
@@ -782,7 +886,8 @@ def main():
             torch.cuda.empty_cache()
             args.compile = False
             optimizer.zero_grad(set_to_none=True)
-            acc_loss, data_iter = run_microbatches(model, data_iter, dl, device, args)
+            acc_loss, data_iter = run_microbatches(model, data_iter, dl, device, args,
+                                                   tracker=domain_tracker)
 
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
@@ -804,6 +909,10 @@ def main():
                 f"Step {step+1}/{args.num_steps} | Loss {avg:.4f} | LR {lr:.2e} | "
                 f"{s_step:.2f}s/step | {tps:.0f} tok/s | GPU {mem:.2f}GB"
             )
+            pd = domain_tracker.means()
+            if pd:
+                pd_str = " · ".join(f"{d} {v:.2f}" for d, v in sorted(pd.items()))
+                logger.info(f"📊 per-domain: {pd_str}")
 
         step_save = (step + 1) % args.save_interval == 0 or step + 1 == args.num_steps
         if should_save_checkpoint(step + 1, args.save_interval, last_save_time,

@@ -1537,6 +1537,59 @@ def test_smoothed_loss_rejects_single_step_noise():
     print("  PASS: best-pt uses interval-smoothed loss (noise step rejected)")
 
 
+def test_domain_loss_tracker():
+    """Per-domain loss accumulator: sums, means, reset (DoReMi-lite input)."""
+    from pretrain_gpu import DomainLossTracker
+    t = DomainLossTracker()
+    t.update("math_easy", 2.0)
+    t.update("math_easy", 3.0)
+    t.update("web_hard", 5.0)
+    means = t.means()
+    assert abs(means["math_easy"] - 2.5) < 1e-9, f"{_test_name()}: {means}"
+    assert abs(means["web_hard"] - 5.0) < 1e-9
+    t.reset()
+    assert t.means() == {}, f"{_test_name()}: reset failed"
+    print("  PASS: domain loss tracker sums/means/reset")
+
+
+def test_doremi_adjust_upweights_stuck_domains():
+    """DoReMi-lite: stuck domains (excess>0) upweighted, improved downweighted,
+    per-tier totals preserved (G1-G4 tier structure intact)."""
+    from pretrain_gpu import doremi_adjust
+    ratios = {"math_easy": 0.1, "web_easy": 0.1, "math_hard": 0.2, "web_hard": 0.1}
+    ref = {"math_easy": 2.0, "web_easy": 2.0, "math_hard": 3.0, "web_hard": 3.0}
+    # math stuck (+20% loss), web improved (-20%)
+    cur = {"math_easy": 2.4, "web_easy": 1.6, "math_hard": 3.6, "web_hard": 2.4}
+    out = doremi_adjust(ratios, cur, ref, eps=0.3)
+    assert out["math_easy"] > ratios["math_easy"], f"{_test_name()}: stuck not upweighted: {out}"
+    assert out["math_hard"] > ratios["math_hard"], f"{_test_name()}: stuck not upweighted: {out}"
+    assert out["web_easy"] < ratios["web_easy"], f"{_test_name()}: improved not downweighted: {out}"
+    assert out["web_hard"] < ratios["web_hard"], f"{_test_name()}: improved not downweighted: {out}"
+    # per-tier totals preserved
+    easy = out["math_easy"] + out["web_easy"]
+    hard = out["math_hard"] + out["web_hard"]
+    assert abs(easy - 0.2) < 0.002, f"{_test_name()}: easy tier {easy} != 0.2"
+    assert abs(hard - 0.3) < 0.002, f"{_test_name()}: hard tier {hard} != 0.3"
+    print("  PASS: doremi adjust upweights stuck / downweights improved / tiers intact")
+
+
+def test_collate_pretrain_with_domains():
+    """StratifiedShardDataset dict batches carry 'domain'; tensor batches (FlatFarm)
+    still work unchanged (backward compat)."""
+    from pretrain_megatrain import collate_pretrain
+    a = torch.arange(6)          # 1-D seq, like real samples (T=6)
+    b = torch.arange(6, 12)
+    out = collate_pretrain([{"input_ids": a, "domain": "math_easy"},
+                            {"input_ids": b, "domain": "web_hard"}])
+    assert out["domain"] == ["math_easy", "web_hard"], f"{_test_name()}: {out.get('domain')}"
+    assert out["input_ids"].shape == (2, 6)
+    # legacy tensor path
+    out2 = collate_pretrain([a, b])
+    assert "domain" not in out2
+    assert out2["input_ids"].shape == (2, 6)
+    print("  PASS: collate carries domains (dict path) and stays tensor-compatible")
+
+
 def test_resume_defaults_to_latest():
     """resolve_resume_path: explicit wins; else latest if present; else None."""
     from pretrain_gpu import resolve_resume_path
@@ -1618,6 +1671,9 @@ TESTS = [
     test_resume_defaults_to_latest,
     test_log_stats_uses_true_step_count,
     test_smoothed_loss_rejects_single_step_noise,
+    test_domain_loss_tracker,
+    test_doremi_adjust_upweights_stuck_domains,
+    test_collate_pretrain_with_domains,
     test_cautious_tail_triton_bitwise,
     test_gradient_checkpointing_inert_in_transformers,
     test_compile_reduce_overhead_smoke,
