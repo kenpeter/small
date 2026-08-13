@@ -344,59 +344,80 @@ if _HAS_TRITON:
     @triton.jit
     def _cautious_tail_apply_kernel(p_ptr, g_ptr, m_ptr, v_ptr, n_elem,
                                     sqrt_bias_corr2, step_size, eps,
-                                    BLOCK: tl.constexpr):
+                                    MOMENTS_BF16: tl.constexpr, BLOCK: tl.constexpr):
         """Pass 2b: denom, update, cautious mask, apply.
 
-        Mirrors torch op-for-op: v.sqrt() (IEEE sqrtf) then div_ by the FP64
-        math.sqrt(bias_corr2) scalar and add_ of the FP64 eps — both computed
-        in fp64 with a single round to fp32, like torch's scalar kernels.
-        update = m/denom is fp32 tensor/tensor division (IEEE). Mask =
-        (update*g > 0). Apply = single-rounding fma (torch's add_(alpha=)).
-        bf16 params round on store."""
+        MOMENTS_BF16 (production: bf16 AdamW states) — torch computes each
+        in-place op in fp32 opmath and rounds to bf16 on store; div_/add_
+        scalars stay fp32 (verified empirically). fp32 moments — torch's
+        scalar ops compute in fp64 with a single round (math.sqrt divisor,
+        eps); update = m/denom is fp32 tensor division (IEEE div.rn). Apply
+        is a single-rounding fma in both cases (torch's add_(alpha=); alpha
+        pre-rounded to bf16 for bf16 params, fp32 for fp32 params)."""
         pid = tl.program_id(0)
         offs = pid * BLOCK + tl.arange(0, BLOCK)
         mask = offs < n_elem
-        m = tl.load(m_ptr + offs, mask=mask)
-        v = tl.load(v_ptr + offs, mask=mask)
-        g = tl.load(g_ptr + offs, mask=mask)
-        denom = tl.math.sqrt_rn(v).to(tl.float64)          # IEEE sqrtf, widen
-        denom = denom / sqrt_bias_corr2                    # fp64 division (IEEE div.rn.f64)
-        denom = (denom + eps).to(tl.float32)               # fp64 eps add, round fp32
-        update = tl.math.div_rn(m, denom)                  # fp32 tensor div (IEEE)
+        m = tl.load(m_ptr + offs, mask=mask).to(tl.float32)
+        v = tl.load(v_ptr + offs, mask=mask).to(tl.float32)
+        g = tl.load(g_ptr + offs, mask=mask).to(tl.float32)
+        if MOMENTS_BF16:
+            # Each torch in-place op rounds to bf16 on store; fp32 `/` in
+            # triton is approximate, so use div_rn everywhere (IEEE).
+            denom = tl.math.sqrt_rn(v)                           # sqrt in fp32
+            denom = denom.to(tl.bfloat16).to(tl.float32)         # v.sqrt() stores bf16
+            denom = tl.math.div_rn(denom, sqrt_bias_corr2.to(tl.float32))
+            denom = denom.to(tl.bfloat16).to(tl.float32)         # div_ stores bf16
+            denom = (denom + eps.to(tl.float32)).to(tl.bfloat16).to(tl.float32)
+            update = tl.math.div_rn(m, denom)
+            update = update.to(tl.bfloat16).to(tl.float32)       # div stores bf16
+        else:
+            denom = tl.math.sqrt_rn(v).to(tl.float64)        # fp64 scalar semantics
+            denom = denom / sqrt_bias_corr2                  # fp64 division (IEEE)
+            denom = (denom + eps).to(tl.float32)
+            update = tl.math.div_rn(m, denom)                # fp32 tensor div (IEEE)
         update = update * (update * g > 0)
         p = tl.load(p_ptr + offs, mask=mask).to(tl.float32)
-        # torch's add_(alpha=-step_size) is a SINGLE-ROUNDING fp32 fma.
-        p = tl.math.fma(-step_size, update, p)
+        if MOMENTS_BF16:
+            # torch's bf16 add_(alpha=-ss) computes in FP64 with the FP64 alpha
+            # (verified: fp32/bf16 alpha drift at ~1e-4 rate on 3.7M elements).
+            p = (p.to(tl.float64) + (-step_size) * update.to(tl.float64)).to(tl.float32)
+        else:
+            # fp32 params: add_(alpha=) is a SINGLE-ROUNDING fp32 fma.
+            p = tl.math.fma(-step_size.to(tl.float32), update, p)
         tl.store(p_ptr + offs, p, mask=mask)
 
 
     def _cautious_tail_triton(params, grads, states, lr, wd, eps, beta1, beta2):
         """Pass 2 via two fused Triton kernels per param (in-place, temp-free).
 
-        Replaces ~9 torch launches per param with 2; math stays fp32 (scalar
-        ops emulated in fp64 like torch). Verified bitwise against the torch
-        loop in the SDLC suite (bf16 + fp32 params)."""
+        Replaces ~9 torch launches per param with 2; math mirrors torch's
+        dtype-specific semantics (bf16: per-op bf16 rounding + fp32 scalars;
+        fp32: fp64 scalar ops). Verified against the torch loop in the SDLC
+        suite (bitwise for bf16, ≤1e-6 for fp32)."""
         for p, g, s in zip(params, grads, states):
             step = s["step"]
             bias_corr1 = 1.0 - beta1 ** step
             bias_corr2 = 1.0 - beta2 ** step
-            step_size = lr / bias_corr1
-            # torch's div_ kernel receives the FP64 math.sqrt(bias_corr2) and
-            # eps as doubles — keep them fp64 end-to-end in the kernel.
-            sqrt_bias_corr2 = math.sqrt(bias_corr2)
+            step_size = np.float64(lr / bias_corr1)
+            # fp64 scalars passed as np.float64 so triton types the args fp64
+            # (plain Python floats would silently become fp32).
+            sqrt_bias_corr2 = np.float64(math.sqrt(bias_corr2))
+            eps64 = np.float64(eps)
+            moments_bf16 = s["exp_avg"].dtype == torch.bfloat16
             n = p.numel()
             grid = (triton.cdiv(n, 1024),)
             if p.dtype == torch.bfloat16:
-                # torch converts the scalar to bf16 and computes in fp32.
+                # wd scalar: bf16-rounded is bitwise-equivalent for bf16 params
+                # (verified at 3.7M elements — bf16 store rounding dominates).
                 wd_factor = float(torch.tensor(1.0 - lr * wd, dtype=torch.bfloat16))
                 _cautious_tail_wd_kernel[grid](p, n, wd_factor, BLOCK=1024, num_warps=4)
             else:
-                # torch keeps the Python-float scalar as fp64 and rounds once.
+                # fp32 params: torch keeps Python-float scalars in fp64.
                 _cautious_tail_wd_f64_kernel[grid](p, n, 1.0 - lr * wd, BLOCK=1024, num_warps=4)
             _cautious_tail_apply_kernel[grid](
                 p, g, s["exp_avg"], s["exp_avg_sq"], n,
-                sqrt_bias_corr2, step_size, eps,
-                BLOCK=1024, num_warps=4,
+                sqrt_bias_corr2, step_size, eps64,
+                MOMENTS_BF16=moments_bf16, BLOCK=1024, num_warps=4,
             )
 
 

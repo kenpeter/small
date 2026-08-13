@@ -429,12 +429,16 @@ def test_cautious_tail_triton_bitwise():
         return
     torch.manual_seed(7)
     shapes = [(4096,), (3, 512), (75, 49152)]  # incl. embed-ish 2D tensor
-    for dtype in (torch.bfloat16, torch.float32):
+    # (param dtype, moments dtype) — production = bf16/bf16 (bf16 AdamW states)
+    combos = [(torch.bfloat16, torch.bfloat16),
+              (torch.bfloat16, torch.float32),
+              (torch.float32, torch.float32)]
+    for p_dtype, m_dtype in combos:
         for shape in shapes:
-            p_src = torch.randn(*shape, dtype=dtype, device="cuda") * 0.02
-            grad_src = torch.randn(*shape, dtype=dtype, device="cuda") * 0.05
-            m_src = torch.randn(*shape, dtype=torch.float32, device="cuda") * 0.05
-            v_src = torch.rand(*shape, dtype=torch.float32, device="cuda") + 0.5
+            p_src = torch.randn(*shape, dtype=p_dtype, device="cuda") * 0.02
+            grad_src = torch.randn(*shape, dtype=p_dtype, device="cuda") * 0.05
+            m_src = torch.randn(*shape, dtype=m_dtype, device="cuda") * 0.05
+            v_src = torch.rand(*shape, dtype=m_dtype, device="cuda") + 0.5
 
             def build():
                 p = torch.nn.Parameter(p_src.clone())
@@ -454,26 +458,25 @@ def test_cautious_tail_triton_bitwise():
                 pg._HAS_TRITON = True
             p_new, opt_new = build()
             opt_new.step()                   # triton path (dispatcher)
-            if dtype == torch.bfloat16:
+            if p_dtype == torch.bfloat16:
                 # Production dtype: must be BITWISE identical (verified).
                 assert torch.equal(p_ref.detach().cpu(), p_new.detach().cpu()), (
-                    f"step-1 BITWISE mismatch dtype={dtype} shape={shape}")
+                    f"step-1 BITWISE mismatch p={p_dtype} m={m_dtype} shape={shape}")
             else:
                 # fp32: triton's fp64 scalar division differs from IEEE by
                 # ~1e-8 (div_rn is fp32-only, no fp64 _rn escape hatch) — far
-                # below training noise; bf16 store rounding makes it invisible
-                # in production. Tight allclose guards against regressions.
+                # below training noise. Tight allclose guards regressions.
                 assert torch.allclose(p_ref.detach().cpu(), p_new.detach().cpu(), atol=1e-6), (
-                    f"step-1 allclose mismatch dtype={dtype} shape={shape}")
+                    f"step-1 allclose mismatch p={p_dtype} m={m_dtype} shape={shape}")
             opt_ref.step()                   # step 2: state accumulation
             opt_new.step()
-            if dtype == torch.bfloat16:
+            if p_dtype == torch.bfloat16:
                 assert torch.equal(p_ref.detach().cpu(), p_new.detach().cpu()), (
-                    f"step-2 BITWISE mismatch dtype={dtype} shape={shape}")
+                    f"step-2 BITWISE mismatch p={p_dtype} m={m_dtype} shape={shape}")
             else:
                 assert torch.allclose(p_ref.detach().cpu(), p_new.detach().cpu(), atol=1e-6), (
-                    f"step-2 allclose mismatch dtype={dtype} shape={shape}")
-    print("  PASS: triton tail bitwise-identical (bf16) / ≤1e-6 (fp32) to torch loop, 2 steps")
+                    f"step-2 allclose mismatch p={p_dtype} m={m_dtype} shape={shape}")
+    print("  PASS: triton tail bitwise (bf16/bf16 + bf16/fp32) / ≤1e-6 (fp32/fp32), 2 steps")
 
 
 def test_gradient_checkpointing_inert_in_transformers():
