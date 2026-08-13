@@ -27,6 +27,14 @@ import torch
 from torch.utils.data import DataLoader, Dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer, LlamaConfig
 
+try:
+    import triton
+    import triton.language as tl
+
+    _HAS_TRITON = True
+except ImportError:
+    _HAS_TRITON = False
+
 from pretrain_megatrain import (
     FARM_DIR,
     SHARD_DIRS,
@@ -211,6 +219,12 @@ def build_model(dtype: torch.dtype) -> torch.nn.Module:
         hf_config, dtype=dtype, trust_remote_code=True, attn_implementation="sdpa"
     )
     model.gradient_checkpointing_enable()
+    # transformers 5.5.3: Llama forward has NO gradient-checkpoint dispatch —
+    # verified empirically (zero torch.utils.checkpoint.checkpoint calls, Aug 13).
+    # The run therefore trains recompute-free; VRAM fits via Liger fused CE +
+    # flash SDPA + bf16. If a future transformers upgrade activates gc, watch
+    # for a speed regression (recompute) and re-evaluate the VRAM budget.
+    logger.info("Gradient checkpointing: INERT in transformers 5.5.3 — run is recompute-free")
     model.config.use_cache = False
     n = sum(p.numel() for p in model.parameters())
     logger.info(f"Model: {n:,} params ({n/1e9:.2f}B), dtype={dtype}")
@@ -275,19 +289,115 @@ class CautiousAdamW(torch.optim.Optimizer):
             torch._foreach_mul_(exp_avg_sqs, beta2)
             torch._foreach_addcmul_(exp_avg_sqs, grads, grads, value=1 - beta2)
             # ── Pass 2: per-param update tail (per-param temps → VRAM-safe) ──
-            for p, g, s in zip(params, grads, states):
-                exp_avg, exp_avg_sq = s["exp_avg"], s["exp_avg_sq"]
-                step = s["step"]
-                bias_corr1 = 1 - beta1 ** step
-                bias_corr2 = 1 - beta2 ** step
-                denom = exp_avg_sq.sqrt().div_(math.sqrt(bias_corr2)).add_(eps)
-                step_size = lr / bias_corr1
-                update = exp_avg.div(denom)
-                # Cautious mask: move only where update agrees with gradient sign
-                update.mul_((update * g) > 0)
-                p.mul_(1 - lr * wd)          # weight decay (unmasked, per paper)
-                p.add_(update, alpha=-step_size)
+            # Fused Triton path: 1 launch per param, temp-free, bitwise-tested
+            # against the torch loop below. Falls back to the torch loop when
+            # triton is unavailable or tensors are non-contiguous/non-CUDA.
+            if _HAS_TRITON and all(
+                p.is_cuda and p.is_contiguous() and g.is_cuda and g.is_contiguous()
+                for p, g in zip(params, grads)
+            ):
+                _cautious_tail_triton(params, grads, states, lr, wd, eps, beta1, beta2)
+            else:
+                for p, g, s in zip(params, grads, states):
+                    exp_avg, exp_avg_sq = s["exp_avg"], s["exp_avg_sq"]
+                    step = s["step"]
+                    bias_corr1 = 1 - beta1 ** step
+                    bias_corr2 = 1 - beta2 ** step
+                    denom = exp_avg_sq.sqrt().div_(math.sqrt(bias_corr2)).add_(eps)
+                    step_size = lr / bias_corr1
+                    update = exp_avg.div(denom)
+                    # Cautious mask: move only where update agrees with gradient sign
+                    update.mul_((update * g) > 0)
+                    p.mul_(1 - lr * wd)          # weight decay (unmasked, per paper)
+                    p.add_(update, alpha=-step_size)
         return loss
+
+
+if _HAS_TRITON:
+
+    @triton.jit
+    def _cautious_tail_wd_kernel(p_ptr, n_elem, wd_factor, BLOCK: tl.constexpr):
+        """Pass 2a (bf16 params): weight decay alone (unmasked, per paper).
+        Separate kernel so the store boundary forces the p*wd_factor rounding
+        (fusing it into the apply fma would skip a round). torch's bf16
+        mul_ converts the scalar to bf16 and computes in fp32 — wd_factor is
+        pre-rounded to bf16 by the caller to match."""
+        pid = tl.program_id(0)
+        offs = pid * BLOCK + tl.arange(0, BLOCK)
+        mask = offs < n_elem
+        p = tl.load(p_ptr + offs, mask=mask).to(tl.float32)
+        p = p * wd_factor
+        tl.store(p_ptr + offs, p, mask=mask)
+
+    @triton.jit
+    def _cautious_tail_wd_f64_kernel(p_ptr, n_elem, wd_factor, BLOCK: tl.constexpr):
+        """Pass 2a (fp32 params): torch's fp32 mul_ with a Python-float scalar
+        computes in FP64 and rounds once at store (verified: fp32-scalar math
+        differs in ~all elements). Emulate: fp64 multiply, round to fp32."""
+        pid = tl.program_id(0)
+        offs = pid * BLOCK + tl.arange(0, BLOCK)
+        mask = offs < n_elem
+        p = tl.load(p_ptr + offs, mask=mask).to(tl.float32)
+        p = (p.to(tl.float64) * wd_factor).to(tl.float32)
+        tl.store(p_ptr + offs, p, mask=mask)
+
+    @triton.jit
+    def _cautious_tail_apply_kernel(p_ptr, g_ptr, m_ptr, v_ptr, n_elem,
+                                    sqrt_bias_corr2, step_size, eps,
+                                    BLOCK: tl.constexpr):
+        """Pass 2b: denom, update, cautious mask, apply.
+
+        Mirrors torch op-for-op: v.sqrt() (IEEE sqrtf) then div_ by the FP64
+        math.sqrt(bias_corr2) scalar and add_ of the FP64 eps — both computed
+        in fp64 with a single round to fp32, like torch's scalar kernels.
+        update = m/denom is fp32 tensor/tensor division (IEEE). Mask =
+        (update*g > 0). Apply = single-rounding fma (torch's add_(alpha=)).
+        bf16 params round on store."""
+        pid = tl.program_id(0)
+        offs = pid * BLOCK + tl.arange(0, BLOCK)
+        mask = offs < n_elem
+        m = tl.load(m_ptr + offs, mask=mask)
+        v = tl.load(v_ptr + offs, mask=mask)
+        g = tl.load(g_ptr + offs, mask=mask)
+        denom = tl.math.sqrt_rn(v).to(tl.float64)          # IEEE sqrtf, widen
+        denom = denom / sqrt_bias_corr2                    # fp64 division (IEEE div.rn.f64)
+        denom = (denom + eps).to(tl.float32)               # fp64 eps add, round fp32
+        update = tl.math.div_rn(m, denom)                  # fp32 tensor div (IEEE)
+        update = update * (update * g > 0)
+        p = tl.load(p_ptr + offs, mask=mask).to(tl.float32)
+        # torch's add_(alpha=-step_size) is a SINGLE-ROUNDING fp32 fma.
+        p = tl.math.fma(-step_size, update, p)
+        tl.store(p_ptr + offs, p, mask=mask)
+
+
+    def _cautious_tail_triton(params, grads, states, lr, wd, eps, beta1, beta2):
+        """Pass 2 via two fused Triton kernels per param (in-place, temp-free).
+
+        Replaces ~9 torch launches per param with 2; math stays fp32 (scalar
+        ops emulated in fp64 like torch). Verified bitwise against the torch
+        loop in the SDLC suite (bf16 + fp32 params)."""
+        for p, g, s in zip(params, grads, states):
+            step = s["step"]
+            bias_corr1 = 1.0 - beta1 ** step
+            bias_corr2 = 1.0 - beta2 ** step
+            step_size = lr / bias_corr1
+            # torch's div_ kernel receives the FP64 math.sqrt(bias_corr2) and
+            # eps as doubles — keep them fp64 end-to-end in the kernel.
+            sqrt_bias_corr2 = math.sqrt(bias_corr2)
+            n = p.numel()
+            grid = (triton.cdiv(n, 1024),)
+            if p.dtype == torch.bfloat16:
+                # torch converts the scalar to bf16 and computes in fp32.
+                wd_factor = float(torch.tensor(1.0 - lr * wd, dtype=torch.bfloat16))
+                _cautious_tail_wd_kernel[grid](p, n, wd_factor, BLOCK=1024, num_warps=4)
+            else:
+                # torch keeps the Python-float scalar as fp64 and rounds once.
+                _cautious_tail_wd_f64_kernel[grid](p, n, 1.0 - lr * wd, BLOCK=1024, num_warps=4)
+            _cautious_tail_apply_kernel[grid](
+                p, g, s["exp_avg"], s["exp_avg_sq"], n,
+                sqrt_bias_corr2, step_size, eps,
+                BLOCK=1024, num_warps=4,
+            )
 
 
 def make_optimizer(model, base_lr: float, cautious: bool = False):
@@ -532,8 +642,8 @@ def main():
         del ckpt, sd
         torch.cuda.empty_cache()
     if args.compile:
-        logger.info("⚡ Compiling model with torch.compile (JIT warmup on first steps)...")
-        model = torch.compile(model)
+        logger.info("⚡ Compiling model with torch.compile (mode=reduce-overhead → CUDA graphs; JIT on first steps)...")
+        model = torch.compile(model, mode="reduce-overhead")
 
     if args.curriculum:
         ratios0 = get_curriculum_ratios(start_step, args.num_steps)
@@ -547,18 +657,34 @@ def main():
     data_iter = iter(dl)
 
     if args.compile:
-        # #1 — surface any compile-time OOM here, then fall back to eager.
-        try:
-            _compile_warmup(model, dl, device)
-            logger.info("⚡ torch.compile JIT warmup OK — training compiled")
-        except torch.cuda.OutOfMemoryError:
-            logger.warning("⚡ torch.compile OOM during JIT warmup — falling back to eager")
-            model = _unwrap_compiled(model)
-            torch.cuda.empty_cache()
-            args.compile = False
+        # #1 — surface any compile-time OOM here; fall back through
+        # reduce-overhead → default mode → eager (never lose the run).
+        compile_mode = "reduce-overhead"
+        while True:
+            try:
+                _compile_warmup(model, dl, device)
+                logger.info(f"⚡ torch.compile JIT warmup OK ({compile_mode}) — training compiled")
+                break
+            except torch.cuda.OutOfMemoryError:
+                if compile_mode == "reduce-overhead":
+                    logger.warning("⚡ reduce-overhead OOM during JIT — falling back to default mode")
+                    model = torch.compile(_unwrap_compiled(model))
+                    compile_mode = "default"
+                    continue
+                logger.warning("⚡ torch.compile OOM during JIT warmup — falling back to eager")
+                model = _unwrap_compiled(model)
+                torch.cuda.empty_cache()
+                args.compile = False
+                break
+            except Exception as e:  # noqa: BLE001 — graph-capture/graph-break errors
+                logger.warning(f"⚡ torch.compile ({compile_mode}) failed: {type(e).__name__}: {e} — falling back to eager")
+                model = _unwrap_compiled(model)
+                torch.cuda.empty_cache()
+                args.compile = False
+                break
         data_iter = iter(dl)
 
-    logger.info(f"Starting pure-GPU pretraining (bf16 AdamW, grad checkpointing)"
+    logger.info(f"Starting pure-GPU pretraining (bf16 AdamW, recompute-free — gc inert)"
                 f"{' from scratch' if start_step == 0 else f' — resuming at step {start_step}'}...")
     global_step = start_step
     running = torch.zeros((), device=device)

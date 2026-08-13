@@ -236,27 +236,27 @@ Mon          Wed         ★Thu         Fri          Sun
 | Betas | (0.9, 0.95) |
 | Weight decay | 0.1 |
 | Gradient clipping | max_norm = 1.0 |
-| Compilation | Disabled (`torch.compile = False`) |
-| Gradient checkpointing | Enabled |
+| Compilation | **torch.compile ENABLED** (`--compile`, Aug 13) — inductor graph fusion over the Liger pipeline; OOM→eager auto-fallback built in (unwraps `_orig_mod`, retries step); one-time JIT ~12–16 min at launch; checkpoints fully compatible. Previously disabled (OOM'd at 11.5 GB pre-fused-CE; fused CE freed 1.9 GB → now fits at ~9.9 GB with ~2 GB headroom) |
+| Gradient checkpointing | **INERT (verified Aug 13)** — transformers 5.5.3 Llama has no gc dispatch (0 `checkpoint()` calls measured); the run trains **recompute-free**, VRAM fits via Liger fused CE + SDPA + bf16. Pinned by SDLC test `test_gradient_checkpointing_inert_in_transformers` |
 | CPU offloading | Disabled — **pure GPU** (bf16 weights + bf16 AdamW states on GPU). CPUMasterModel offload was the previous approach. |
 | Attention | Flash Attention via `F.scaled_dot_product_attention` |
 | Memory config | `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` (kills fragmentation) |
 | Checkpointing | Every 1000 steps (or 20 min) → `megatrain_latest.pt` + `megatrain_best.pt`; plus lean SWA snapshots (`swa_tail/swa_<step>.pt`, model-only bf16 ~2.1 GB each, last 24 kept via `--swa-window 24`) |
 | Resume rule | **ALWAYS `megatrain_latest.pt`, NEVER best** — auto-default in code since 2026-08-11 (explicit `--resume-from` still wins; `--init-from` = intentional weights-only warm start) |
-| Fused kernels | Liger (`--liger`: RMSNorm/SwiGLU/RoPE) + fused linear+CE (`--fused-ce`: no [B,S,V] logits materialization, frees ~1.9 GB) |
-| Power limit | 100W (user live-tunes 200W→180W→100W; ~14 s/step @ 100W vs 9.5 s @ 180W, cooler) |
+| Fused kernels | Liger (`--liger`: RMSNorm/SwiGLU/RoPE) + fused linear+CE (`--fused-ce`: no [B,S,V] logits materialization, frees ~1.9 GB) + **Triton CautiousAdamW tail** (`_cautious_tail_{wd,wd_f64,apply}_kernel`: 2 launches/param vs ~9; bitwise on bf16, ≤1e-6 on fp32; temp-free) |
+| Power limit | **200W — verified ceiling (Aug 13)**: 285W = ZERO gain (SM clocks 2640–2715 MHz either way, 87–88°C thermal throttle wall; extra watts = heat only). 100W = 14.15 s/step / 4,632 tok/s; 200W = 9.12 s/step / 7,183 tok/s (+54%), ~80°C. Re-apply after reboot/GPU-idle events |
 
 ### Pretraining Scripts
 
 ```bash
 cd /home/kenpeter/work/small
 source venv/bin/activate
-bash run_pretrain_gpu_60k.sh     # CURRENT: 60K warm-restart cycle (batch 4 × accum 8, --curriculum --liger --cautious --fused-ce --swa-window 24)
+bash run_pretrain_gpu_60k.sh     # CURRENT: 60K warm-restart cycle (batch 4 × accum 8, --curriculum --liger --cautious --fused-ce --compile --swa-window 24)
 bash run_pretrain_gpu.sh         # original 30K pure-GPU entry (kept for reference)
 # bash run_pretrain.sh           # legacy: CPUMaster offload (kept for reference)
 ```
 
-**Current training state:** ▶️ **RUNNING 60K cycle** — resumed 2026-08-11 21:39 from `megatrain_latest.pt` at **step 36,586/60,000**, best loss **1.7101**, 100W, ~14 s/step (~4,560 tok/s), ~9.9 GB VRAM. First SWA snapshot lands at step 37,000. ETA ~Aug 12 ~10:25.
+**Current training state:** ▶️ **RUNNING 60K cycle (compile-enabled)** — relaunched 2026-08-13 ~12:20 from `megatrain_latest.pt` at **step ~46,650/60,000**, best loss **1.6993** (Aug 11 23:18), 200W, 9.12 s/step (~7,183 tok/s) pre-compile → **~7.6–8 s/step (~8,500+ tok/s) expected** post-JIT. ~9.9 GB VRAM. SWA tail: 10 snapshots. ETA ~Aug 14 ~16:30 @ compiled speed. Tokens: 3.05B seen, 3.93B by step 60K.
 
 ---
 
@@ -472,13 +472,13 @@ Re-enable with `cronjob action=resume` on both IDs.
 
 ---
 
-## Current State (2026-08-11)
+## Current State (2026-08-13)
 
-- **Training:** ▶️ RUNNING 60K cycle @ **100W** (user live-tunes: 200W→180W→100W — cooler, slower OK). Resumed 21:39 from `megatrain_latest.pt` → **step 36,586/60,000**, best loss **1.7101** (Aug 9 01:47). Batch 4 × accum 8 (eff 32), seq 2048, LR 3e-4→1e-6 cosine, `--curriculum --liger --cautious --fused-ce --swa-window 24`. ~14 s/step, ~9.9 GB VRAM.
+- **Training:** ▶️ RUNNING 60K cycle (compile + Triton-tail enabled) — relaunched Aug 13 ~12:20 from `megatrain_latest.pt` → **step ~46,650/60,000**, best loss **1.6993** (Aug 11 23:18). Batch 4 × accum 8 (eff 32), seq 2048, LR 3e-4→1e-6 cosine, `--curriculum --liger --cautious --fused-ce --compile --swa-window 24`. **200W** (verified ceiling), 9.12 s/step pre-compile → ~7.6–8 s/step expected. ~9.9 GB VRAM. ETA ~Aug 14 ~16:30. 3.05B tokens seen → 3.93B by 60K.
 - **Curriculum:** fold 2 (hard→easy mirror) active since step 30K; ratios re-glide every 2000 steps (G1–G4).
 - **SWA tail collection LIVE:** lean model-only snapshots (bf16, ~2.1 GB) in `checkpoints/swa_tail/` every 1000 steps, window 24 ≈ 50 GB (disk 221 GB free). At run end: `swa_average.py` → `megatrain_swa.pt`, then quick-eval vs `megatrain_best.pt` (auto-finalize wired into the 30-min training-progress cron).
 - **Resume rule:** ALWAYS `megatrain_latest.pt`, NEVER best — auto-default in code (explicit path wins).
-- **Power-limit footgun:** resets to 285W after reboot/GPU idle — re-apply `sudo nvidia-smi -pl 100` (sudo pwd in short_term.md).
+- **Power-limit footgun:** resets to 285W after reboot/GPU idle — re-apply `sudo nvidia-smi -pl 200` (sudo pwd in short_term.md). 285W = zero gain (thermal ceiling); 100W = −54% speed.
 - **x-small 135M:** parked (stopped at step 45,200; watchdog paused).
 
 ### Recent History (August 2026)
@@ -486,6 +486,7 @@ Re-enable with `cronjob action=resume` on both IDs.
 - **Aug 10 — speed session (3 changes, 57/57 tests):** fused CautiousAdamW moments via `torch._foreach_*` (400→4 launches, bitwise-identical, VRAM-safe); Liger fused CE `--fused-ce` (bitwise-identical to chunked CE, frees ~1.9 GB → batch 4 fits at 9,865 MiB); batch 2→4 × accum 8 (eff 32). Commits cc0ce82 + bdcaae3.
 - **Aug 11 — SWA + resume hardening (63/63 tests):** `--swa-window N` lean tail snapshots + `swa_average.py`; auto-resume-latest default (`resolve_resume_path`); post-resume log-stats fix (`compute_log_stats` — first line after resume divided by 100 instead of true step count → fake Loss 0.27, real ~1.98); `quick_eval_pretrain.py --ckpt`. Commits ec8ae4d → 47b5828.
 - **Aug 11 — machine powered off 06:44 AEST, back ~21:16** (clean shutdown, not a crash; killed a resume that had run 4 min). Power limit had reset to 285W. Training resumed from latest with zero step loss (05:51 checkpoint untouched).
+- **Aug 13 — power ceiling + compile + Triton tail (66/66 tests):** (1) 285W tested = ZERO gain (SM clocks 2640–2715 MHz either way, 87–88°C throttle wall) → **200W is the ceiling** (+54% vs 100W: 14.15 → 9.12 s/step). (2) **torch.compile enabled** with `mode="reduce-overhead"` (CUDA graphs) + fallback chain reduce-overhead → default → eager; fused CE's 1.9 GB headroom made it fit (OOM'd pre-fused-CE). (3) **Gradient-checkpointing discovery:** inert in transformers 5.5.3 (0 `checkpoint()` calls) — run is recompute-free. (4) **Triton CautiousAdamW tail** (2 fused kernels/param, temp-free; bitwise on bf16 — sqrt/div use `_rn` variants + fp64 scalar emulation + explicit fma). Checkpoints backed up to `checkpoints_backup_precompile/`. Commits c5a628e + (this).
 
 ---
 

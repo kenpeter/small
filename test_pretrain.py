@@ -412,6 +412,124 @@ def test_torch_compile_smoke():
     print(f"  PASS: torch.compile wraps and runs a tiny model")
 
 
+def test_cautious_tail_triton_bitwise():
+    """Triton fused update tail must match the torch loop BITWISE (CUDA+triton).
+
+    Both optimizers are built from IDENTICAL clones of the same source tensors
+    (two separate build() calls would draw from different RNG positions and
+    compare apples to oranges). The reference forces the torch-loop path by
+    temporarily clearing the module's _HAS_TRITON flag."""
+    import torch
+    if not torch.cuda.is_available():
+        print("  SKIP: no CUDA available")
+        return
+    import pretrain_gpu as pg
+    if not pg._HAS_TRITON:
+        print("  SKIP: triton unavailable")
+        return
+    torch.manual_seed(7)
+    shapes = [(4096,), (3, 512), (75, 49152)]  # incl. embed-ish 2D tensor
+    for dtype in (torch.bfloat16, torch.float32):
+        for shape in shapes:
+            p_src = torch.randn(*shape, dtype=dtype, device="cuda") * 0.02
+            grad_src = torch.randn(*shape, dtype=dtype, device="cuda") * 0.05
+            m_src = torch.randn(*shape, dtype=torch.float32, device="cuda") * 0.05
+            v_src = torch.rand(*shape, dtype=torch.float32, device="cuda") + 0.5
+
+            def build():
+                p = torch.nn.Parameter(p_src.clone())
+                opt = pg.CautiousAdamW([p], lr=3e-4, weight_decay=0.1)
+                st = opt.state[p]
+                st["step"] = 1
+                st["exp_avg"] = m_src.clone()
+                st["exp_avg_sq"] = v_src.clone()
+                p.grad = grad_src.clone()
+                return p, opt
+
+            p_ref, opt_ref = build()
+            pg._HAS_TRITON = False          # force the torch-loop reference
+            try:
+                opt_ref.step()
+            finally:
+                pg._HAS_TRITON = True
+            p_new, opt_new = build()
+            opt_new.step()                   # triton path (dispatcher)
+            if dtype == torch.bfloat16:
+                # Production dtype: must be BITWISE identical (verified).
+                assert torch.equal(p_ref.detach().cpu(), p_new.detach().cpu()), (
+                    f"step-1 BITWISE mismatch dtype={dtype} shape={shape}")
+            else:
+                # fp32: triton's fp64 scalar division differs from IEEE by
+                # ~1e-8 (div_rn is fp32-only, no fp64 _rn escape hatch) — far
+                # below training noise; bf16 store rounding makes it invisible
+                # in production. Tight allclose guards against regressions.
+                assert torch.allclose(p_ref.detach().cpu(), p_new.detach().cpu(), atol=1e-6), (
+                    f"step-1 allclose mismatch dtype={dtype} shape={shape}")
+            opt_ref.step()                   # step 2: state accumulation
+            opt_new.step()
+            if dtype == torch.bfloat16:
+                assert torch.equal(p_ref.detach().cpu(), p_new.detach().cpu()), (
+                    f"step-2 BITWISE mismatch dtype={dtype} shape={shape}")
+            else:
+                assert torch.allclose(p_ref.detach().cpu(), p_new.detach().cpu(), atol=1e-6), (
+                    f"step-2 allclose mismatch dtype={dtype} shape={shape}")
+    print("  PASS: triton tail bitwise-identical (bf16) / ≤1e-6 (fp32) to torch loop, 2 steps")
+
+
+def test_gradient_checkpointing_inert_in_transformers():
+    """Pin Aug-13 discovery: transformers 5.5.3 Llama has NO gc dispatch —
+    gradient_checkpointing_enable() is a no-op, so the run is recompute-free.
+    If this fails after a transformers upgrade, gc has activated: re-measure
+    speed/VRAM before trusting the 'recompute-free' assumption."""
+    import torch
+    if not torch.cuda.is_available():
+        print("  SKIP: no CUDA available")
+        return
+    import torch.utils.checkpoint as ckpt
+    from transformers import LlamaConfig, LlamaForCausalLM
+    torch.manual_seed(0)
+    cfg = LlamaConfig(vocab_size=1024, hidden_size=128, intermediate_size=256,
+                      num_hidden_layers=4, num_attention_heads=4,
+                      num_key_value_heads=2, head_dim=32)
+    x = torch.randint(0, 1024, (2, 32)).cuda()
+    orig = ckpt.checkpoint
+    calls = [0]
+    def counting(*a, **k):
+        calls[0] += 1
+        return orig(*a, **k)
+    ckpt.checkpoint = counting
+    m = LlamaForCausalLM(cfg).cuda().train()
+    m.gradient_checkpointing_enable()
+    loss = m(x, labels=x).loss
+    loss.backward()
+    assert calls[0] == 0, (
+        f"gc dispatch ACTIVE ({calls[0]} checkpoint calls) — update the inert-gc assumption"
+    )
+    print("  PASS: gradient checkpointing inert (recompute-free) in transformers 5.5.3")
+
+
+def test_compile_reduce_overhead_smoke():
+    """torch.compile(mode=reduce-overhead) must run fwd+bwd with finite loss
+    on a tiny HF Llama (CUDA). Guards the #1 CUDA-graphs lever."""
+    import torch
+    if not torch.cuda.is_available():
+        print("  SKIP: no CUDA available")
+        return
+    from transformers import LlamaConfig, LlamaForCausalLM
+    torch.manual_seed(0)
+    cfg = LlamaConfig(vocab_size=512, hidden_size=64, intermediate_size=128,
+                      num_hidden_layers=2, num_attention_heads=4,
+                      num_key_value_heads=2, head_dim=16, max_position_embeddings=64)
+    m = LlamaForCausalLM(cfg).to("cuda").bfloat16().train()
+    m.gradient_checkpointing_enable()
+    m = torch.compile(m, mode="reduce-overhead")
+    x = torch.randint(0, 512, (1, 32)).to("cuda")
+    loss = m(x, labels=x).loss
+    loss.backward()
+    assert torch.isfinite(loss), f"loss not finite: {loss}"
+    print("  PASS: reduce-overhead compile runs fwd+bwd, loss finite")
+
+
 def test_optimizer_groups_fused():
     """make_optimizer must return AdamW with fused=True on every param group."""
     from pretrain_gpu import make_optimizer
@@ -1475,6 +1593,9 @@ TESTS = [
     test_swa_average_matches_mean,
     test_resume_defaults_to_latest,
     test_log_stats_uses_true_step_count,
+    test_cautious_tail_triton_bitwise,
+    test_gradient_checkpointing_inert_in_transformers,
+    test_compile_reduce_overhead_smoke,
 ]
 
 if __name__ == "__main__":
