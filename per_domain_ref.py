@@ -21,7 +21,7 @@ import torch
 import torch.nn.functional as F
 
 from pretrain_megatrain import SHARD_DIRS, _load_shard_list
-from pretrain_gpu import build_model, fused_ce
+from pretrain_gpu import build_model, chunked_ce
 
 SEQ_LEN = 2048
 
@@ -48,7 +48,8 @@ def eval_domain(model, shard_path, seq_len, n_samples, device):
                     break
             toks = toks.to(device).unsqueeze(0)
             hidden = model.model.norm(model.model(toks).last_hidden_state)
-            loss = fused_ce(hidden, model.lm_head.weight, toks)  # already /1
+            logits = F.linear(hidden, model.lm_head.weight)  # bf16 [1, S, V]
+            loss = chunked_ce(logits, toks)  # CPU-safe; identical to fused CE
             losses.append(loss.item())
     if not losses:
         return None
