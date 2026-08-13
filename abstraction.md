@@ -222,6 +222,36 @@ Mon          Wed         ★Thu         Fri          Sun
 
 ---
 
+## DoReMi-Lite — Loss-Driven Domain Reweighting (implemented, opt-in)
+
+> **Status: IMPLEMENTED but DORMANT** (commits `4816bbf`, `db5f763`) — NOT active in the
+> current 115K cycle (requires `refs.json` baselines, which don't exist yet).
+
+Lite variant of DoReMi (arXiv 2305.10429) — **no separate reference model**. Per-domain
+reference losses come from a baseline run (JSON file); the model's own per-domain losses
+are compared to them at every curriculum re-glide:
+
+```
+w_d = ratio_d × exp(eps × (cur_d − ref_d) / ref_d)     # eps default 0.3 (paper: 1.0 with averaging)
+```
+
+- **Stuck domains** (cur > ref) → upweighted; improved domains → downweighted
+- **Renormalized PER TIER** (easy/medium/hard) → G1–G4 tier structure preserved intact
+- **When:** every `CURRICULUM_UPDATE_INTERVAL` = **2000 steps** — same hook as the G3 glide
+  (`pretrain_gpu.py:853`): ratios rebuilt → epoch order reshuffled → tracker reset
+- **Mechanics:** `DomainLossTracker` accumulates TRUE per-micro-batch loss per domain (pre
+  grad-accum division) over the 2000-step window; `doremi_adjust()` applies the formula
+- **Flags:** `--doremi-lite --doremi-ref refs.json --doremi-eps 0.3` (opt-in)
+- **Why 2000, not 500 (update interval):** per-domain loss noise floor. A 2000-step window
+  = 131M tokens ≈ 3,200 sequences per 5% domain → mean std err ±0.01–0.02. A 500-step window
+  ≈ 800 sequences → ±0.03–0.05, at/below the stall signal (excess typically 0.02–0.05) →
+  you'd reweight on noise + 4× more epoch-order rebuilds (~35s each, 20.6M samples).
+  **Want faster response? Raise `--doremi-eps` (0.3 → 0.5), don't shorten the interval.**
+- **To activate:** generate `refs.json` (per-domain losses from a stable baseline checkpoint),
+  add the two flags to the launch command, SDLC-test, ship.
+
+---
+
 ## Pretraining Configuration (Current)
 
 | Parameter | Value |
@@ -251,12 +281,12 @@ Mon          Wed         ★Thu         Fri          Sun
 ```bash
 cd /home/kenpeter/work/small
 source venv/bin/activate
-bash run_pretrain_gpu_60k.sh     # CURRENT: 60K warm-restart cycle (batch 4 × accum 8, --curriculum --liger --cautious --fused-ce --compile --swa-window 24; sets 120W power cap at launch)
+bash run_pretrain_gpu_60k.sh     # STALE (60K era) since Aug 14: superseded by the manual 115K cycle — canonical launch cmd lives in watchdog_pretrain.py; script applies 100W power cap
 bash run_pretrain_gpu.sh         # original 30K pure-GPU entry (kept for reference)
 # bash run_pretrain.sh           # legacy: CPUMaster offload (kept for reference)
 ```
 
-**Current training state:** ▶️ **RUNNING 60K cycle (eager — compile OOMs on this card, see Compilation row)** — relaunched 2026-08-13 13:39 from `megatrain_latest.pt` at **step 46,821/60,000**, best loss **1.6993** (Aug 11 23:18, step ~37K; loss has since risen to and oscillated at ~2.0 since step ~39K — pre-existing warm-restart/curriculum trend, NOT a regression from Aug 13 changes). **120W** → 11.49 s/step / 5,701 tok/s, 69°C, 11.16 GB VRAM. SWA tail: 10+ snapshots. ETA: ~12,900 steps × 11.5 s ≈ 41 h → **~Aug 15 ~07:30 AEST**. Tokens: ~3.1B seen, 3.93B by step 60K.
+**Current training state:** ▶️ **RUNNING 115K warm-restart cycle @ 100W** — config superseded; see **Current State (2026-08-14)** below (this 60K-era row kept for history).
 
 ---
 
@@ -482,6 +512,14 @@ Re-enable with `cronjob action=resume` on both IDs.
 - **Power-limit footgun FIXED (Aug 13):** script now applies 120W itself at every launch (`4171d49`, non-fatal if sudo fails) — no more manual re-apply after reboot/GPU-idle. 120W = 11.49 s/step, 69°C; 200W = 9.12 s/step, ~80°C (speed ceiling); 285W = zero gain (thermal wall).
 - **x-small 135M:** parked (stopped at step 45,200; watchdog paused).
 
+### Current State (2026-08-14)
+
+- **Training:** ▶️ RUNNING **115K warm-restart cycle** — resumed **07:05** from `pretrained_paused.pt` (step 52,690) with **one-time** `--restart-lr` (LR peaked 3e-4, cosine over 62,310 remaining steps) + `--rebaseline-best` (best reset to inf → honest new best **1.9815** @ step ~52.8K). Step **52,900/115,000** @08:07, loss **1.9881**, LR 1.58e-04 (warmup ramp), **14.30 s/step / 4,583 tok/s @ 100W**, 64°C, 11.15 GB VRAM. torch.compile OOM'd at JIT **again** (every launch) → eager fallback, as documented.
+- **08:14 silent crash + recovery:** training died ~08:07 (right after a checkpoint save — no traceback, no OOM in dmesg, cause unknown). Watchdog cron had a stalled gap (07:58 → 08:16) → **manually relaunched 08:17** with the watchdog's canonical 115K command — **NO `--restart-lr` / `--rebaseline-best`** (one-time only per watchdog comment; LR continues absolute-step cosine ≈ 4e-5 at 52.9K). Resumed from `megatrain_latest.pt` (step 52,900 — zero step loss).
+- **DoReMi-lite:** implemented (`4816bbf`, `db5f763`) but **DORMANT** — no `refs.json`, flags not in the launch command (see DoReMi-Lite section).
+- **Loss band:** oscillating ~1.98–2.03 (pre-rebaseline best 1.6993 was the previous cycle's metric — not comparable).
+- **Watchdog config (2026-08-14):** `watchdog_pretrain.py` relaunches the 115K cycle from `megatrain_latest.pt` every 5 min when dead (log stale >180s); NO restart-lr/rebaseline/DoReMi flags — keep in sync if the cycle changes.
+
 ### Recent History (August 2026)
 
 - **Aug 10 — speed session (3 changes, 57/57 tests):** fused CautiousAdamW moments via `torch._foreach_*` (400→4 launches, bitwise-identical, VRAM-safe); Liger fused CE `--fused-ce` (bitwise-identical to chunked CE, frees ~1.9 GB → batch 4 fits at 9,865 MiB); batch 2→4 × accum 8 (eff 32). Commits cc0ce82 + bdcaae3.
@@ -495,6 +533,6 @@ Re-enable with `cronjob action=resume` on both IDs.
 ## Summary
 
 - **Tokens ready:** ~78 GB across 5 domains (math, web, code, synth, reformat), tiered easy/medium/hard
-- **Training:** ▶️ RUNNING 60K cycle @ **120W** — step 47,100/60,000 (relaunched Aug 13 13:39), loss ~2.02 (best 1.6993 @ step ~37K), batch 4 × accum 8, CautiousAdamW + Liger fused CE + Triton tail, **eager mode** (compile OOMs → fallback), 11.49 s/step / 5,701 tok/s, ~11.2 GB VRAM. SWA tail collection live (window 24). ETA ~Aug 15 ~07:30 AEST.
+- **Training:** ▶️ RUNNING **115K warm-restart cycle** @ **100W** — step ~52,900+/115,000 (relaunched Aug 14 08:17 after silent crash ~08:07; one-time LR restart + best rebaseline at the 07:05 resume), loss ~1.99 band (best 1.9815), batch 4 × accum 8, CautiousAdamW + Liger fused CE + Triton tail, **eager mode** (compile OOMs → fallback), 14.30 s/step / 4,583 tok/s, ~11.15 GB VRAM. SWA tail collection live (window 24). **DoReMi-lite implemented but dormant** (no refs.json).
 - **SFT assets ready:** 25.76 GB (`_sft_final_shards/`)
-- **Next action:** finish 60K → SWA average → eval `megatrain_swa.pt` vs `megatrain_best.pt` → pick final base → SFT → DPO.
+- **Next action:** finish 115K → SWA average → eval `megatrain_swa.pt` vs `megatrain_best.pt` → pick final base → SFT → DPO.
