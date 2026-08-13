@@ -519,6 +519,23 @@ def save_swa_snapshot_robust(step, cpu_model_sd, window, output_dir, logger):
                 pass
 
 
+def smoothed_loss_at_save(running, n_log, last_logged_avg):
+    """Interval-smoothed loss for best-pt tracking (replaces single-step).
+
+    Regression fix (2026-08-14): is_best compared acc_loss.item() — ONE
+    step's loss, which swings ±0.5+ with the per-step domain mix (an
+    all-easy step can hit 1.4 while the 100-step average is 2.0) → best.pt
+    tracked single-step noise ('Best loss 1.4603' logged while the smoothed
+    loss was 2.04). Uses the same interval average the log line reports;
+    falls back to the last logged average when the save fires on a log
+    boundary (n_log == 0 — happens at every step_save, since log and save
+    share the step).
+    """
+    if n_log > 0:
+        return (running / n_log).item()
+    return last_logged_avg
+
+
 def save_checkpoint_async(state, is_best, logger, output_dir=None,
                           swa_window=0, swa_step=None):
     """Snapshot state to CPU on the calling thread, then write the ~6.2GB file
@@ -602,6 +619,16 @@ def main():
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--warmup-steps", type=int, default=WARMUP_DEFAULT)
     parser.add_argument("--min-lr", type=float, default=1e-6)
+    parser.add_argument("--rebaseline-best", action="store_true",
+                        help="One-time: reset best_loss=inf at start so the FIRST save "
+                             "re-baselines best.pt with an honest smoothed loss. Use after "
+                             "the is_best smoothing fix to clear a noise-polluted best.pt.")
+    parser.add_argument("--restart-lr", action="store_true",
+                        help="TRUE warm restart: LR schedule restarts from local step 0 at "
+                             "resume (400-step warmup → base_lr peak → cosine to min_lr over "
+                             "the remaining steps). Without it get_lr uses the absolute step, "
+                             "so a late resume lands in the cosine tail (LR ~1e-5) and the "
+                             "'warm restart' does nothing.")
     parser.add_argument("--init-from", type=str, default=None,
                         help="Optional checkpoint .pt to load MODEL WEIGHTS from "
                              "(warm start; optimizer starts fresh — bf16 family)")
@@ -651,6 +678,13 @@ def main():
     best_loss = float("inf")
     if args.resume_from and os.path.exists(args.resume_from):
         start_step, best_loss = apply_resume(args.resume_from, model, optimizer, logger)
+        if args.restart_lr:
+            logger.warning(f"♻️  --restart-lr: LR restarts at local step 0 (peak {args.lr}, "
+                           f"cosine over {max(args.num_steps - start_step, 1)} remaining steps)")
+        if args.rebaseline_best:
+            logger.warning("♻️  --rebaseline-best: best_loss reset to inf — first save "
+                           "re-baselines best.pt with an honest smoothed loss")
+            best_loss = float("inf")
     elif args.init_from and os.path.exists(args.init_from):
         ckpt = torch.load(args.init_from, map_location="cpu", weights_only=False)
         sd = ckpt["model_state_dict"]
@@ -709,6 +743,7 @@ def main():
                 f"{' from scratch' if start_step == 0 else f' — resuming at step {start_step}'}...")
     global_step = start_step
     running = torch.zeros((), device=device)
+    last_logged_avg = float("inf")  # for is_best smoothing when a save lands on a log boundary
     t0 = time.time()
     last_save_time = time.time()
     last_log_step = start_step  # first log after resume has < log_interval steps
@@ -724,7 +759,12 @@ def main():
             ds._build_stratified_order()
             data_iter = iter(dl)
             logger.info(f"📚 G1-G4 curriculum @ step {step}: {new_ratios}")
-        lr = get_lr(step + 1, args.warmup_steps, args.num_steps, args.lr, args.min_lr)
+        if args.restart_lr:
+            sched_step = (step + 1) - start_step          # local step since resume
+            sched_total = max(args.num_steps - start_step, 1)
+            lr = get_lr(sched_step, args.warmup_steps, sched_total, args.lr, args.min_lr)
+        else:
+            lr = get_lr(step + 1, args.warmup_steps, args.num_steps, args.lr, args.min_lr)
         for g in optimizer.param_groups:
             g["lr"] = lr
 
@@ -757,6 +797,7 @@ def main():
             last_log_step = step + 1
             avg, tps, s_step = compute_log_stats(
                 running, n_log, dt, args.batch_size, args.max_seq_len, args.grad_accum)
+            last_logged_avg = avg
             running = torch.zeros((), device=device)
             mem = torch.cuda.max_memory_allocated(device) / 1024**3
             logger.info(
@@ -767,13 +808,17 @@ def main():
         step_save = (step + 1) % args.save_interval == 0 or step + 1 == args.num_steps
         if should_save_checkpoint(step + 1, args.save_interval, last_save_time,
                                   time.time(), args.save_every_minutes) or step + 1 == args.num_steps:
-            acc_loss_f = acc_loss.item()  # ONE sync per save, not 16 per step
-            is_best = acc_loss_f < best_loss
+            # is_best on the interval-smoothed loss, NOT the current step's —
+            # single steps swing ±0.5 with the per-step domain mix (see
+            # smoothed_loss_at_save). ONE sync per save, not 16 per step.
+            smoothed = smoothed_loss_at_save(
+                running, (step + 1) - last_log_step, last_logged_avg)
+            is_best = smoothed < best_loss
             if is_best:
-                best_loss = acc_loss_f
+                best_loss = smoothed
             state = {
                 "step": step + 1,
-                "loss": acc_loss_f,
+                "loss": smoothed,
                 "best_loss": best_loss,
                 "model_state_dict": model.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),

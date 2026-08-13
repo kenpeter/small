@@ -1516,6 +1516,27 @@ def test_log_stats_uses_true_step_count():
     print("  PASS: log stats divide by true step count (resume line honest)")
 
 
+def test_smoothed_loss_rejects_single_step_noise():
+    """Regression (2026-08-14): is_best compared ONE step's loss (acc_loss.item()).
+
+    A lucky all-easy step at 1.46 faked 'Best loss 1.4603' in the log while
+    the 100-step smoothed average was 2.04 → best.pt tracked per-step domain
+    mix noise, not genuine progress. The fix: best-pt tracking uses the
+    interval-smoothed average (same number the log line reports).
+    """
+    from pretrain_gpu import smoothed_loss_at_save
+    # 100-step interval averaging 2.04 → smoothed MUST be 2.04, not 1.46
+    smoothed = smoothed_loss_at_save(torch.full((), 204.0), 100, 2.04)
+    assert abs(smoothed - 2.04) < 1e-5, f"{_test_name()}: smoothed = {smoothed}"
+    # old code compared 1.46 < 1.6993 → fake best; smoothed 2.04 must NOT be best
+    assert not (smoothed < 1.6993), f"{_test_name()}: noise step faked a best!"
+    # a genuine improvement still wins
+    assert smoothed_loss_at_save(torch.full((), 150.0), 100, 1.5) < 1.6993
+    # save on a log boundary (n_log == 0, every 1000-step save) → logged avg
+    assert smoothed_loss_at_save(torch.zeros(()), 0, 2.01) == 2.01
+    print("  PASS: best-pt uses interval-smoothed loss (noise step rejected)")
+
+
 def test_resume_defaults_to_latest():
     """resolve_resume_path: explicit wins; else latest if present; else None."""
     from pretrain_gpu import resolve_resume_path
@@ -1596,6 +1617,7 @@ TESTS = [
     test_swa_average_matches_mean,
     test_resume_defaults_to_latest,
     test_log_stats_uses_true_step_count,
+    test_smoothed_loss_rejects_single_step_noise,
     test_cautious_tail_triton_bitwise,
     test_gradient_checkpointing_inert_in_transformers,
     test_compile_reduce_overhead_smoke,
