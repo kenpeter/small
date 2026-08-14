@@ -247,6 +247,10 @@ w_d = ratio_d × exp(eps × (cur_d − ref_d) / ref_d)     # eps default 0.3 (pa
   ≈ 800 sequences → ±0.03–0.05, at/below the stall signal (excess typically 0.02–0.05) →
   you'd reweight on noise + 4× more epoch-order rebuilds (~35s each, 20.6M samples).
   **Want faster response? Raise `--doremi-eps` (0.3 → 0.5), don't shorten the interval.**
+- **Status:** ✅ **ACTIVE since Aug 15 (step 59,100 resume, 115K cycle)** — refs.json computed from
+  the step-59,100 checkpoint (13 domains; note `code_hard` ref=0.0182 — near-memorized tiny domain,
+  its relative excess will be noisy but tier-normalization bounds the damage). Flags live in
+  `watchdog_pretrain.py` launch cmd so crash-restarts keep DoReMi on.
 - **To activate:** generate `refs.json` (per-domain losses from a stable baseline checkpoint),
   add the two flags to the launch command, SDLC-test, ship.
 
