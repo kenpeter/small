@@ -254,6 +254,9 @@ w_d = ratio_d × exp(eps × (cur_d − ref_d) / ref_d)     # eps default 0.3 (pa
 - **WEB_BOOST=1.5 (pretrain_megatrain.py):** web lags every domain (ref 2.96-3.26 vs 1.4-2.3 rest) —
   web_* shares ×1.5 then per-tier renormalized (G1-G4 tier totals intact, same principle as DoReMi).
   Web ≈22% → 30% of tokens at step 59K, drifting to ~34% by run end.
+- **HOT-RELOAD (c365fad, agent-in-the-loop DoReMi):** `curriculum_boost.json` per-domain multipliers
+  override WEB_BOOST, re-read at every re-glide (2000 steps) — the agent edits the JSON to rebalance
+  domains with ZERO restarts. Workflow + pitfalls in skill `agent-in-the-loop-doremi`. SDLC 72/72.
 - **To activate:** generate `refs.json` (per-domain losses from a stable baseline checkpoint),
   add the two flags to the launch command, SDLC-test, ship.
 
