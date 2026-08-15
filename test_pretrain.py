@@ -1618,13 +1618,16 @@ def test_web_boost_upweights_web_preserves_tiers():
         saved = _pmt.WEB_BOOST
         saved_file = _pmt.WEB_BOOST_FILE
         try:
-            _pmt.WEB_BOOST = 1.0
+            # isolate from curriculum_boost.json — this test exercises the
+            # WEB_BOOST code default only (the JSON path has its own test)
             _pmt.WEB_BOOST_FILE = _pmt.WEB_BOOST_FILE.with_name("_nonexistent_boost.json")
+            _pmt.WEB_BOOST = 1.0
             r_off = _pmt.get_curriculum_ratios(step, total)
+            _pmt.WEB_BOOST = saved
+            r_on = _pmt.get_curriculum_ratios(step, total)
         finally:
             _pmt.WEB_BOOST = saved
             _pmt.WEB_BOOST_FILE = saved_file
-        r_on = _pmt.get_curriculum_ratios(step, total)
         e_off, m_off, h_off = _tier_weights(r_off)
         e_on, m_on, h_on = _tier_weights(r_on)
         assert abs(e_on - e_off) < 1e-3, f"easy tier moved: {e_off:.4f}->{e_on:.4f} @ {step}"
@@ -1688,6 +1691,19 @@ def test_web_boost_hot_reload_json():
         expected = base_e * 1.5 / (1.0 + 0.5 * base_e)
         assert abs((r2["web_easy"] / e2) - expected) < 2e-3, \
             f"fallback share {(r2['web_easy']/e2):.4f} != expected {expected:.4f}"
+        # STRICT dead-file check: a non-web boost MUST move its share (this
+        # catches a silently-failing file read, e.g. NameError on json — the
+        # web-only assertions above hold even when the file is ignored).
+        # web_* set to 1.0 so the closed form holds (only code_easy boosted).
+        fake.write_text(_json.dumps({"web_easy": 1.0, "web_medium": 1.0,
+                                     "web_hard": 1.0, "code_easy": 2.0}))
+        r3 = _pmt.get_curriculum_ratios(total // 2, total)
+        e3, _, _ = _tier_weights(r3)
+        code_share = r3["code_easy"] / e3
+        base_c = pmt.EASY_SPLIT["code_easy"]
+        expected_c = base_c * 2.0 / (1.0 + 1.0 * base_c)
+        assert abs(code_share - expected_c) < 2e-3, \
+            f"code_easy share {code_share:.4f} != expected {expected_c:.4f} — boost file ignored!"
         # tier totals still exactly intact with the file active
         assert abs(e + m + h - 1.0) < 1e-3, f"tiers {e:.4f}+{m:.4f}+{h:.4f} != 1"
     finally:

@@ -3,7 +3,7 @@ Pretraining with MegaTrain + Kimi K2 MuonClip
 CPU offloaded training of 1.03B model with orthogonal updates.
 Loads .bin shards directly (already tokenized with SmolLM2 tokenizer).
 """
-import os, time, logging, argparse, math, shutil, random
+import os, time, logging, argparse, math, shutil, random, json
 from pathlib import Path
 
 import torch
