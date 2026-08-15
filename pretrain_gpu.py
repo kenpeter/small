@@ -575,7 +575,7 @@ class DomainLossTracker:
         self.counts.clear()
 
 
-def doremi_adjust(ratios, current, ref, eps=0.3):
+def doremi_adjust(ratios, current, ref, eps=0.3, mult_min=0.25, mult_max=4.0):
     """DoReMi-style domain reweighting (lite, arXiv 2305.10429).
 
     Domains whose CURRENT mean loss exceeds their reference baseline
@@ -583,6 +583,14 @@ def doremi_adjust(ratios, current, ref, eps=0.3):
     downweighted: w_d = ratio_d * exp(eps * (cur_d - ref_d) / ref_d),
     then renormalized PER TIER (easy/medium/hard) so each tier's total
     weight is preserved and the G1-G4 tier structure stays intact.
+
+    The exp() multiplier is CLAMPED to [mult_min, mult_max]: a near-zero
+    reference (e.g. code_hard ref=0.0182 — tiny memorized domain) makes
+    excess explode to +80x, and exp(0.3*80) ≈ 1e11 would hand the whole
+    tier to one domain and round every other ratio to 0.0000 → crash in
+    _build_stratified_order (min_ratio=0). Clamping keeps the direction
+    and rough magnitude of the signal without the blow-up. 4x upweight /
+    4x downweight is far more than any real stall signal needs.
 
     ratios/current/ref: dicts {domain: value}. Domains missing from
     current or ref keep their base ratio (excess = 0).
@@ -598,7 +606,8 @@ def doremi_adjust(ratios, current, ref, eps=0.3):
             excess = (cur_d - ref_d) / ref_d
         else:
             excess = 0.0
-        out[d] = r * _m.exp(eps * excess)
+        mult = min(mult_max, max(mult_min, _m.exp(eps * excess)))
+        out[d] = r * mult
         for suffix in tier_raw:
             if d.endswith(suffix):
                 tier_raw[suffix] += out[d]
@@ -854,9 +863,21 @@ def main():
             new_ratios = get_curriculum_ratios(step, args.num_steps)
             if doremi_refs is not None:
                 cur_means = domain_tracker.means()
-                new_ratios = doremi_adjust(new_ratios, cur_means, doremi_refs, eps=args.doremi_eps)
-                logger.info(f"🎼 DoReMi per-domain loss: "
-                            f"{ {d: round(v, 3) for d, v in sorted(cur_means.items())} }")
+                # Minimum window guard: right after a resume the tracker has
+                # almost no data (e.g. 64 steps → ~2K micro-batches vs 64K for
+                # a full 2000-step window) — reweighting on that is pure noise
+                # (Aug 15: fired on 64 steps of noise, code_hard excess +8470%,
+                # crashed the run). Skip DoReMi until ≥25% of a full window.
+                n_updates = sum(domain_tracker.counts.values())
+                if n_updates >= CURRICULUM_UPDATE_INTERVAL * 32 // 4:
+                    new_ratios = doremi_adjust(new_ratios, cur_means, doremi_refs,
+                                               eps=args.doremi_eps)
+                    logger.info(f"🎼 DoReMi per-domain loss: "
+                                f"{ {d: round(v, 3) for d, v in sorted(cur_means.items())} }")
+                else:
+                    logger.info(f"🎼 DoReMi skipped @ {step} — tracker window "
+                                f"too small after resume ({n_updates} micro-batches < "
+                                f"{CURRICULUM_UPDATE_INTERVAL * 32 // 4})")
             ds.ratios = new_ratios
             ds._build_stratified_order()
             data_iter = iter(dl)

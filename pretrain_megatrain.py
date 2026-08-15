@@ -456,6 +456,14 @@ class StratifiedShardDataset(Dataset):
         # (Fixed: was max(1, int(2*ratio)) → floored every ratio to 1 and
         #  silently disabled ratio enforcement.)
         min_ratio = min(self.ratios[d] for d in active_domains)
+        if min_ratio <= 0:
+            # A domain ratio rounded to 0.0000 (e.g. after an extreme DoReMi
+            # reweight) would make n_emit = ratio/0 → ZeroDivisionError.
+            # Drop zero-weight domains instead of crashing (Aug 15 crash).
+            active_domains = [d for d in active_domains if self.ratios[d] > 0]
+            if not active_domains:
+                raise RuntimeError("All domain ratios are zero — cannot build epoch order")
+            min_ratio = min(self.ratios[d] for d in active_domains)
         # We just build a flat list; DataLoader batching will grab sequentially
         # To enforce ratios per step, we emit in repeating pattern
         while sum(ptrs[d] < len(buckets[d]) for d in active_domains) > 0:

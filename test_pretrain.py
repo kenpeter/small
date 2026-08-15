@@ -1339,6 +1339,19 @@ def test_g4_windowed_jit_shuffle_and_ratios():
 def test_g1234_together_full_run():
     """Integration: G1+G2+G3 produce valid ratios over the whole run and the
     dataset rebuild path (as wired in pretrain_gpu.py) keeps them enforced."""
+    import pretrain_megatrain as _pmt
+    # isolate from curriculum_boost.json (if present, per-domain boosts skew
+    # the tier-shape assertions this test exists to check — boost has its own tests)
+    _saved_bf = _pmt.WEB_BOOST_FILE
+    _pmt.WEB_BOOST_FILE = _pmt.WEB_BOOST_FILE.with_name("_g1234_no_boost.json")
+    try:
+        _g1234_full_run_inner()
+    finally:
+        _pmt.WEB_BOOST_FILE = _saved_bf
+    print("  PASS: G1+G2+G3+G4 integration — ratios valid & enforced over full run")
+
+
+def _g1234_full_run_inner():
     total = 15000
     # whole-run ratio validity + 2-fold shape: easy bottoms mid, hard peaks mid
     easy_series, hard_series = [], []
@@ -1394,7 +1407,6 @@ def test_g1234_together_full_run():
             f"end-state must be easy-heavy (mirror): easy {easy_end:.3f} vs hard {hard_end:.3f}"
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
-    print("  PASS: G1-G4 together — valid ratios all run, fold peak mid-run, rebuild enforces end-state")
 
 
 def test_fused_ce_matches_chunked_ce():
@@ -1571,6 +1583,29 @@ def test_doremi_adjust_upweights_stuck_domains():
     assert abs(easy - 0.2) < 0.002, f"{_test_name()}: easy tier {easy} != 0.2"
     assert abs(hard - 0.3) < 0.002, f"{_test_name()}: hard tier {hard} != 0.3"
     print("  PASS: doremi adjust upweights stuck / downweights improved / tiers intact")
+
+
+def test_doremi_adjust_clamps_exploding_excess():
+    """Regression (Aug 15 crash): a near-zero ref (code_hard 0.0182) makes
+    excess explode (+8470%) — exp(0.3*84.7)≈1e11 would hand the tier to one
+    domain and zero the rest → min_ratio=0 → ZeroDivisionError. The clamp
+    keeps every ratio > 0 and the tier total intact."""
+    from pretrain_gpu import doremi_adjust
+    ratios = {"math_hard": 0.55, "web_hard": 0.15, "synth_hard": 0.20, "code_hard": 0.10}
+    ref = {"math_hard": 1.6, "web_hard": 2.9, "synth_hard": 1.7, "code_hard": 0.0182}
+    cur = {"math_hard": 1.98, "web_hard": 2.35, "synth_hard": 1.97, "code_hard": 1.56}
+    out = doremi_adjust(ratios, cur, ref, eps=0.3)
+    assert all(v > 0 for v in out.values()), f"zero ratio survived clamp: {out}"
+    assert all(v <= max(ratios.values()) * 5 for v in out.values()), \
+        f"multiplier not clamped: {out}"
+    # code_hard still upweighted (direction preserved) but not tier-dominant
+    assert out["code_hard"] > ratios["code_hard"], "code_hard should be upweighted"
+    assert out["code_hard"] < 0.5, f"code_hard still exploded: {out}"
+    total = sum(out.values())
+    assert abs(total - 1.0) < 0.01, f"hard tier total {total} != 1"
+    # web_hard (ref 2.9, cur 2.35 → improved) still downweighted
+    assert out["web_hard"] < ratios["web_hard"], "web_hard should be downweighted"
+    print("  PASS: doremi clamp bounds exploding excess — all ratios > 0, tier intact")
 
 
 def test_web_boost_upweights_web_preserves_tiers():
@@ -1762,6 +1797,7 @@ TESTS = [
     test_smoothed_loss_rejects_single_step_noise,
     test_domain_loss_tracker,
     test_doremi_adjust_upweights_stuck_domains,
+    test_doremi_adjust_clamps_exploding_excess,
     test_web_boost_upweights_web_preserves_tiers,
     test_web_boost_hot_reload_json,
     test_collate_pretrain_with_domains,
