@@ -251,6 +251,9 @@ w_d = ratio_d × exp(eps × (cur_d − ref_d) / ref_d)     # eps default 0.3 (pa
   the step-59,100 checkpoint (13 domains; note `code_hard` ref=0.0182 — near-memorized tiny domain,
   its relative excess will be noisy but tier-normalization bounds the damage). Flags live in
   `watchdog_pretrain.py` launch cmd so crash-restarts keep DoReMi on.
+- **WEB_BOOST=1.5 (pretrain_megatrain.py):** web lags every domain (ref 2.96-3.26 vs 1.4-2.3 rest) —
+  web_* shares ×1.5 then per-tier renormalized (G1-G4 tier totals intact, same principle as DoReMi).
+  Web ≈22% → 30% of tokens at step 59K, drifting to ~34% by run end.
 - **To activate:** generate `refs.json` (per-domain losses from a stable baseline checkpoint),
   add the two flags to the launch command, SDLC-test, ship.
 
