@@ -527,6 +527,14 @@ Re-enable with `cronjob action=resume` on both IDs.
 - **Loss band:** oscillating ~1.98–2.03 (pre-rebaseline best 1.6993 was the previous cycle's metric — not comparable).
 - **Watchdog config (2026-08-14):** `watchdog_pretrain.py` relaunches the 115K cycle from `megatrain_latest.pt` every 5 min when dead (log stale >180s); NO restart-lr/rebaseline/DoReMi flags — keep in sync if the cycle changes.
 
+### Current State (2026-08-15)
+
+- **Training:** ▶️ RUNNING **115K warm-restart cycle** — resumed **11:48** from `megatrain_latest.pt` (step ~59,100) with **DoReMi-lite ACTIVE + WEB_BOOST=1.5**. Step ~59,100/115,000, loss **~1.98 band**, LR 1.45e-04, **14.2 s/step @ 100W**, 64°C, 11.15 GB VRAM. torch.compile OOM'd at JIT (every launch) → eager fallback, as documented.
+- **DoReMi-lite → ACTIVE (was dormant):** `refs.json` generated from the step-59,100 checkpoint via `per_domain_ref.py` (13 domains, 200 samples each; spot refs: web_easy 3.261, web_medium 3.124, web_hard 2.960, math_easy 2.298, code_easy 1.478; `code_hard` 0.0182 — near-memorized tiny domain, noisy relative excess, tier-normalization bounds it). Flags `--doremi-lite --doremi-ref refs.json --doremi-eps 0.3` **added to `watchdog_pretrain.py` launch cmd** so crash-restarts keep DoReMi on. First reweight at step 60,000 (tracker window short ~900 steps after restart — noisier; clean 2000-step windows from 62,000 on). SDLC 70/70 before relaunch.
+- **WEB_BOOST=1.5 (`pretrain_megatrain.py`, `a5519ac`):** web lags every domain (ref 2.96–3.26 vs 1.4–2.3 rest) → web_* shares ×1.5 then **per-tier renormalized** (G1-G4 tier totals provably intact — same principle as DoReMi). **Web ≈22% → 30% of tokens at step 59,100** (web_easy 0.0908 / web_medium 0.1147 / web_hard 0.0947), drifting to ~34% by run end; math 41% → 37% → ~32%. SDLC 71/71 incl. new closed-form share test (`base·B/(1+(B−1)·base)` — naive 1.35× assertion failed because renormalization dilutes to 1.28× at web_easy's 35% base).
+- **Checkpoints backed up:** `checkpoints_backup_predoremi/` (latest+best, 12 GB) + `megatrain_latest_prewebboost.pt`.
+- **Watchdog config (2026-08-15):** now carries `--doremi-lite --doremi-ref refs.json`; web boost lives in code so no flag needed. Keep in sync if the cycle changes.
+
 ### Recent History (August 2026)
 
 - **Aug 10 — speed session (3 changes, 57/57 tests):** fused CautiousAdamW moments via `torch._foreach_*` (400→4 launches, bitwise-identical, VRAM-safe); Liger fused CE `--fused-ce` (bitwise-identical to chunked CE, frees ~1.9 GB → batch 4 fits at 9,865 MiB); batch 2→4 × accum 8 (eff 32). Commits cc0ce82 + bdcaae3.
