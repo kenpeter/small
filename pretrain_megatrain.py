@@ -219,6 +219,7 @@ SHARD_DIRS = {
     "web_hard":      Path("/home/kenpeter/work/data/_shards_web_hard"),      # empty
     "math_hard":     Path("/home/kenpeter/work/data/_shards_math_hard"),     # 5.1G
     "reformat_easy": Path("/home/kenpeter/work/data/_shards_reformat_easy"),  # was 8.5M tokens
+    "gold_hard":     Path("/home/kenpeter/work/data/_shards_gold"),           # Qwen gold set (3 methods + 5 variants)
 }
 
 # x-small style flat farm: uniform random interleave of ALL tiered shards
@@ -240,7 +241,7 @@ CURRICULUM_UPDATE_INTERVAL = 2000  # steps between ratio rebuilds (rebuild ~35s)
 # preserved under G1-G4 curriculum (it's absent from all splits → excluded otherwise)
 EASY_SPLIT = {"math_easy": 0.35, "web_easy": 0.35, "synth_easy": 0.125, "code_easy": 0.10, "reformat_easy": 0.075}
 MED_SPLIT = {"math_medium": 0.25, "web_medium": 0.25, "synth_medium": 0.333, "code_medium": 0.167}
-HARD_SPLIT = {"math_hard": 0.55, "web_hard": 0.15, "synth_hard": 0.20, "code_hard": 0.10}  # web_hard live: QuRatedPajama 594M tok
+HARD_SPLIT = {"math_hard": 0.50, "web_hard": 0.15, "synth_hard": 0.20, "code_hard": 0.10, "gold_hard": 0.05}  # web_hard live: QuRatedPajama 594M tok; gold_hard ×5 via curriculum_boost.json
 
 # Web boost (Aug 15): web lags every other domain (ref losses 2.96-3.26 vs
 # 1.4-2.3 for the rest — measured from the step-59,100 checkpoint). Domains
