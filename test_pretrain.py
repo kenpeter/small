@@ -1573,6 +1573,53 @@ def test_doremi_adjust_upweights_stuck_domains():
     print("  PASS: doremi adjust upweights stuck / downweights improved / tiers intact")
 
 
+def test_web_boost_upweights_web_preserves_tiers():
+    """WEB_BOOST: web_* within-tier share rises ~1.5x vs its un-boosted base,
+    non-web domains shrink, and every tier total stays exactly intact."""
+    import pretrain_megatrain as _pmt
+    total = 115000
+    for step in (0, 100, total // 2, total - 1):
+        # boost OFF = the plain G1-G4 curve (WEB_BOOST must not move tier totals)
+        saved = _pmt.WEB_BOOST
+        try:
+            _pmt.WEB_BOOST = 1.0
+            r_off = _pmt.get_curriculum_ratios(step, total)
+        finally:
+            _pmt.WEB_BOOST = saved
+        r_on = _pmt.get_curriculum_ratios(step, total)
+        e_off, m_off, h_off = _tier_weights(r_off)
+        e_on, m_on, h_on = _tier_weights(r_on)
+        assert abs(e_on - e_off) < 1e-3, f"easy tier moved: {e_off:.4f}->{e_on:.4f} @ {step}"
+        assert abs(m_on - m_off) < 1e-3, f"med tier moved: {m_off:.4f}->{m_on:.4f} @ {step}"
+        assert abs(h_on - h_off) < 1e-3, f"hard tier moved: {h_off:.4f}->{h_on:.4f} @ {step}"
+        # web's share within each tier matches the exact closed form:
+        #   share_on = base*B / (1 + (B-1)*base)   (only web is boosted per tier)
+        for dom in r_on:
+            if not dom.startswith("web"):
+                continue
+            tier = "_" + dom.split("_")[1]
+            base_frac = {"_easy": pmt.EASY_SPLIT, "_medium": pmt.MED_SPLIT,
+                         "_hard": pmt.HARD_SPLIT}[tier][dom]
+            B = _pmt.WEB_BOOST
+            expected = base_frac * B / (1.0 + (B - 1.0) * base_frac)
+            tsum_on = {"_easy": e_on, "_medium": m_on, "_hard": h_on}[tier]
+            share_on = r_on[dom] / tsum_on
+            assert abs(share_on - expected) < 2e-3, \
+                f"{dom} share {share_on:.4f} != expected {expected:.4f} @ {step}"
+        # non-web domains lose share within their tier (renormalization)
+        for dom in r_on:
+            if dom.startswith("web"):
+                continue
+            tier = "_" + dom.split("_")[1]
+            tsum_on = {"_easy": e_on, "_medium": m_on, "_hard": h_on}[tier]
+            tsum_off = {"_easy": e_off, "_medium": m_off, "_hard": h_off}[tier]
+            if r_off[dom] <= 0:
+                continue
+            assert r_on[dom] / tsum_on < r_off[dom] / tsum_off, \
+                f"{dom} should shrink but grew @ {step}"
+    print(f"  PASS: WEB_BOOST={_pmt.WEB_BOOST} — web upweighted per tier, tier totals intact")
+
+
 def test_collate_pretrain_with_domains():
     """StratifiedShardDataset dict batches carry 'domain'; tensor batches (FlatFarm)
     still work unchanged (backward compat)."""
@@ -1673,6 +1720,7 @@ TESTS = [
     test_smoothed_loss_rejects_single_step_noise,
     test_domain_loss_tracker,
     test_doremi_adjust_upweights_stuck_domains,
+    test_web_boost_upweights_web_preserves_tiers,
     test_collate_pretrain_with_domains,
     test_cautious_tail_triton_bitwise,
     test_gradient_checkpointing_inert_in_transformers,

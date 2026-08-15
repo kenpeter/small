@@ -242,6 +242,12 @@ EASY_SPLIT = {"math_easy": 0.35, "web_easy": 0.35, "synth_easy": 0.125, "code_ea
 MED_SPLIT = {"math_medium": 0.25, "web_medium": 0.25, "synth_medium": 0.333, "code_medium": 0.167}
 HARD_SPLIT = {"math_hard": 0.55, "web_hard": 0.15, "synth_hard": 0.20, "code_hard": 0.10}  # web_hard live: QuRatedPajama 594M tok
 
+# Web boost (Aug 15): web lags every other domain (ref losses 2.96-3.26 vs
+# 1.4-2.3 for the rest — measured from the step-59,100 checkpoint). Domains
+# get their within-tier share multiplied by WEB_BOOST, then each tier is
+# renormalized so G1-G4 tier totals stay intact (same principle as DoReMi).
+WEB_BOOST = 1.5
+
 def _smooth_tier_weights(t):
     """G1+G3: 2-fold reversal (paper STR/SAW-2, arXiv:2605.30334).
 
@@ -276,6 +282,20 @@ def get_curriculum_ratios(step, total_steps):
         ratios[dom] = round(w_med * frac, 4)
     for dom, frac in HARD_SPLIT.items():
         ratios[dom] = round(w_hard * frac, 4)
+
+    # Web boost: multiply web_* shares by WEB_BOOST, then renormalize per
+    # tier so the G1-G4 tier totals (easy/medium/hard) stay exactly intact.
+    if WEB_BOOST != 1.0:
+        for tier in ("_easy", "_medium", "_hard"):
+            doms = [d for d in ratios if d.endswith(tier)]
+            tier_total = sum(ratios[d] for d in doms)
+            if tier_total <= 0:
+                continue
+            boosted = {d: ratios[d] * (WEB_BOOST if d.startswith("web") else 1.0)
+                       for d in doms}
+            s = sum(boosted.values())
+            for d in doms:
+                ratios[d] = round(boosted[d] * tier_total / s, 4)
     return {k: v for k, v in ratios.items() if v > 0}
 
 
