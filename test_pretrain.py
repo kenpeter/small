@@ -1581,11 +1581,14 @@ def test_web_boost_upweights_web_preserves_tiers():
     for step in (0, 100, total // 2, total - 1):
         # boost OFF = the plain G1-G4 curve (WEB_BOOST must not move tier totals)
         saved = _pmt.WEB_BOOST
+        saved_file = _pmt.WEB_BOOST_FILE
         try:
             _pmt.WEB_BOOST = 1.0
+            _pmt.WEB_BOOST_FILE = _pmt.WEB_BOOST_FILE.with_name("_nonexistent_boost.json")
             r_off = _pmt.get_curriculum_ratios(step, total)
         finally:
             _pmt.WEB_BOOST = saved
+            _pmt.WEB_BOOST_FILE = saved_file
         r_on = _pmt.get_curriculum_ratios(step, total)
         e_off, m_off, h_off = _tier_weights(r_off)
         e_on, m_on, h_on = _tier_weights(r_on)
@@ -1618,6 +1621,45 @@ def test_web_boost_upweights_web_preserves_tiers():
             assert r_on[dom] / tsum_on < r_off[dom] / tsum_off, \
                 f"{dom} should shrink but grew @ {step}"
     print(f"  PASS: WEB_BOOST={_pmt.WEB_BOOST} — web upweighted per tier, tier totals intact")
+
+
+def test_web_boost_hot_reload_json():
+    """curriculum_boost.json overrides WEB_BOOST per-domain, re-read on every
+    call; tier totals stay intact; missing file falls back to WEB_BOOST."""
+    import json as _json
+    import pretrain_megatrain as _pmt
+    total = 115000
+    saved_file = _pmt.WEB_BOOST_FILE
+    fake = _pmt.WEB_BOOST_FILE.with_name("_test_boost.json")
+    try:
+        _pmt.WEB_BOOST_FILE = fake
+        fake.write_text(_json.dumps({"web_easy": 2.0, "web_hard": 1.2}))
+        r = _pmt.get_curriculum_ratios(total // 2, total)
+        e, m, h = _tier_weights(r)
+        # web_easy boosted MORE than web_medium (default 1.5); web_hard LESS
+        web_easy_share = r["web_easy"] / e
+        web_med_share = r["web_medium"] / m
+        web_hard_share = r["web_hard"] / h
+        assert web_easy_share > web_med_share, \
+            f"web_easy {web_easy_share:.4f} should exceed web_medium {web_med_share:.4f}"
+        assert web_hard_share < web_med_share, \
+            f"web_hard {web_hard_share:.4f} should be below web_medium {web_med_share:.4f}"
+        # file removed → falls back to WEB_BOOST=1.5 default: web_easy share
+        # must match the closed form base*B/(1+(B-1)*base) at B=1.5
+        fake.unlink()
+        r2 = _pmt.get_curriculum_ratios(total // 2, total)
+        e2, m2, h2 = _tier_weights(r2)
+        base_e = pmt.EASY_SPLIT["web_easy"]
+        expected = base_e * 1.5 / (1.0 + 0.5 * base_e)
+        assert abs((r2["web_easy"] / e2) - expected) < 2e-3, \
+            f"fallback share {(r2['web_easy']/e2):.4f} != expected {expected:.4f}"
+        # tier totals still exactly intact with the file active
+        assert abs(e + m + h - 1.0) < 1e-3, f"tiers {e:.4f}+{m:.4f}+{h:.4f} != 1"
+    finally:
+        if fake.exists():
+            fake.unlink()
+        _pmt.WEB_BOOST_FILE = saved_file
+    print("  PASS: curriculum_boost.json hot-reload — overrides apply, fallback works, tiers intact")
 
 
 def test_collate_pretrain_with_domains():
@@ -1721,6 +1763,7 @@ TESTS = [
     test_domain_loss_tracker,
     test_doremi_adjust_upweights_stuck_domains,
     test_web_boost_upweights_web_preserves_tiers,
+    test_web_boost_hot_reload_json,
     test_collate_pretrain_with_domains,
     test_cautious_tail_triton_bitwise,
     test_gradient_checkpointing_inert_in_transformers,

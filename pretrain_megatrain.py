@@ -246,7 +246,15 @@ HARD_SPLIT = {"math_hard": 0.55, "web_hard": 0.15, "synth_hard": 0.20, "code_har
 # 1.4-2.3 for the rest — measured from the step-59,100 checkpoint). Domains
 # get their within-tier share multiplied by WEB_BOOST, then each tier is
 # renormalized so G1-G4 tier totals stay intact (same principle as DoReMi).
+#
+# HOT-RELOAD (agent-in-the-loop DoReMi, Aug 15): if the file
+# curriculum_boost.json exists next to this module, its per-domain multipliers
+# OVERRIDE WEB_BOOST (missing domains keep WEB_BOOST). The file is re-read at
+# every curriculum re-glide (2000 steps) — the agent edits the JSON and the
+# next re-glide applies it. No restart. Format:
+#   {"web_easy": 1.8, "web_medium": 1.8, "web_hard": 1.8}
 WEB_BOOST = 1.5
+WEB_BOOST_FILE = Path(__file__).parent / "curriculum_boost.json"
 
 def _smooth_tier_weights(t):
     """G1+G3: 2-fold reversal (paper STR/SAW-2, arXiv:2605.30334).
@@ -285,17 +293,33 @@ def get_curriculum_ratios(step, total_steps):
 
     # Web boost: multiply web_* shares by WEB_BOOST, then renormalize per
     # tier so the G1-G4 tier totals (easy/medium/hard) stay exactly intact.
-    if WEB_BOOST != 1.0:
+    # HOT-RELOAD: per-domain multipliers from curriculum_boost.json override
+    # WEB_BOOST when present (re-read every call → applied at next re-glide).
+    boost = {}
+    try:
+        if WEB_BOOST_FILE.exists():
+            with open(WEB_BOOST_FILE) as f:
+                boost = json.load(f)
+    except Exception:
+        boost = {}
+    # capture pre-boost tier totals — renormalization must restore these
+    tier_totals = {}
+    for tier in ("_easy", "_medium", "_hard"):
+        tier_totals[tier] = sum(v for k, v in ratios.items() if k.endswith(tier))
+    for dom in ratios:
+        # default: WEB_BOOST for web_* (the historical behavior), 1.0 for the
+        # rest; curriculum_boost.json per-domain multipliers override either.
+        dom_boost = WEB_BOOST if dom.startswith("web") else 1.0
+        dom_boost = boost.get(dom, dom_boost)
+        ratios[dom] = round(ratios[dom] * dom_boost, 4)
+    if WEB_BOOST != 1.0 or boost:
         for tier in ("_easy", "_medium", "_hard"):
             doms = [d for d in ratios if d.endswith(tier)]
-            tier_total = sum(ratios[d] for d in doms)
-            if tier_total <= 0:
+            s = sum(ratios[d] for d in doms)
+            if s <= 0:
                 continue
-            boosted = {d: ratios[d] * (WEB_BOOST if d.startswith("web") else 1.0)
-                       for d in doms}
-            s = sum(boosted.values())
             for d in doms:
-                ratios[d] = round(boosted[d] * tier_total / s, 4)
+                ratios[d] = round(ratios[d] * tier_totals[tier] / s, 4)
     return {k: v for k, v in ratios.items() if v > 0}
 
 
