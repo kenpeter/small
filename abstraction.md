@@ -549,6 +549,15 @@ Re-enable with `cronjob action=resume` on both IDs.
 - **Auto-finish cron `gold-finish-tokenize-resume` (every 15m):** waits for generation → merge+tokenize both gold JSONLs → 73-test gate → kill vLLM → resume training → verify gold count. Never double-starts training.
 - **Design rationale (user decision):** gold = best-of-best LeetCode + high-score finemath, each with 3 solution methods + 5 similar variants ("exhaust the type"). Repetition = gold ONLY (×5), everything else stays at normal curriculum ratios. Proof-of-concept: compare held-out code/math after ~5-10K steps vs pre-gold trajectory (best 1.66 @ 62K). Scale option: 20K questions (~55h) if pilot works — math pool unlimited (~21M Qs score≥2), code capped at 2,638 LeetCode problems.
 
+### Current State (2026-08-17)
+
+- **Training:** ⏹️ **STOPPED (user request — save all + kill)** — frozen 09:30 (SIGSTOP) then killed ~09:40. Last logged: **step 68,800/115,000, loss 1.9070** (band 1.89–1.93 since ~67K), LR 1.06e-04 (cosine decay), 9.07 s/step @200W / 7,229 tok/s (power was silently back at 100W → 14.1 s/step; restored to 200W before the pause). **Best loss 1.7888** (step 66,338, Aug 16 23:25). Tokens seen ~4.5B.
+- **Per-domain (final, step 68,800):** code_hard 1.43 · gold_hard 1.62 · synth_easy 1.82 · synth_hard 1.85 · code_medium 1.75 · math_medium 1.88 · reformat_easy 1.88 · math_hard 1.86 · synth_medium 1.89 · web_gold 1.87 · **web_easy 2.25 · web_hard 2.19 · web_medium 2.19** (web = sole stuck cluster, 0.3–0.8 above rest — plateau candidate; gold_hard also flat at 1.61–1.62).
+- **Checkpoints saved & backed up:** `checkpoints/backup_20260817_final/` (49 GB — megatrain_latest.pt step ~68,800 + megatrain_best.pt 1.7888 + .bak + full swa_tail/). GPU fully freed (92 MiB, 0%).
+- **Processes killed:** PID 1081730 (pretrain_gpu.py tree incl. 2 pt_data_worker children) — all gone. Cron `check_training.sh` inert (file missing); `check_status.sh` (read-only) still active.
+- **Resume path (when ready):** `watchdog_pretrain.py` canonical 115K cycle cmd → auto-resumes from `megatrain_latest.pt` (step ~68,800). Watchdog had a 5-min auto-restart — verify it's not running before relaunch. Next checkpoint save would have been step 69,000.
+- **Plateau verdict:** soft overall band 1.89–1.93 masked by curriculum re-glide (easy domains still ticking down: synth_easy 1.91→1.80, code_easy 1.84→1.81). Web is the real stuck block; gold flat. If web stays stuck on resume: drop web_medium weight / boost code+synth via `curriculum_boost.json` next 2K re-glide.
+
 ### Recent History (August 2026)
 
 - **Aug 10 — speed session (3 changes, 57/57 tests):** fused CautiousAdamW moments via `torch._foreach_*` (400→4 launches, bitwise-identical, VRAM-safe); Liger fused CE `--fused-ce` (bitwise-identical to chunked CE, frees ~1.9 GB → batch 4 fits at 9,865 MiB); batch 2→4 × accum 8 (eff 32). Commits cc0ce82 + bdcaae3.
@@ -562,6 +571,6 @@ Re-enable with `cronjob action=resume` on both IDs.
 ## Summary
 
 - **Tokens ready:** ~78 GB across 5 domains (math, web, code, synth, reformat) + **gold set 17.9M tok**, tiered easy/medium/hard
-- **Training:** ▶️ RUNNING **115K cycle** @ 180W — step ~62,700+/115,000 (resumed Aug 16 09:11 with **gold_hard live: 8,742 seqs ×5 boost + DoReMi ref 1.5**), loss ~2.08 band (best ~1.66), batch 4 × accum 8, CautiousAdamW + Liger fused CE + Triton tail, **eager mode** (compile OOMs → fallback), ~9-14 s/step depending on power, ~11.15 GB VRAM. SWA tail collection live (window 24). **DoReMi-lite ACTIVE** (refs.json incl. gold_hard).
+- **Training:** ⏹️ **STOPPED Aug 17 (user request)** at **step ~68,800/115,000** — loss 1.9070 final (best **1.7888** @ 66,338), batch 4 × accum 8, CautiousAdamW + Liger fused CE + Triton tail, eager mode, ~9.1 s/step @200W, ~11.15 GB VRAM. SWA tail backed up (window 24, 49 GB total backup in `backup_20260817_final/`). **DoReMi-lite ACTIVE** (refs.json incl. gold_hard). Resume = watchdog_pretrain.py 115K cmd → `megatrain_latest.pt`.
 - **SFT assets ready:** 25.76 GB (`_sft_final_shards/`)
 - **Next action:** run gold experiment 5-10K steps → eval held-out code/math vs pre-gold trajectory → finish 115K → SWA average → eval → pick final base → SFT → DPO.
