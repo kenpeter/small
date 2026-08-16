@@ -331,6 +331,20 @@ def get_curriculum_ratios(step, total_steps):
                 continue
             for d in doms:
                 ratios[d] = round(ratios[d] * tier_totals[tier] / s, 4)
+            # Absorb the rounding residual into the tier's largest share so the
+            # tier total lands EXACTLY on tier_totals[tier]. With web_gold the
+            # HARD tier has 6 domains — 4dp rounding drift can reach 5e-4 and
+            # trip the G2 renormalization check (< 5e-4).
+            resid = tier_totals[tier] - sum(ratios[d] for d in doms)
+            if resid:
+                ratios[max(doms, key=ratios.get)] += resid
+    # Final exactness: absorb any remaining drift (≤ ~5e-5/domain from the 4dp
+    # rounds) into the largest ratio so the full distribution sums to exactly
+    # 1.0. Residual is identical whether boost is on or off (tier_totals come
+    # from the same pre-boost rounded values) → tier totals stay comparable.
+    total = sum(ratios.values())
+    if abs(total - 1.0) > 1e-9:
+        ratios[max(ratios, key=ratios.get)] += 1.0 - total
     return {k: v for k, v in ratios.items() if v > 0}
 
 
