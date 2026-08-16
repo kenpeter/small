@@ -38,6 +38,7 @@ except ImportError:
 from pretrain_megatrain import (
     FARM_DIR,
     SHARD_DIRS,
+    DOMAIN_TIER,
     FlatFarmDataset,
     StratifiedShardDataset,
     collate_pretrain,
@@ -608,14 +609,14 @@ def doremi_adjust(ratios, current, ref, eps=0.3, mult_min=0.25, mult_max=4.0):
             excess = 0.0
         mult = min(mult_max, max(mult_min, _m.exp(eps * excess)))
         out[d] = r * mult
-        for suffix in tier_raw:
-            if d.endswith(suffix):
-                tier_raw[suffix] += out[d]
-                tier_base[suffix] += r
+        tier = DOMAIN_TIER.get(d)
+        if tier is not None:
+            tier_raw[tier] += out[d]
+            tier_base[tier] += r
     for d in out:
-        for suffix in tier_raw:
-            if d.endswith(suffix) and tier_raw[suffix] > 0:
-                out[d] *= tier_base[suffix] / tier_raw[suffix]
+        tier = DOMAIN_TIER.get(d)
+        if tier is not None and tier_raw[tier] > 0:
+            out[d] *= tier_base[tier] / tier_raw[tier]
     return {k: round(v, 4) for k, v in out.items() if v > 0}
 
 

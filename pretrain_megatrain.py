@@ -220,6 +220,7 @@ SHARD_DIRS = {
     "math_hard":     Path("/home/kenpeter/work/data/_shards_math_hard"),     # 5.1G
     "reformat_easy": Path("/home/kenpeter/work/data/_shards_reformat_easy"),  # was 8.5M tokens
     "gold_hard":     Path("/home/kenpeter/work/data/_shards_gold"),           # Qwen gold set (3 methods + 5 variants)
+    "web_gold":      Path("/home/kenpeter/work/data/_shards_web_gold"),       # best-of-best web (textbook+QA reformatted)
 }
 
 # x-small style flat farm: uniform random interleave of ALL tiered shards
@@ -241,7 +242,16 @@ CURRICULUM_UPDATE_INTERVAL = 2000  # steps between ratio rebuilds (rebuild ~35s)
 # preserved under G1-G4 curriculum (it's absent from all splits → excluded otherwise)
 EASY_SPLIT = {"math_easy": 0.35, "web_easy": 0.35, "synth_easy": 0.125, "code_easy": 0.10, "reformat_easy": 0.075}
 MED_SPLIT = {"math_medium": 0.25, "web_medium": 0.25, "synth_medium": 0.333, "code_medium": 0.167}
-HARD_SPLIT = {"math_hard": 0.50, "web_hard": 0.15, "synth_hard": 0.20, "code_hard": 0.10, "gold_hard": 0.05}  # web_hard live: QuRatedPajama 594M tok; gold_hard ×5 via curriculum_boost.json
+HARD_SPLIT = {"math_hard": 0.48, "web_hard": 0.15, "synth_hard": 0.19, "code_hard": 0.10, "gold_hard": 0.05, "web_gold": 0.03}  # web_hard live: QuRatedPajama 594M tok; gold_hard ×5 via curriculum_boost.json; web_gold ×3
+
+# Tier membership derived from the split dicts (NOT name suffixes) so any
+# domain name works — e.g. "web_gold" (best-of-best web, HARD tier) does not
+# end in "_hard". Suffix parsing silently dropped it from boost renormalization
+# and made per-tier totals drift (sum > 1.0).
+DOMAIN_TIER = {}
+for _d in EASY_SPLIT:   DOMAIN_TIER[_d] = "_easy"
+for _d in MED_SPLIT:    DOMAIN_TIER[_d] = "_medium"
+for _d in HARD_SPLIT:   DOMAIN_TIER[_d] = "_hard"
 
 # Web boost (Aug 15): web lags every other domain (ref losses 2.96-3.26 vs
 # 1.4-2.3 for the rest — measured from the step-59,100 checkpoint). Domains
@@ -306,7 +316,7 @@ def get_curriculum_ratios(step, total_steps):
     # capture pre-boost tier totals — renormalization must restore these
     tier_totals = {}
     for tier in ("_easy", "_medium", "_hard"):
-        tier_totals[tier] = sum(v for k, v in ratios.items() if k.endswith(tier))
+        tier_totals[tier] = sum(v for k, v in ratios.items() if DOMAIN_TIER.get(k) == tier)
     for dom in ratios:
         # default: WEB_BOOST for web_* (the historical behavior), 1.0 for the
         # rest; curriculum_boost.json per-domain multipliers override either.
@@ -315,7 +325,7 @@ def get_curriculum_ratios(step, total_steps):
         ratios[dom] = round(ratios[dom] * dom_boost, 4)
     if WEB_BOOST != 1.0 or boost:
         for tier in ("_easy", "_medium", "_hard"):
-            doms = [d for d in ratios if d.endswith(tier)]
+            doms = [d for d in ratios if DOMAIN_TIER.get(d) == tier]
             s = sum(ratios[d] for d in doms)
             if s <= 0:
                 continue

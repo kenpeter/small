@@ -1157,10 +1157,14 @@ def test_default_argparse_values():
 # G1-G4 curriculum tests — each mechanism individually + integrated together
 # =============================================================================
 def _tier_weights(ratios):
-    """Aggregate per-domain ratios into (easy, medium, hard) tier weights."""
-    e = sum(v for k, v in ratios.items() if k.endswith("_easy"))
-    m = sum(v for k, v in ratios.items() if k.endswith("_medium"))
-    h = sum(v for k, v in ratios.items() if k.endswith("_hard"))
+    """Aggregate per-domain ratios into (easy, medium, hard) tier weights.
+
+    Tier membership comes from the split dicts (DOMAIN_TIER), not name
+    suffixes — "web_gold" is a HARD-tier domain but doesn't end in "_hard".
+    """
+    e = sum(v for k, v in ratios.items() if pmt.DOMAIN_TIER.get(k) == "_easy")
+    m = sum(v for k, v in ratios.items() if pmt.DOMAIN_TIER.get(k) == "_medium")
+    h = sum(v for k, v in ratios.items() if pmt.DOMAIN_TIER.get(k) == "_hard")
     return e, m, h
 
 
@@ -1638,11 +1642,16 @@ def test_web_boost_upweights_web_preserves_tiers():
         for dom in r_on:
             if not dom.startswith("web"):
                 continue
-            tier = "_" + dom.split("_")[1]
-            base_frac = {"_easy": pmt.EASY_SPLIT, "_medium": pmt.MED_SPLIT,
-                         "_hard": pmt.HARD_SPLIT}[tier][dom]
+            tier = pmt.DOMAIN_TIER[dom]
+            tier_doms = {"_easy": pmt.EASY_SPLIT, "_medium": pmt.MED_SPLIT,
+                         "_hard": pmt.HARD_SPLIT}[tier]
+            base_frac = tier_doms[dom]
+            # General closed form: ALL web domains in the tier get boost B and
+            # the tier is renormalized — web_base_sum accounts for multiple
+            # web domains per tier (hard: web_hard + web_gold).
+            web_base_sum = sum(f for d, f in tier_doms.items() if d.startswith("web"))
             B = _pmt.WEB_BOOST
-            expected = base_frac * B / (1.0 + (B - 1.0) * base_frac)
+            expected = base_frac * B / (1.0 + (B - 1.0) * web_base_sum)
             tsum_on = {"_easy": e_on, "_medium": m_on, "_hard": h_on}[tier]
             share_on = r_on[dom] / tsum_on
             assert abs(share_on - expected) < 2e-3, \
@@ -1651,7 +1660,7 @@ def test_web_boost_upweights_web_preserves_tiers():
         for dom in r_on:
             if dom.startswith("web"):
                 continue
-            tier = "_" + dom.split("_")[1]
+            tier = pmt.DOMAIN_TIER[dom]
             tsum_on = {"_easy": e_on, "_medium": m_on, "_hard": h_on}[tier]
             tsum_off = {"_easy": e_off, "_medium": m_off, "_hard": h_off}[tier]
             if r_off[dom] <= 0:
