@@ -74,7 +74,9 @@ def chunked_ce(logits, labels, chunk_size=CE_CHUNK):
     B, S, V = logits.shape
     shift_logits = logits[:, :-1, :].contiguous()
     shift_labels = labels[:, 1:].contiguous()
-    n_tok = shift_labels.numel()
+    n_tok = (shift_labels != -100).sum().item()  # count ONLY trained tokens (SFT masks prompts)
+    if n_tok == 0:
+        return torch.tensor(0.0, device=logits.device)
     loss = None
     for i in range(0, S - 1, chunk_size):
         ce = torch.nn.functional.cross_entropy(

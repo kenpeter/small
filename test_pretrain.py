@@ -226,7 +226,7 @@ def test_chunked_ce_matches_full_ce():
     labels[:, :5] = -100                        # ignore_index holes
     full = torch.nn.functional.cross_entropy(
         logits[:, :-1, :].reshape(-1, 4096), labels[:, 1:].reshape(-1),
-        reduction="sum", ignore_index=-100) / labels[:, 1:].numel()
+        reduction="sum", ignore_index=-100) / (labels[:, 1:] != -100).sum()
     for chunk in (16, 32, 64):                  # 64 = whole seq in one slice
         got = chunked_ce(logits, labels, chunk_size=chunk)
         assert abs(got - full) < 1e-5, (
