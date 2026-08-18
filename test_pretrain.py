@@ -785,6 +785,33 @@ def test_resume_missing_optimizer_falls_back_gracefully():
     print("  PASS: resume without optimizer state falls back to fresh optimizer")
 
 
+def test_resume_none_best_loss_falls_back_to_inf():
+    """SWA snapshots carry best_loss=None — apply_resume must not crash and
+    must fall back to inf so the first save establishes best.pt (regression:
+    TypeError: unsupported format string passed to NoneType.__format__)."""
+    from pretrain_gpu import apply_resume
+    import torch.nn as nn
+
+    m = nn.Linear(4, 4)
+    ckpt = {"step": 68000, "loss": 1.907, "best_loss": None, "model_state_dict": m.state_dict()}
+    tmpdir = tempfile.mkdtemp()
+    try:
+        path = os.path.join(tmpdir, "swa.pt")
+        torch.save(ckpt, path)
+        m2 = nn.Linear(4, 4)
+        opt2 = torch.optim.AdamW(m2.parameters(), lr=3e-4)
+        start_step, best_loss = apply_resume(path, m2, opt2, pmt.logger)
+        assert start_step == 68000
+        assert best_loss == float("inf"), f"{_test_name()}: best_loss={best_loss}"
+        # optimizer still usable
+        opt2.zero_grad()
+        m2(torch.randn(2, 4)).sum().backward()
+        opt2.step()
+    finally:
+        shutil.rmtree(tmpdir)
+    print("  PASS: resume with best_loss=None falls back to inf without crashing")
+
+
 def test_resume_keeps_best_pt_until_better_loss():
     """After resume, is_best must compare against the checkpoint's best_loss
     (not inf), so best.pt is only overwritten by a genuinely better loss."""
@@ -1818,6 +1845,7 @@ TESTS = [
     test_async_save_writes_swa_snapshot,
     test_swa_average_matches_mean,
     test_resume_defaults_to_latest,
+    test_resume_none_best_loss_falls_back_to_inf,
     test_log_stats_uses_true_step_count,
     test_smoothed_loss_rejects_single_step_noise,
     test_domain_loss_tracker,

@@ -684,7 +684,7 @@ def apply_resume(ckpt_path, model, optimizer, logger):
         except (RuntimeError, ValueError) as e:
             logger.warning(f"resume: optimizer state mismatch ({e}) — fresh optimizer")
     start_step = ckpt.get("step", 0)
-    best_loss = ckpt.get("best_loss", float("inf"))
+    best_loss = ckpt.get("best_loss") or float("inf")  # None (SWA snapshots) → inf, keep fresh-best semantics
     logger.info(f"🔁 Resumed from {ckpt_path} (step {start_step}, best_loss {best_loss:.4f})")
     del ckpt, sd
     torch.cuda.empty_cache()
