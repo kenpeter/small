@@ -221,7 +221,7 @@ SHARD_DIRS = {
     "reformat_easy": Path("/home/kenpeter/work/data/_shards_reformat_easy"),  # was 8.5M tokens
     "gold_hard":     Path("/home/kenpeter/work/data/_shards_gold"),           # Qwen gold set (3 methods + 5 variants)
     "web_gold":      Path("/home/kenpeter/work/data/_shards_web_gold"),       # best-of-best web (textbook+QA reformatted)
-    "code_gold":     Path("/home/kenpeter/work/data/_shards_code_gold"),      # verified-correct classic code solutions (Qwen gen) — greedy-test patterns
+    "code_gold":     Path("/home/kenpeter/work/data/_shards_code_gold"),      # exec-verified correct LeetCode solutions (513 HQ + 134 Qwen; 771 unique post-dedup) — greedy-test patterns
 }
 
 # x-small style flat farm: uniform random interleave of ALL tiered shards
