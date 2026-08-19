@@ -558,6 +558,21 @@ Re-enable with `cronjob action=resume` on both IDs.
 - **Resume path (when ready):** `watchdog_pretrain.py` canonical 115K cycle cmd → auto-resumes from `megatrain_latest.pt` (step ~68,800). Watchdog had a 5-min auto-restart — verify it's not running before relaunch. Next checkpoint save would have been step 69,000.
 - **Plateau verdict:** soft overall band 1.89–1.93 masked by curriculum re-glide (easy domains still ticking down: synth_easy 1.91→1.80, code_easy 1.84→1.81). Web is the real stuck block; gold flat. If web stays stuck on resume: drop web_medium weight / boost code+synth via `curriculum_boost.json` next 2K re-glide.
 
+### Current State (2026-08-19)
+
+- **Training:** ⏸️ **PAUSED (user request — "Pause" + "Save check point")** — clean kill at **step 74,300/115,000**. Checkpoint saved at 20:20 (step ~74,252) then stage-copied to `training_paused_74300.pt`; GPU fully freed (219 MiB, 0%). **Best loss 1.0870** (new best, down from 1.1511). Last-running loss 1.1342 @ step 74,300, LR 8.48e-05, **14.24 s/step / 4,601 tok/s @ 100W**, 9.35 GB VRAM. Tokens seen ~4.9B.
+- **Per-domain (final, step 74,300):** code_easy 1.18 · **code_gold 0.83** · **code_hard 0.89** (best domain) · code_medium 1.15 · gold_hard 1.15 · math_easy 1.42 · math_hard 1.22 · math_medium 1.33 · reformat_easy 1.31 · synth_easy 1.30 · synth_hard 1.16 · synth_medium 1.27 · web_easy 1.69 · web_gold 1.07 · web_hard 1.62 · web_medium 1.63.
+- **code_gold → LIVE & sprinting (the "more greedy questions" ask):** new domain built this session — **Qwen3-8B-AWQ generated + exec-verified correct LeetCode-style solutions** (`gen_code_gold_qwen.py`, verify-by-running-against-test-cases, ~19% pass yield → 134 verified solutions ≈ 100 problem types), tokenized (`tokenize_code_gold_qwen.py`) + 150× identifier-variant replication (`expand_code_gold.py`) → **`code_gold` bin 148 MB / 74M tokens / 36,150 seqs**. Added to `pretrain_megatrain.py` SHARD_DIRS + HARD_SPLIT (0.12) + boost `code_gold` 10.0 in `curriculum_boost.json`; visible in loader at ratio 0.1417 (code overall ~70% mix). SDLC 74/74 before relaunch (commit `e378f3b`).
+- **code_gold loss collapse — the model is learning correct-code patterns fast:**
+  | step | code_gold | code_hard |
+  |---|---|---|
+  | 73,100 | 1.63 | — |
+  | 74,100 | 0.92 | 0.95 |
+  | 74,300 | **0.83** | **0.89** |
+  code_gold dropped 1.63 → 0.83 in ~1,200 steps — best-tier code domain is now the lowest-loss part of the model, a strong sign the greedy-generation correctness is being drilled in (PPL ≠ greedy correct output — verify with a greedy code-gen eval on `training_paused_74300.pt` before resuming).
+- **Checkpoint stage copy:** `training_paused_74300.pt` = lean resume point for this exact step. Resume via `watchdog_pretrain.py` canonical 115K cmd → `megatrain_latest.pt` (or point at the stage copy). Watchdog auto-restart — verify not running before relaunch.
+- **Answer to "So math, code improve???" — YES, both.** Over the run: code_hard 1.60→1.17 (pre-boost) then 0.95→**0.89** (post code_gold); math_hard 1.98→1.69 earlier and now 1.22; total loss 2.03→1.15→best **1.087**. Recent transient upticks were curriculum re-glide artifacts, not regressions. Web remains the sole laggard cluster (1.62–1.69, ~0.4 above the rest).
+
 ### Recent History (August 2026)
 
 - **Aug 10 — speed session (3 changes, 57/57 tests):** fused CautiousAdamW moments via `torch._foreach_*` (400→4 launches, bitwise-identical, VRAM-safe); Liger fused CE `--fused-ce` (bitwise-identical to chunked CE, frees ~1.9 GB → batch 4 fits at 9,865 MiB); batch 2→4 × accum 8 (eff 32). Commits cc0ce82 + bdcaae3.
