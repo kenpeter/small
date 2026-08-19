@@ -221,6 +221,7 @@ SHARD_DIRS = {
     "reformat_easy": Path("/home/kenpeter/work/data/_shards_reformat_easy"),  # was 8.5M tokens
     "gold_hard":     Path("/home/kenpeter/work/data/_shards_gold"),           # Qwen gold set (3 methods + 5 variants)
     "web_gold":      Path("/home/kenpeter/work/data/_shards_web_gold"),       # best-of-best web (textbook+QA reformatted)
+    "code_gold":     Path("/home/kenpeter/work/data/_shards_code_gold"),      # verified-correct classic code solutions (Qwen gen) — greedy-test patterns
 }
 
 # x-small style flat farm: uniform random interleave of ALL tiered shards
@@ -242,7 +243,7 @@ CURRICULUM_UPDATE_INTERVAL = 2000  # steps between ratio rebuilds (rebuild ~35s)
 # preserved under G1-G4 curriculum (it's absent from all splits → excluded otherwise)
 EASY_SPLIT = {"math_easy": 0.35, "web_easy": 0.35, "synth_easy": 0.125, "code_easy": 0.10, "reformat_easy": 0.075}
 MED_SPLIT = {"math_medium": 0.25, "web_medium": 0.25, "synth_medium": 0.333, "code_medium": 0.167}
-HARD_SPLIT = {"math_hard": 0.48, "web_hard": 0.15, "synth_hard": 0.19, "code_hard": 0.10, "gold_hard": 0.05, "web_gold": 0.03}  # web_hard live: QuRatedPajama 594M tok; gold_hard ×5 via curriculum_boost.json; web_gold ×3
+HARD_SPLIT = {"math_hard": 0.40, "web_hard": 0.15, "synth_hard": 0.17, "code_hard": 0.07, "gold_hard": 0.06, "web_gold": 0.03, "code_gold": 0.12}  # web_hard live: QuRatedPajama 594M tok; gold_hard ×5 via curriculum_boost.json; web_gold ×3; code_gold = verified-correct classic code (greedy-test patterns) boosted hard
 
 # Tier membership derived from the split dicts (NOT name suffixes) so any
 # domain name works — e.g. "web_gold" (best-of-best web, HARD tier) does not
