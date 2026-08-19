@@ -18,7 +18,7 @@ from transformers import AutoTokenizer, LlamaConfig
 from pretrain_gpu import build_model, make_optimizer, chunked_ce, resolve_resume_path, save_checkpoint_async  # noqa
 
 BASE_CKPT = Path("/home/kenpeter/work/checkpoints/pretrained_best.pt")
-SFT_SHARDS = Path("/mnt/file_drive/data/_sft_codegold_shards")
+SFT_SHARDS = Path("/mnt/file_drive/data/_sft_mixed_shards")
 OUT_DIR = Path("/home/kenpeter/work/checkpoints")
 SEQ_LEN = 2048
 
