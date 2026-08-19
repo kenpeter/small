@@ -1,0 +1,325 @@
+/home/kenpeter/work/small/venv/lib/python3.11/site-packages/torch/cuda/__init__.py:61: FutureWarning: The pynvml package is deprecated. Please install nvidia-ml-py instead. If you did not install pynvml directly, please report this to the maintainers of the package that installed pynvml for you.
+  import pynvml  # type: ignore[import]
+Loading /home/kenpeter/work/checkpoints/pretrained_quickeval_71800.pt...
+  step=71925 loss=1.8038452863693237 best=1.437947154045105
+  Model on cpu: 1.03B params
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+
+============================================================
+MATH — greedy
+
+💬 '2 + 2 = 4. 3 + 5 = 8. 7 * 6 ='
+🤖 2 + 2 = 4. 3 + 5 = 8. 7 * 6 = 42. 1 + 2 + 3 + 4 + 5 + 6 + 7 = 21. 1 + 2 + 3 + 4 + 5 + 6 + 7 + 8 = 21. 1 + 2 + 3 + 4 + 5 + 6 + 7 + 8 + 9 = 21. 1 + 2 + 3 + 4 + 5 + 6 + 7 + 8 + 9 + 10 = 21. 1 + 2
+----------------------------------------
+
+💬 'Solve for x: 3x + 5 = 20. x ='
+🤖 Solve for x: 3x + 5 = 20. x = 5.
+
+## SIMILAR QUESTIONS
+VARIANT 1  
+Solve for x: 3x + 5 = 20. x = 5.
+
+VARIANT 2  
+Solve for x: 3x + 5 = 20. x = 5.
+
+VARIANT 3  
+Solve for x: 3x + 5 = 20. x = 5.
+
+VARIANT 4  
+Solve for x: 3x + 5 = 20. x =
+----------------------------------------
+
+💬 'The area of a circle with radius 3 is pi * 3^2 ='
+🤖 The area of a circle with radius 3 is pi * 3^2 = 3.1416.
+
+## THREE SOLUTION METHODS
+METHOD 1: Using the Formula for the Area of a Circle with Radius  
+The area of a circle is given by:  
+$$
+\text{Area} = \pi r^2
+$$  
+Where:  
+- $ r $ is the radius  
+- $ \pi $ is the ratio of the circumference to the diameter  
+- $ r $ is the radius of the circle  
+- $ r $ is the radius of the circle  
+- $ \pi = 3.1
+----------------------------------------
+
+💬 'If there are 12 apples and each basket holds 4 apples, the number of baskets needed is'
+🤖 If there are 12 apples and each basket holds 4 apples, the number of baskets needed is 12 - 4 = 8.
+
+**Example 2:**
+
+**Input:** n = 1, k = 1
+**Output:** 1
+
+**Constraints:**
+
+*   `1 <= k <= n <= 1000`
+
+Solutions:
+
+// python
+
+    ```python
+def findNumberOfSubstrings(s: str) -> int:
+    res, i, count = 0, 0, [0, 0, 0]
+    
+    for j, ch in enumerate(s):
+        count[ord(ch) - ord
+----------------------------------------
+
+MATH — sampled (temp 0.7)
+
+💬 '2 + 2 = 4. 3 + 5 = 8. 7 * 6 ='
+🤖 2 + 2 = 4. 3 + 5 = 8. 7 * 6 = 42. 7 + 2 = 8. 8 * 6 = 48. 8 + 1 = 9. 9 * 6 = 54. 9 + 8 = 10. 10 * 6 = 60. 10 + 5 = 15. 15 * 6 = 75. 15 + 4 = 19. 19 * 6 = 86. 19 + 3 = 21. 21 * 6 = 98
+----------------------------------------
+
+💬 'Solve for x: 3x + 5 = 20. x ='
+🤖 Solve for x: 3x + 5 = 20. x = 3y – 5.
+
+This is the same as the solution for x.
+
+3x + 5 = 20
+
+3x = 20 – 5
+
+3x = 15
+
+x = 5
+
+Therefore, the solution is x = 5.
+
+2. Solve for y: 2x – 3y = 12. y = 2x + 1.
+
+This is the same as the solution for x.
+
+2x – 3y = 12
+
+2x = 12
+----------------------------------------
+
+💬 'The area of a circle with radius 3 is pi * 3^2 ='
+🤖 The area of a circle with radius 3 is pi * 3^2 = 13.14.
+
+## SIMILAR QUESTIONS
+VARIANT 1  
+The circumference of a circle is 40 meters. The radius of the circle is 10 meters. What is the area of the circle?
+
+VARIANT 2  
+The area of a circle is 60 square meters. The radius of the circle is 6 meters. What is the area of the circle?
+
+VARIANT 3  
+The area of a circle is 80 square meters. The radius of the circle is 8 meters. What is the area
+----------------------------------------
+
+============================================================
+CODE — greedy
+
+💬 'def reverse_string(s):\n    '
+🤖 def reverse_string(s):
+    	return s[0] + s[1] + s[2] + s[3] + s[4] + s[5] + s[6] + s[7] + s[8] + s[9] + s[10]
+
+def reverse_string(s):
+    return s[::-1]
+
+def reverse_string(s):
+    return reverse_string(s)
+
+def reverse_string(s):
+    return reverse_string(s)
+
+def reverse_string(s):
+    return reverse_string(s)
+
+def reverse_
+----------------------------------------
+
+💬 'def fibonacci(n):\n    '
+🤖 def fibonacci(n):
+    	return fibonacci(n - 1)
+```
+
+**Example 1:**
+```python
+n = 1
+print(fibonacci(n))  # Output: 1
+```
+
+**Example 2:**
+```python
+n = 2
+print(fibonacci(n))  # Output: 2
+```
+
+**Example 3:**
+```python
+n = 3
+print(fibonacci(n))  # Output: 3
+```
+
+**Example 4:**
+```python
+n = 4
+print(fibonacci(n))
+----------------------------------------
+
+💬 'def is_prime(n):\n    '
+🤖 def is_prime(n):
+     return is_prime(n) == is_prime(n-1)
+```
+
+    
+    The algorithm first checks if the given number is a prime number. If it is, we return `true` because it is not a prime number. Then, we check if it's not equal to 1, if it is, then it is a prime number. If it is not equal to 1, we check if it has less than 2 factors, and if so, we update the factors and return the new number. This is done until we have checked all the factors in the number or there is no such number.
+----------------------------------------
+
+💬 'class Solution:\n    def twoSum(self, nums, target):\n        '
+🤖 class Solution:
+    def twoSum(self, nums, target):
+        
+        if target == 0:
+            return 0
+        
+        if nums[target] == 1:
+            return 1
+        
+        if target == 1:
+            return 2
+        
+        return 0
+```
+
+
+The given code is a solution to the LeetCode problem 122, which aims to find the number of pairs in an array where a pair of numbers is the sum of the two numbers.
+
+Explanation of the code:
+1. The code defines a class `Solution` with a method `twoSum` that takes a list of integers `nums` as input and returns the number
+----------------------------------------
+
+CODE — sampled (temp 0.7)
+
+💬 'def reverse_string(s):\n    '
+🤖 def reverse_string(s):
+    	return s[s.index(0)]
+    	
+    	return s
+    	
+    	
+    	
+    	
+    	
+    	
+    	
+    	
+    	
+    	
+    	
+    	
+    	
+    	
+    	
+    	
+    	
+    	
+    	
+    	
+    	
+    	
+    	
+    	
+    	
+    	
+    	
+    	
+    	
+    	
+    	
+    	
+    	
+    	
+    	
+    	
+    	
+    	
+    	
+    	
+    	
+    	
+    	
+    	
+    	
+    	
+    	
+    	
+    	
+    	
+    	
+    	
+    	
+    	
+    	
+    	
+----------------------------------------
+
+💬 'def fibonacci(n):\n    '
+🤖 def fibonacci(n):
+    	return fibonacci(n, 0, 1)
+```
+
+**Example 1:**
+```python
+a = 1
+b = 2
+c = 3
+d = 4
+e = 5
+f = 6
+
+def fibonacci(n):
+    if n == 0:
+        return 0
+    if n == 1:
+        return 1
+    if n == 2:
+        return 2
+    if n == 3:
+        return 3
+    return 4
+```
+
+**Example 2:**
+```python
+a = 1
+----------------------------------------
+
+💬 'def is_prime(n):\n    '
+🤖 def is_prime(n):
+    	return sum(prime_divisors(n) for prime in divisors(n)) % divisors(n)
+
+def is_prime(n):
+    if n <= 1:
+        return False
+    return sum(prime_divisors(n) for prime in divisors(n)) % divisors(n)
+
+def is_prime(n):
+    if n <= 1:
+        return True
+    return False
+
+def prime_divisors(n):
+    if n <= 1:
+        return n
+    return is_prime(n)
+
+def is_prime(n,
+----------------------------------------
+
+============================================================
+📊 Perplexity (math + code)
+  PPL=    5.41  loss=1.6877  | '2 + 2 = 4\n3 + 5 = 8\n7 * 6 = 42\n12 / 4 = 3'
+  PPL=    3.58  loss=1.2747  | 'x^2 - 5x + 6 = 0, so x = 2 or x = 3'
+  PPL=    2.19  loss=0.7835  | 'def fibonacci(n):\n    if n <= 1:\n        return n\n    r'
+  PPL=    1.55  loss=0.4361  | 'def is_prime(n):\n    if n < 2:\n        return False\n   '
+  PPL=    3.68  loss=1.3027  | 'left = 0\nright = len(arr) - 1\nwhile left <= right:\n    '
+DONE
