@@ -637,15 +637,10 @@ def save_checkpoint_robust(state, output_dir, is_best, logger):
     os.replace(tmp_path, latest_path)
     logger.info(f"  Saved checkpoint to {latest_path}")
 
-    if is_best:
-        best_path = os.path.join(output_dir, "megatrain_best.pt")
-        bak_path = best_path + ".bak"
-        if os.path.exists(best_path):
-            shutil.copy2(best_path, bak_path)
-        torch.save(state, tmp_path)
-        os.replace(tmp_path, best_path)
-        logger.info(f"  Best loss {state['best_loss']:.4f} — saved to {best_path}")
-
+    # User rule (2026-08-21): NEVER save a separate best.pt — always resume
+    # from latest. A single latest.pt avoids the duplicated 6.2GB best copy
+    # and the noise-prone best-loss comparison entirely. The `is_best` arg is
+    # kept for signature compatibility but is now a no-op.
     return True
 
 

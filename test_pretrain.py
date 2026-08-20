@@ -360,6 +360,24 @@ def test_checkpoint_saves_clean_state():
     print(f"  PASS: clean checkpoint saved")
 
 
+def test_no_best_pt_ever_written():
+    """User rule (2026-08-21): NEVER save a best.pt — even with is_best=True
+    only megatrain_latest.pt is written. A single latest.pt is the resume point."""
+    tmpdir = tempfile.mkdtemp()
+    try:
+        clean_sd = {"w": torch.randn(4, 4), "b": torch.randn(4)}
+        state = {"model_state_dict": clean_sd, "best_loss": 3.5}
+        result = save_checkpoint_robust(state, tmpdir, True, pmt.logger)
+        assert result is True, f"{_test_name()}: should have saved clean checkpoint"
+        assert os.path.exists(os.path.join(tmpdir, "megatrain_latest.pt")), \
+            f"{_test_name()}: latest.pt must be written"
+        assert not os.path.exists(os.path.join(tmpdir, "megatrain_best.pt")), \
+            f"{_test_name()}: best.pt must NOT be written (never save best)"
+    finally:
+        shutil.rmtree(tmpdir)
+    print("  PASS: best.pt never written — only latest.pt")
+
+
 def test_save_trigger_step_based():
     """should_save_checkpoint fires on save_interval multiples, not before."""
     assert should_save_checkpoint(1000, 1000, 0.0, 0.0, 0) is True
@@ -1802,6 +1820,7 @@ TESTS = [
     test_checkpoint_rejects_nan,
     test_checkpoint_rejects_inf,
     test_checkpoint_saves_clean_state,
+    test_no_best_pt_ever_written,
     test_validate_cpu_params_detects_nan,
     test_validate_cpu_params_passes_clean,
     test_llama_config_creation,

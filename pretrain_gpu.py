@@ -18,7 +18,8 @@ async checkpoints, optional Liger fused kernels (--liger) and torch.compile
 Supports --init-from warm-start (checkpoint loaded on CPU, freed after
 load_state_dict — the OOM fix) and --resume-from true-resume (model +
 optimizer + step + best_loss restored, so the LR/curriculum schedule
-continues and best.pt is never clobbered by a fresh best_loss=inf).
+continues). User rule (2026-08-21): NEVER save best.pt — always save to
+megatrain_latest.pt and always resume from it.
 """
 import argparse, logging, math, os, threading, time
 from pathlib import Path
@@ -705,10 +706,6 @@ def main():
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--warmup-steps", type=int, default=WARMUP_DEFAULT)
     parser.add_argument("--min-lr", type=float, default=1e-6)
-    parser.add_argument("--rebaseline-best", action="store_true",
-                        help="One-time: reset best_loss=inf at start so the FIRST save "
-                             "re-baselines best.pt with an honest smoothed loss. Use after "
-                             "the is_best smoothing fix to clear a noise-polluted best.pt.")
     parser.add_argument("--restart-lr", action="store_true",
                         help="TRUE warm restart: LR schedule restarts from local step 0 at "
                              "resume (400-step warmup → base_lr peak → cosine to min_lr over "
@@ -778,10 +775,6 @@ def main():
         if args.restart_lr:
             logger.warning(f"♻️  --restart-lr: LR restarts at local step 0 (peak {args.lr}, "
                            f"cosine over {max(args.num_steps - start_step, 1)} remaining steps)")
-        if args.rebaseline_best:
-            logger.warning("♻️  --rebaseline-best: best_loss reset to inf — first save "
-                           "re-baselines best.pt with an honest smoothed loss")
-            best_loss = float("inf")
     elif args.init_from and os.path.exists(args.init_from):
         ckpt = torch.load(args.init_from, map_location="cpu", weights_only=False)
         sd = ckpt["model_state_dict"]
@@ -941,14 +934,11 @@ def main():
         step_save = (step + 1) % args.save_interval == 0 or step + 1 == args.num_steps
         if should_save_checkpoint(step + 1, args.save_interval, last_save_time,
                                   time.time(), args.save_every_minutes) or step + 1 == args.num_steps:
-            # is_best on the interval-smoothed loss, NOT the current step's —
-            # single steps swing ±0.5 with the per-step domain mix (see
-            # smoothed_loss_at_save). ONE sync per save, not 16 per step.
+            # NOTE (2026-08-21): no more best.pt — we always save to latest.pt
+            # and always resume from latest. smoothed_loss_at_save is kept only
+            # for the logged loss value (no best-comparison).
             smoothed = smoothed_loss_at_save(
                 running, (step + 1) - last_log_step, last_logged_avg)
-            is_best = smoothed < best_loss
-            if is_best:
-                best_loss = smoothed
             state = {
                 "step": step + 1,
                 "loss": smoothed,
@@ -957,7 +947,7 @@ def main():
                 "optimizer_state_dict": optimizer.state_dict(),
                 "config": args.__dict__,
             }
-            save_checkpoint_async(state, is_best, logger,
+            save_checkpoint_async(state, False, logger,
                                   swa_window=args.swa_window if step_save else 0,
                                   swa_step=step + 1)
             last_save_time = time.time()
